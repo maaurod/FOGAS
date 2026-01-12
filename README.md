@@ -156,21 +156,47 @@ See example notebooks in `testing_vectorized/`:
 
 ## Google Colab Usage
 
-To use this repository in Google Colab:
+There are **two ways** to use this repository in Google Colab:
+
+### Method 1: Clone and Run Notebooks Directly (Easiest) ⭐
+
+The notebooks are already set up to work in Colab! Just clone and run:
 
 ```python
-# Clone the repository
-!git clone https://github.com/YOUR_USERNAME/YOUR_REPO_NAME.git
-%cd YOUR_REPO_NAME
+# 1. Clone the repository
+!git clone https://github.com/maaurod/FOGAS.git
+%cd FOGAS
 
-# Install dependencies
+# 2. Install dependencies
 !pip install -r requirements.txt
 
-# Import and use
-from fogas import FOGASSolverVectorized, PolicySolver
+# 3. Open any notebook from testing_vectorized/ and run it!
+# The notebooks use PROJECT_ROOT which automatically works in Colab
 ```
 
-**Note**: The repository uses relative paths (`PROJECT_ROOT / "datasets" / ...`) which work seamlessly in Colab after cloning.
+**Then**: In Colab's file browser, navigate to `testing_vectorized/` and open any notebook (e.g., `2State.ipynb`). All paths will work automatically!
+
+### Method 2: Install as Package (For Custom Scripts)
+
+If you want to write your own code instead of using the notebooks:
+
+```python
+# 1. Install the package directly from GitHub
+!pip install git+https://github.com/maaurod/FOGAS.git
+
+# 2. Now you can import from anywhere
+from fogas import FOGASSolverVectorized, PolicySolver
+
+# 3. Write your own code
+mdp = PolicySolver(...)
+solver = FOGASSolverVectorized(mdp=mdp, csv_path="path/to/data.csv")
+policy = solver.run(T=1000)
+```
+
+**Use Method 1 if**: You want to run the example notebooks  
+**Use Method 2 if**: You want to write custom Python scripts in Colab
+
+**Note**: The example notebooks already use relative paths that work seamlessly in Colab after cloning.
 
 ## PyTorch Version
 
@@ -191,4 +217,4 @@ See `requirements.txt` for specific versions.
 
 ## License
 
-[Add your license here]
+MIT License - see [LICENSE](LICENSE) file for details.

@@ -1,4 +1,4 @@
-# FOGAS: Feature-based Offline Gradient-based Actor Search
+# FOGAS: Feature-Occupancy Gradient Ascent
 
 Implementation of the FOGAS algorithm for offline reinforcement learning in linear MDPs.
 

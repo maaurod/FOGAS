@@ -191,4 +191,4 @@ See `requirements.txt` for specific versions.
 
 ## License
 
-[Add your license here]
+[-]

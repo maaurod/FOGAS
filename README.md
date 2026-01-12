@@ -160,8 +160,8 @@ To use this repository in Google Colab:
 
 ```python
 # Clone the repository
-!git clone https://github.com/YOUR_USERNAME/YOUR_REPO_NAME.git
-%cd YOUR_REPO_NAME
+!git clone https://github.com/maaurod/FOGAS.git
+%cd FOGAS
 
 # Install dependencies
 !pip install -r requirements.txt

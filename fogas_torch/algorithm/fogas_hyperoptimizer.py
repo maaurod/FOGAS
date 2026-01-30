@@ -22,12 +22,22 @@ class FOGASHyperOptimizer:
         "eta":   {"bounds": lambda theory, cur: (theory["eta"], 3.0),   "log_scale": True},
     }
 
-    def __init__(self, solver, metric_callable):
+    def __init__(self, solver, metric_callable, seed=42):
         """
         metric_callable: zero-argument function returning a scalar
+        seed: random seed for reproducibility (default: 42)
         """
         self.solver = solver
         self.metric = metric_callable
+        self.seed = seed
+
+        # Set random seeds for reproducibility
+        if seed is not None:
+            import torch
+            np.random.seed(seed)
+            torch.manual_seed(seed)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed(seed)
 
     # =====================================================
     # Objective (metric-agnostic)

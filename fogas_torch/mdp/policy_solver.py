@@ -40,10 +40,23 @@ class PolicySolver(LinearMDP):
         # Compute discounted occupancy μ*
         self.mu_star = self.occupancy_measure(pi=self.pi_star)
 
+    def to(self, device):
+        """Move all internal tensors to the specified device."""
+        LinearMDP.to(self, device)
+        self.r = self.r.to(device)
+        self.P = self.P.to(device)
+        self.pi_star = self.pi_star.to(device)
+        self.v_star = self.v_star.to(device)
+        self.q_star = self.q_star.to(device)
+        self.mu_star = self.mu_star.to(device)
+        return self
+
     # ------------------------------------------------------------
     # Policy Evaluation
     # ------------------------------------------------------------
     def evaluate_policy(self, pi, verbose=False):
+        device = self.r.device
+        pi = pi.to(device)
         r = self.r
         P = self.P
 
@@ -51,12 +64,12 @@ class PolicySolver(LinearMDP):
         r_pi = (pi * r.reshape(self.N, self.A)).sum(dim=1)
 
         # P_pi(s, s') = sum_a pi(s,a) P(s' | s,a)
-        P_pi = torch.zeros((self.N, self.N), dtype=torch.float64)
+        P_pi = torch.zeros((self.N, self.N), dtype=torch.float64, device=device)
         for a in range(self.A):
             P_pi += torch.diag(pi[:, a]) @ P[a::self.A, :]
 
         # v = (I - γ P_pi)^{-1} r_pi
-        v = torch.linalg.solve(torch.eye(self.N, dtype=torch.float64) - self.gamma * P_pi, r_pi)
+        v = torch.linalg.solve(torch.eye(self.N, dtype=torch.float64, device=device) - self.gamma * P_pi, r_pi)
 
         # q(s,a) = r(s,a) + γ ∑_{s'} P(s'|s,a) v(s')
         q = (r + self.gamma * P @ v).reshape(self.N, self.A)
@@ -72,7 +85,8 @@ class PolicySolver(LinearMDP):
     def policy_iteration(self, mode="deterministic", temperature=1.0,
                          max_iter=1000, eps=1e-8, verbose=False):
 
-        pi = torch.ones((self.N, self.A), dtype=torch.float64) / self.A  # uniform start
+        device = self.r.device
+        pi = torch.ones((self.N, self.A), dtype=torch.float64, device=device) / self.A  # uniform start
 
         for it in range(max_iter):
             v, q = self.evaluate_policy(pi)
@@ -139,12 +153,14 @@ class PolicySolver(LinearMDP):
     # ------------------------------------------------------------
     def occupancy_measure(self, pi):
         # Build (N*A × N) matrix that expands pi into action probabilities
-        Comp_pi = torch.zeros((self.N * self.A, self.N), dtype=torch.float64)
+        device = self.r.device
+        pi = pi.to(device)
+        Comp_pi = torch.zeros((self.N * self.A, self.N), dtype=torch.float64, device=device)
         for x in range(self.N):
             for a in range(self.A):
                 Comp_pi[x * self.A + a, x] = pi[x, a]
 
-        I = torch.eye(self.N * self.A, dtype=torch.float64)
+        I = torch.eye(self.N * self.A, dtype=torch.float64, device=device)
         rhs = (1 - self.gamma) * (Comp_pi @ self.nu0)
 
         # Solve: μ = (I - γ * Comp_pi * P^T)^(-1) * rhs
@@ -200,7 +216,8 @@ class PolicySolver(LinearMDP):
 
         y = torch.stack(y)  # (N*A,)
 
-        A_mat = self.Phi.T @ self.Phi + ridge * torch.eye(d, dtype=torch.float64)
+        device = self.r.device
+        A_mat = self.Phi.T @ self.Phi + ridge * torch.eye(d, dtype=torch.float64, device=device)
         b = self.Phi.T @ y
         theta_star = torch.linalg.solve(A_mat, b)
 

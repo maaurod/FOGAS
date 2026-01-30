@@ -74,14 +74,15 @@ class LinearMDPEnv(gym.Env):
                 probs = P[row_idx]  # size N
 
                 # Conditions for absorbing under this action
-                if not torch.isclose(probs.sum(), torch.tensor(1.0), atol=tol):
+                one = torch.tensor(1.0, dtype=P.dtype, device=P.device)
+                if not torch.isclose(probs.sum(), one, atol=tol):
                     is_absorbing = False
                     break
-                if not torch.isclose(probs[s_idx], torch.tensor(1.0), atol=tol):
+                if not torch.isclose(probs[s_idx], one, atol=tol):
                     is_absorbing = False
                     break
 
-                mask_others = torch.ones(self.N, dtype=torch.bool)
+                mask_others = torch.ones(self.N, dtype=torch.bool, device=P.device)
                 mask_others[s_idx] = False
                 if torch.any(probs[mask_others] > tol):
                     is_absorbing = False

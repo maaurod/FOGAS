@@ -309,7 +309,7 @@ class FOGASEvaluator:
         
         for step in range(max_steps):
             action_probs = pi[state]
-            action = torch.multinomial(action_probs, num_samples=1).item()
+            action = torch.argmax(action_probs).item()
             
             reward = mdp.r[state * mdp.A + action]
             if isinstance(reward, torch.Tensor):

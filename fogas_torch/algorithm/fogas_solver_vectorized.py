@@ -42,6 +42,9 @@ class FOGASSolverVectorized:
             if torch.cuda.is_available():
                 torch.cuda.manual_seed(seed)
 
+        # Move MDP to device
+        self.mdp.to(self.device)
+
         # ------------------------------
         # Dataset
         # ------------------------------
@@ -67,6 +70,10 @@ class FOGASSolverVectorized:
         # ------------------------------
         # Theoretical parameters
         # ------------------------------
+        if print_params:
+            print(f"\nDevice: {self.device}")
+            print(f"Dataset: {csv_path} (n={self.n})")
+
         self.params = FOGASParameters(
             mdp=mdp,
             n=self.n,

@@ -43,6 +43,9 @@ class FOGASSolver:
             if torch.cuda.is_available():
                 torch.cuda.manual_seed(seed)
 
+        # Move MDP to device
+        self.mdp.to(self.device)
+
         # ------------------------------
         # Dataset
         # ------------------------------
@@ -68,6 +71,10 @@ class FOGASSolver:
         # ------------------------------
         # Theoretical parameters
         # ------------------------------
+        if print_params:
+            print(f"\nDevice: {self.device}")
+            print(f"Dataset: {csv_path} (n={self.n})")
+
         self.params = FOGASParameters(
             mdp=mdp,
             n=self.n,
@@ -108,10 +115,10 @@ class FOGASSolver:
         Xs = self.Xs
         As = self.As
 
-        Phi_list = [phi(int(x.item()), int(a.item())).to(dtype=torch.float64) 
+        Phi_list = [phi(int(x.item()), int(a.item())).to(dtype=torch.float64, device=self.device) 
                     for x, a in zip(Xs, As)]
         Phi = torch.vstack(Phi_list)
-        Cov_emp = beta * torch.eye(d, dtype=torch.float64) + (Phi.T @ Phi) / n
+        Cov_emp = beta * torch.eye(d, dtype=torch.float64, device=self.device) + (Phi.T @ Phi) / n
         Cov_emp_inv = torch.linalg.inv(Cov_emp)
 
         self.Phi = Phi
@@ -140,7 +147,7 @@ class FOGASSolver:
                 return compute_probs(x)
             return pi
         else:
-            out = torch.zeros((N, A), dtype=torch.float64)
+            out = torch.zeros((N, A), dtype=torch.float64, device=self.device)
             for x in range(N):
                 out[x] = compute_probs(x)
             return out
@@ -186,10 +193,11 @@ class FOGASSolver:
         # -------------------------
         # Initialization
         # -------------------------
-        lambda_t = torch.zeros(d, dtype=torch.float64) if lambda_init is None else lambda_init.clone()
-        theta_bar_t = torch.zeros(d, dtype=torch.float64) if theta_bar_init is None else theta_bar_init.clone()
+        device = self.device
+        lambda_t = torch.zeros(d, dtype=torch.float64, device=device) if lambda_init is None else lambda_init.clone().to(device)
+        theta_bar_t = torch.zeros(d, dtype=torch.float64, device=device) if theta_bar_init is None else theta_bar_init.clone().to(device)
         theta_bar_history = []
-        pi_t = lambda x: torch.ones(A, dtype=torch.float64) / A  # start uniform
+        pi_t = lambda x: torch.ones(A, dtype=torch.float64, device=device) / A  # start uniform
 
         # -------------------------
         # Main loop
@@ -203,7 +211,7 @@ class FOGASSolver:
             # μ̂ term
             # ---------------------------
             lambda_emp_sum1 = (1 - gamma) * sum(
-                pi_t(x0)[a] * phi(x0, a).to(dtype=torch.float64) for a in range(A)
+                pi_t(x0)[a] * phi(x0, a).to(dtype=torch.float64, device=device) for a in range(A)
             )
 
             Lambda_term = Cov_emp_inv @ lambda_t
@@ -211,7 +219,7 @@ class FOGASSolver:
 
             for i in range(n):
                 coeff = Phi[i] @ Lambda_term
-                inner = sum(pi_t(int(X_nexts[i].item()))[a] * phi(int(X_nexts[i].item()), a).to(dtype=torch.float64)
+                inner = sum(pi_t(int(X_nexts[i].item()))[a] * phi(int(X_nexts[i].item()), a).to(dtype=torch.float64, device=device)
                             for a in range(A))
                 lambda_emp_sum2 += coeff * inner
             lambda_emp_sum2 *= gamma / n
@@ -232,7 +240,7 @@ class FOGASSolver:
             for i in range(n):
                 probs = pi_t(int(X_nexts[i].item()))
                 v = sum(
-                    probs[a] * torch.dot(theta_t, phi(int(X_nexts[i].item()), a).to(dtype=torch.float64))
+                    probs[a] * torch.dot(theta_t, phi(int(X_nexts[i].item()), a).to(dtype=torch.float64, device=device))
                     for a in range(A)
                 )
                 sum_term += Phi[i] * v

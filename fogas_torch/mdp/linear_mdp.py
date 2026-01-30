@@ -118,6 +118,19 @@ class LinearMDP:
 
         self.Psi = None  # cache
 
+    def to(self, device):
+        """Move all internal tensors to the specified device."""
+        self.states = self.states.to(device)
+        self.actions = self.actions.to(device)
+        self.omega = self.omega.to(device)
+        self.nu0 = self.nu0.to(device)
+        self.Phi = self.Phi.to(device)
+        if self.P is not None:
+            self.P = self.P.to(device)
+        if self.Psi is not None:
+            self.Psi = self.Psi.to(device)
+        return self
+
     # ------------------------------------------------------------
     # Reward computation: r = Φω
     # ------------------------------------------------------------
@@ -200,10 +213,11 @@ class LinearMDP:
             return self.Psi
 
         if self.given_psi:
-            Psi = torch.zeros((self.d, self.N), dtype=torch.float64)
+            device = self.Phi.device
+            Psi = torch.zeros((self.d, self.N), dtype=torch.float64, device=device)
             for xp in range(self.N):
                 s_next = self.states[xp].item()
-                v = self.psi(s_next).to(dtype=torch.float64).reshape(-1)
+                v = self.psi(s_next).to(dtype=torch.float64, device=device).reshape(-1)
                 if v.shape != (self.d,):
                     raise ValueError(f"psi({s_next}) must return shape ({self.d},), got {v.shape}")
                 Psi[:, xp] = v

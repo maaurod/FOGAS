@@ -60,7 +60,7 @@ class FOGASHyperOptimizer:
         return_history=False,
         num_runs=3,
     ):
-        assert search_method in {"bo", "random"}
+        assert search_method in {"bo", "random", "grid"}
         fixed_params = fixed_params or {}
         a, b = bounds
 
@@ -105,7 +105,20 @@ class FOGASHyperOptimizer:
                 print_each,
                 num_runs
             )
-        else:
+        elif search_method == "grid":
+            X, y = self._optimize_grid(
+                param_name,
+                left,
+                right,
+                X.reshape(-1, 1),
+                y,
+                fixed_params,
+                random_candidates,  # Reuse this parameter as grid_points
+                log_scale,
+                print_each,
+                num_runs
+            )
+        else:  # random
             X, y = self._optimize_random(
                 param_name,
                 left,
@@ -227,6 +240,113 @@ class FOGASHyperOptimizer:
                 )
 
         return X, y
+
+    def _optimize_grid(
+        self,
+        param_name,
+        left,
+        right,
+        X,
+        y,
+        fixed_params,
+        grid_points,
+        log_scale,
+        print_each,
+        num_runs,
+    ):
+        """
+        Exhaustive grid search over the refined parameter range.
+        """
+        if log_scale:
+            candidates = np.logspace(np.log10(left), np.log10(right), grid_points)
+        else:
+            candidates = np.linspace(left, right, grid_points)
+
+        for i, x in enumerate(candidates):
+            params = dict(fixed_params)
+            params[param_name] = x
+
+            y_val = self._evaluate(num_runs=num_runs, **params)
+
+            X = np.vstack([X, [[x]]])
+            y = np.append(y, y_val)
+
+            if print_each:
+                print(
+                    f"Grid {i+1}/{grid_points}: {param_name}={x:.4g}, metric={y_val:.4f}"
+                )
+
+        return X, y
+
+    def simple_grid_search(
+        self,
+        param_name,
+        bounds,
+        n_points=10,
+        fixed_params=None,
+        log_scale=False,
+        num_runs=3,
+        print_results=True,
+    ):
+        """
+        Simple direct grid search over a parameter range without coarse/refinement.
+        
+        Parameters
+        ----------
+        param_name : str
+            Parameter to optimize ("alpha", "rho", or "eta")
+        bounds : tuple
+            (min, max) bounds for the parameter
+        n_points : int
+            Number of grid points to evaluate
+        fixed_params : dict
+            Fixed values for other parameters, e.g. {"eta": 0.02, "rho": 0.05}
+        log_scale : bool
+            If True, use logarithmic spacing; otherwise linear
+        num_runs : int
+            Number of solver runs to average per evaluation
+        print_results : bool
+            If True, print each evaluation
+            
+        Returns
+        -------
+        best_value : float
+            Best parameter value found
+        grid_values : ndarray
+            All tested parameter values
+        metric_values : ndarray
+            Metric value for each grid point
+        """
+        fixed_params = fixed_params or {}
+        a, b = bounds
+        
+        # Create grid
+        if log_scale:
+            grid = np.logspace(np.log10(a), np.log10(b), n_points)
+        else:
+            grid = np.linspace(a, b, n_points)
+        
+        # Evaluate each point
+        metrics = []
+        for i, value in enumerate(grid):
+            params = dict(fixed_params)
+            params[param_name] = value
+            
+            metric = self._evaluate(num_runs=num_runs, **params)
+            metrics.append(metric)
+            
+            if print_results:
+                param_str = ", ".join([f"{k}={v:.4g}" for k, v in params.items()])
+                print(f"Point {i+1}/{n_points}: {param_str} → metric={metric:.6f}")
+        
+        metrics = np.array(metrics)
+        best_idx = np.argmin(metrics)
+        best_value = float(grid[best_idx])
+        
+        if print_results:
+            print(f"\n✅ Best {param_name} = {best_value:.6f} with metric = {metrics[best_idx]:.6f}")
+        
+        return best_value, grid, metrics
 
     def optimize_fogas_hyperparameters(
         self,

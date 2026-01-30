@@ -17,6 +17,7 @@ from .algorithm.fogas_oraclesolver_vectorized import FOGASOracleSolverVectorized
 # --- Dataset collection utilities ---
 from .dataset_collection.linear_mdp_env import LinearMDPEnv
 from .dataset_collection.env_data_collector import EnvDataCollector
+from .dataset_collection.dataset_analyzer import DatasetAnalyzer
 
 __all__ = [
     "LinearMDP",
@@ -27,8 +28,10 @@ __all__ = [
     "FOGASParameters",
     "LinearMDPEnv",
     "EnvDataCollector",
+    "DatasetAnalyzer",
     "FOGASEvaluator",
     "FOGASHyperOptimizer",
     "FOGASOracleSolver",
     "FOGASOracleSolverVectorized",
 ]
+

@@ -68,6 +68,7 @@ class EnvDataCollector:
         def sample(self, state):
             return self.action_space.sample()
 
+
     class UniformPolicy:
         """Uniform distribution over actions via np.random.choice."""
         def __init__(self, action_space):
@@ -76,6 +77,22 @@ class EnvDataCollector:
         def sample(self, state):
             return np.random.choice(self.action_space.n)
 
+    class MatrixPolicy:
+        """Policy wrapper for numpy policy matrices (e.g., mdp.pi_star)."""
+        def __init__(self, policy_matrix):
+            """
+            Parameters
+            ----------
+            policy_matrix : ndarray of shape (N, A)
+                Policy matrix where policy_matrix[s, a] = probability of action a in state s
+            """
+            self.policy_matrix = policy_matrix
+
+        def sample(self, state):
+            """Sample action from policy distribution at given state."""
+            action_probs = self.policy_matrix[state]
+            return np.random.choice(len(action_probs), p=action_probs)
+
     # --------------------------------------------
     # Policy factory
     # --------------------------------------------
@@ -83,6 +100,7 @@ class EnvDataCollector:
         """
         Accepts:
             - a policy object with .sample(state)
+            - a numpy array (policy matrix of shape (N, A))
             - or a string: "random", "uniform"
 
         Returns:
@@ -92,6 +110,10 @@ class EnvDataCollector:
         # Already a policy object → return as is
         if hasattr(policy, "sample"):
             return policy
+
+        # Numpy array (policy matrix) → wrap it
+        if isinstance(policy, np.ndarray):
+            return self.MatrixPolicy(policy)
 
         # String name → build the corresponding policy
         if isinstance(policy, str):
@@ -107,7 +129,9 @@ class EnvDataCollector:
                 f"Unknown policy name '{policy}'. Supported: 'random', 'uniform'."
             )
 
-        raise ValueError("Policy must be a string or an object with a .sample() method.")
+        raise ValueError(
+            "Policy must be a string, numpy array (policy matrix), or an object with a .sample() method."
+        )
 
     # --------------------------------------------
     # Dataset collection
@@ -177,4 +201,159 @@ class EnvDataCollector:
                 print(f"✅ Dataset saved to: {save_path}")
                 print(f"   Total transitions: {len(df)}")
 
+
         return df
+
+    def collect_mixed_dataset(self, policies, proportions=None, n_steps=1000, 
+                             save_path=None, verbose=True, episode_based=True):
+        """
+        Collect transitions using multiple policies with specified proportions.
+        
+        Parameters
+        ----------
+        policies : list
+            List of policies (each can be a string like "random" or object with .sample(state)).
+            Example: ["random", policy_obj1, policy_obj2]
+        proportions : list of float, optional
+            Proportion of data to collect with each policy. Must sum to 1.0.
+            If None, policies are used equally (e.g., [0.5, 0.5] for 2 policies).
+            Example: [0.3, 0.5, 0.2] means 30% policy1, 50% policy2, 20% policy3.
+        n_steps : int
+            Total number of environment steps to collect.
+        save_path : str or None
+            If provided, CSV path where (s, a, r, s', policy_id) transitions are saved.
+        verbose : bool
+            If True, prints collection statistics.
+        episode_based : bool
+            If True, switches policy at episode boundaries (entire episodes use one policy).
+            If False, switches policy according to proportions at each step.
+            
+        Returns
+        -------
+        df : pd.DataFrame
+            DataFrame with columns: episode, step, state, action, reward, next_state, policy_id
+        """
+        # Reset seed for reproducible data collection
+        if self.seed is not None:
+            np.random.seed(self.seed)
+        
+        # Validate inputs
+        if not isinstance(policies, list):
+            raise ValueError("policies must be a list")
+        
+        num_policies = len(policies)
+        if num_policies < 2:
+            raise ValueError("Must provide at least 2 policies. Use collect_dataset() for single policy.")
+        
+        # Convert all policies to policy objects
+        policies = [self._make_policy(p) for p in policies]
+        
+        # Set proportions
+        if proportions is None:
+            proportions = [1.0 / num_policies] * num_policies
+        else:
+            if len(proportions) != num_policies:
+                raise ValueError(f"proportions must have {num_policies} elements to match policies")
+            if not np.isclose(sum(proportions), 1.0):
+                raise ValueError(f"proportions must sum to 1.0, got {sum(proportions)}")
+        
+        env = self.env
+        
+        data = {
+            "episode": [],
+            "step": [],
+            "state": [],
+            "action": [],
+            "reward": [],
+            "next_state": [],
+            "policy_id": [],  # Track which policy was used
+        }
+        
+        # Track statistics
+        policy_step_counts = [0] * num_policies
+        policy_episode_counts = [0] * num_policies
+        
+        episode, step = 0, 0
+        obs, _ = env.reset()
+        
+        # Choose initial policy
+        if episode_based:
+            current_policy_idx = np.random.choice(num_policies, p=proportions)
+            current_policy = policies[current_policy_idx]
+            policy_episode_counts[current_policy_idx] += 1
+        
+        for global_step in range(n_steps):
+            # Select policy for this step
+            if episode_based:
+                # Use the same policy for entire episode
+                policy_idx = current_policy_idx
+                policy = current_policy
+            else:
+                # Sample policy at each step according to proportions
+                policy_idx = np.random.choice(num_policies, p=proportions)
+                policy = policies[policy_idx]
+            
+            # Execute action
+            action = policy.sample(obs)
+            next_obs, reward, terminated, truncated, _ = env.step(action)
+            
+            # Record transition
+            data["episode"].append(episode)
+            data["step"].append(step)
+            data["state"].append(obs)
+            data["action"].append(action)
+            data["reward"].append(reward)
+            data["next_state"].append(next_obs)
+            data["policy_id"].append(policy_idx)
+            
+            # Update statistics
+            policy_step_counts[policy_idx] += 1
+            step += 1
+            
+            # Handle episode termination
+            if terminated or truncated:
+                episode += 1
+                step = 0
+                obs, _ = env.reset()
+                
+                # Choose new policy for next episode (if episode-based)
+                if episode_based:
+                    current_policy_idx = np.random.choice(num_policies, p=proportions)
+                    current_policy = policies[current_policy_idx]
+                    policy_episode_counts[current_policy_idx] += 1
+            else:
+                obs = next_obs
+        
+        df = pd.DataFrame(data)
+        
+        # Print statistics
+        if verbose:
+            print(f"\n{'='*60}")
+            print(f"  MIXED DATASET COLLECTION SUMMARY")
+            print(f"{'='*60}")
+            print(f"Total transitions: {len(df)}")
+            print(f"Total episodes: {episode}")
+            print(f"Mode: {'Episode-based' if episode_based else 'Step-based'}")
+            print(f"\nPolicy Distribution:")
+            for i, (count, prop) in enumerate(zip(policy_step_counts, proportions)):
+                actual_prop = count / len(df) if len(df) > 0 else 0
+                print(f"  Policy {i}: {count:5d} steps ({actual_prop:5.1%}) | "
+                      f"Target: {prop:5.1%} | ", end="")
+                if episode_based:
+                    print(f"Episodes: {policy_episode_counts[i]}")
+                else:
+                    print()
+            print(f"{'='*60}\n")
+        
+        # Optional saving
+        if save_path is not None:
+            os.makedirs(os.path.dirname(save_path), exist_ok=True)
+            df[["state", "action", "reward", "next_state", "policy_id"]].to_csv(
+                save_path, index=False
+            )
+            
+            if verbose:
+                print(f"✅ Mixed dataset saved to: {save_path}")
+        
+        return df
+

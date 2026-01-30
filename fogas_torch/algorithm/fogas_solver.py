@@ -9,6 +9,7 @@ class FOGASSolver:
     """
     FOGAS implementation: runs the optimization algorithm, stores θ̄-history and final π.
     Evaluation utilities are moved to FOGASEvaluator.
+    Supports CUDA acceleration.
     """
 
     def __init__(
@@ -23,18 +24,33 @@ class FOGASSolver:
         D_theta=None,
         print_params=False,
         dataset_verbose=False,
+        seed=42,
+        device=None,
     ):
         self.mdp = mdp
         self.delta = delta
+        self.seed = seed
+
+        # Set device (CUDA if available)
+        if device is None:
+            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        else:
+            self.device = torch.device(device)
+
+        # Set random seed for reproducibility
+        if seed is not None:
+            torch.manual_seed(seed)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed(seed)
 
         # ------------------------------
         # Dataset
         # ------------------------------
         self.dataset = FOGASDataset(csv_path=csv_path, verbose=dataset_verbose)
-        self.Xs = self.dataset.X
-        self.As = self.dataset.A
-        self.Rs = self.dataset.R
-        self.X_nexts = self.dataset.X_next
+        self.Xs = self.dataset.X.to(self.device)
+        self.As = self.dataset.A.to(self.device)
+        self.Rs = self.dataset.R.to(self.device)
+        self.X_nexts = self.dataset.X_next.to(self.device)
         self.n = self.dataset.n
 
         # ------------------------------
@@ -46,7 +62,7 @@ class FOGASSolver:
         self.gamma = mdp.gamma
         self.R = mdp.R
         self.phi = mdp.phi
-        self.omega = mdp.omega
+        self.omega = mdp.omega.to(self.device) if isinstance(mdp.omega, torch.Tensor) else torch.tensor(mdp.omega, dtype=torch.float64, device=self.device)
         self.x0 = mdp.x0
 
         # ------------------------------

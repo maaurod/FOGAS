@@ -1,24 +1,28 @@
 import torch
 
+from .fogas_dataset import FOGASDataset
 from .fogas_parameters import FOGASParameters
 from tqdm import trange
 
 
-class FOGASOracleSolver:
-    """Oracle FOGAS solver with CUDA support."""
-    
+class FOGASSolverVectorized:
+    """
+    Vectorized FOGAS implementation: precomputes PHI tensors and runs the
+    core loop with batch operations. Supports CUDA acceleration.
+    """
+
     def __init__(
         self,
         mdp,
+        csv_path,
         delta=0.05,
-        n=None,
         T=None,
         alpha=None,
         eta=None,
         rho=None,
         D_theta=None,
         print_params=False,
-        cov_matrix="identity",
+        dataset_verbose=False,
         seed=42,
         device=None,
     ):
@@ -38,7 +42,15 @@ class FOGASOracleSolver:
             if torch.cuda.is_available():
                 torch.cuda.manual_seed(seed)
 
-        self.n = 10e6 if n is None else n
+        # ------------------------------
+        # Dataset
+        # ------------------------------
+        self.dataset = FOGASDataset(csv_path=csv_path, verbose=dataset_verbose)
+        self.Xs = self.dataset.X.to(self.device)
+        self.As = self.dataset.A.to(self.device)
+        self.Rs = self.dataset.R.to(self.device)
+        self.X_nexts = self.dataset.X_next.to(self.device)
+        self.n = self.dataset.n
 
         # ------------------------------
         # MDP info
@@ -51,7 +63,6 @@ class FOGASOracleSolver:
         self.phi = mdp.phi
         self.omega = mdp.omega.to(self.device) if isinstance(mdp.omega, torch.Tensor) else torch.tensor(mdp.omega, dtype=torch.float64, device=self.device)
         self.x0 = mdp.x0
-        self.Phi = mdp.Phi.to(self.device) if isinstance(mdp.Phi, torch.Tensor) else torch.tensor(mdp.Phi, dtype=torch.float64, device=self.device)
 
         # ------------------------------
         # Theoretical parameters
@@ -71,10 +82,14 @@ class FOGASOracleSolver:
         self.T = self.params.T
         self.alpha = self.params.alpha
         self.eta = self.params.eta
-        self.rho = self.params.rho if n is not None else 10e-3
+        self.rho = self.params.rho
         self.D_theta = self.params.D_theta
         self.beta = self.params.beta
         self.D_pi = self.params.D_pi
+
+        # Precompute feature tensors and covariances
+        self._build_feature_tensors()
+        self._build_covariances()
 
         # Results to be filled by run()
         self.theta_bar_history = None
@@ -82,34 +97,45 @@ class FOGASOracleSolver:
         self.mod_alpha = self.alpha
         self.lambda_T = None
 
-        self.cov_matrix = cov_matrix
+    # ------------------------------------------------------------------
+    # Feature tensors
+    # ------------------------------------------------------------------
+    def _build_feature_tensors(self):
+        # PHI_XA[x, a] = phi(x, a)
+        PHI_XA = torch.stack(
+            [torch.stack([self.phi(x, a) for a in range(self.A)]) for x in range(self.N)],
+            dim=0,
+        ).to(dtype=torch.float64, device=self.device)
+
+        # Dataset features via indexing: Phi_i = phi(X_i, A_i)
+        Phi = PHI_XA[self.Xs.long(), self.As.long()]
+
+        self.PHI_XA = PHI_XA
+        self.Phi = Phi
 
     # ------------------------------------------------------------------
-    # Softmax policy
+    # Covariance
     # ------------------------------------------------------------------
-    def softmax_policy(self, theta_bar, alpha, return_matrix=False):
-        phi = self.phi
-        A = self.A
-        N = self.N
+    def _build_covariances(self):
+        n = self.n
+        d = self.d
+        beta = self.beta
+        Phi = self.Phi
 
-        def compute_probs(x):
-            logits = []
-            for a in range(A):
-                phi_val = phi(x, a).to(dtype=torch.float64)
-                logits.append(alpha * torch.dot(phi_val, theta_bar))
-            logits = torch.stack(logits)
-            exp_logits = torch.exp(logits - torch.max(logits))
-            return exp_logits / exp_logits.sum()
+        Cov_emp = beta * torch.eye(d, dtype=torch.float64, device=self.device) + (Phi.T @ Phi) / n
+        Cov_emp_inv = torch.linalg.inv(Cov_emp)
 
-        if not return_matrix:
-            def pi(x):
-                return compute_probs(x)
-            return pi
-        else:
-            out = torch.zeros((N, A), dtype=torch.float64)
-            for x in range(N):
-                out[x] = compute_probs(x)
-            return out
+        self.Cov_emp = Cov_emp
+        self.Cov_emp_inv = Cov_emp_inv
+
+    # ------------------------------------------------------------------
+    # Softmax policy (matrix)
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _row_softmax(logits):
+        z = logits - logits.max(dim=1, keepdim=True).values
+        ez = torch.exp(z)
+        return ez / ez.sum(dim=1, keepdim=True)
 
     # ------------------------------------------------------------------
     # RUN FOGAS
@@ -120,14 +146,12 @@ class FOGASOracleSolver:
         alpha=None,
         eta=None,
         rho=None,
-        n=None,
         D_theta=None,
         lambda_init=None,
         theta_bar_init=None,
         print_policies=False,
         verbose=False,
-        tqdm_print=False, 
-        cov_matrix=None,
+        tqdm_print=False,
     ):
         # -------------------------
         # Override parameters
@@ -137,24 +161,29 @@ class FOGASOracleSolver:
         eta = self.params.eta if eta is None else eta
         rho = self.params.rho if rho is None else rho
         D_theta = self.params.D_theta if D_theta is None else D_theta
-        cov_matrix = self.cov_matrix if cov_matrix is None else cov_matrix
 
         self.mod_alpha = alpha  # store alpha used
 
-        Phi = self.Phi
+        N, A, d = self.N, self.A, self.d
+        n = self.n
         gamma = self.gamma
+        PHI_XA = self.PHI_XA
+        Phi = self.Phi
+        Xn = self.X_nexts.long()
+        x0 = int(self.x0)
+
+        Cov = self.Cov_emp
+        Cov_inv = self.Cov_emp_inv
         omega = self.omega
-        d = self.d
-        A = self.A
-        N = self.N
+
+        device = self.device
 
         # -------------------------
         # Initialization
         # -------------------------
-        lambda_t = torch.zeros(d, dtype=torch.float64) if lambda_init is None else lambda_init.clone()
-        theta_bar_t = torch.zeros(d, dtype=torch.float64) if theta_bar_init is None else theta_bar_init.clone()
+        lambda_t = torch.zeros(d, dtype=torch.float64, device=device) if lambda_init is None else lambda_init.clone().to(device)
+        theta_bar_t = torch.zeros(d, dtype=torch.float64, device=device) if theta_bar_init is None else theta_bar_init.clone().to(device)
         theta_bar_history = []
-        pi_t = lambda x: torch.ones(A, dtype=torch.float64) / A  # start uniform
 
         # -------------------------
         # Main loop
@@ -163,60 +192,44 @@ class FOGASOracleSolver:
         iterator = trange(T, desc="FOGAS", disable=not use_tqdm)
 
         for t in iterator:
+            # ---------- Policy matrix π_t (N,A) ----------
+            logits = alpha * torch.tensordot(PHI_XA, theta_bar_t, dims=([2], [0]))
+            pi_mat = self._row_softmax(logits)
 
-            # ---------------------------
-            # μ̂ term
-            # ---------------------------
-            pi_matrix = self.softmax_policy(theta_bar=theta_bar_t, alpha=alpha, return_matrix=True)
-            occ_measure = self.mdp.occupancy_measure(pi_matrix)
+            # E_phi_pi[x] = sum_a pi(x,a) * phi(x,a)
+            E_phi_pi = (pi_mat[..., None] * PHI_XA).sum(dim=1)
 
-            true_feature_occupancy = Phi.T @ occ_measure
+            # ---------- μ̂ term ----------
+            lambda_emp_sum1 = (1.0 - gamma) * E_phi_pi[x0]
 
-            # ---------------------------
-            # θ_t update
-            # ---------------------------
-            c_t = true_feature_occupancy - lambda_t
+            Lambda_term = Cov_inv @ lambda_t
+            coeff = Phi @ Lambda_term
+            inner = E_phi_pi[Xn]
+            lambda_emp_sum2 = (gamma / n) * (coeff[:, None] * inner).sum(dim=0)
+            emp_feature_occupancy = lambda_emp_sum1 + lambda_emp_sum2
+
+            # ---------- θ_t update ----------
+            c_t = emp_feature_occupancy - lambda_t
             norm_c = torch.linalg.norm(c_t)
             theta_t = torch.zeros_like(c_t) if norm_c < 1e-12 else -D_theta * c_t / norm_c
 
-            # ---------------------------
-            # Ψ̂ v term
-            # ---------------------------
-            # q_theta(s,a) = <theta, phi(s,a)>
-            q = (Phi @ theta_t).reshape(N, A)      # (N,A)
-            v_theta_pi = (pi_matrix * q).sum(dim=1)                  # (N,)
+            # ---------- Ψ̂ v term ----------
+            q = torch.tensordot(PHI_XA[Xn], theta_t, dims=([2], [0]))
+            v = (pi_mat[Xn] * q).sum(dim=1)
+            sum_term = (Phi * v[:, None]).sum(dim=0)
+            Psi_hat_v = (Cov_inv @ sum_term) / n
 
-            Psi_v = self.mdp.get_Psi() @ v_theta_pi                   # (d,)
+            # ---------- λ update ----------
+            g = omega + gamma * Psi_hat_v - theta_t
+            lambda_t = (1.0 / (1.0 + rho * eta)) * (lambda_t + eta * (Cov @ g))
 
-            # ---------------------------
-            # λ update
-            # ---------------------------
-            g = omega + gamma * Psi_v - theta_t
-            
-            if cov_matrix == "identity":
-                Lambda = torch.eye(d, dtype=torch.float64)
-            else:
-                if cov_matrix == "cov_uniform":
-                    mu = torch.ones(N * A, dtype=torch.float64) / (N * A)  # Fixed: added parentheses
-                elif cov_matrix == "cov_opt":
-                    mu = self.mdp.mu_star
-                elif cov_matrix == "cov_dynamic":
-                    mu = occ_measure
-                Lambda = self.beta * torch.eye(d, dtype=torch.float64) + Phi.T @ (mu[:, None] * Phi)
-
-            lambda_t = (1 / (1 + rho * eta)) * (lambda_t + eta * Lambda @ g)
-
-            # ---------------------------
-            # Policy update
-            # ---------------------------
-            theta_bar_t += theta_t
+            # ---------- θ̄ update ----------
+            theta_bar_t = theta_bar_t + theta_t
             theta_bar_history.append(theta_bar_t.clone())
-            pi_t = self.softmax_policy(theta_bar_t, alpha)
 
             if print_policies and (t % max(1, T // 10) == 0):
                 print(f"\nIteration {t+1}")
-                pi_matrix = self.softmax_policy(theta_bar_t, alpha, return_matrix=True)
-                self.mdp.print_policy(pi_matrix)
+                self.mdp.print_policy(pi_mat.cpu())
 
             if verbose and (t % max(1, T // 10) == 0):
                 print(f"\n[FOGAS] Iter {t+1}/{T}")
@@ -224,10 +237,9 @@ class FOGASOracleSolver:
                 print(f"  ||θ_t|| = {torch.linalg.norm(theta_t).item():.3e}")
                 print(f"  λ_t     = {lambda_t}")
                 print(f"  ||λ_t|| = {torch.linalg.norm(lambda_t).item():.3e}")
-    
+
         self.theta_bar_history = theta_bar_history
-        self.pi = self.softmax_policy(theta_bar_t, alpha, return_matrix=True)
+        self.pi = pi_mat
         self.lambda_T = lambda_t
 
-        return pi_t
-
+        return pi_mat

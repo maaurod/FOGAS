@@ -266,3 +266,171 @@ class FOGASEvaluator:
     def print_policy(self):
         self.mdp.print_policy(self.solver.pi)
 
+    # =====================================================
+    # --- Optimal Path Visualization ---
+    # =====================================================
+
+    def simulate_trajectory(self, pi=None, max_steps=100, seed=None, goal_state=None):
+        """
+        Simulate a single trajectory following a given policy.
+        
+        Parameters
+        ----------
+        pi : tensor, optional
+            Policy to follow. If None, uses the learned policy from solver.
+        max_steps : int
+            Maximum number of steps to simulate.
+        seed : int, optional
+            Random seed for reproducibility.
+        goal_state : int, optional
+            If provided, simulation stops when this state is reached.
+            
+        Returns
+        -------
+        trajectory : list of dict
+            Each element contains: {'state': s, 'action': a, 'reward': r, 'next_state': sp}
+        """
+        if seed is not None:
+            torch.manual_seed(seed)
+            
+        mdp = self.mdp
+        
+        if pi is None:
+            if self.solver.pi is None:
+                raise ValueError("Run solver.run() first or provide a policy.")
+            pi = self.solver.pi
+        
+        # Ensure pi is a tensor
+        if not isinstance(pi, torch.Tensor):
+            pi = torch.tensor(pi, dtype=torch.float64)
+            
+        trajectory = []
+        state = int(mdp.x0)
+        
+        for step in range(max_steps):
+            action_probs = pi[state]
+            action = torch.multinomial(action_probs, num_samples=1).item()
+            
+            reward = mdp.r[state * mdp.A + action]
+            if isinstance(reward, torch.Tensor):
+                reward = reward.item()
+                
+            transition_probs = mdp.P[state * mdp.A + action]
+            if isinstance(transition_probs, torch.Tensor):
+                next_state = torch.multinomial(transition_probs, num_samples=1).item()
+            else:
+                next_state = torch.multinomial(torch.tensor(transition_probs), num_samples=1).item()
+            
+            trajectory.append({
+                'state': state,
+                'action': action,
+                'reward': reward,
+                'next_state': next_state,
+                'step': step,
+                'was_self_loop': (next_state == state),
+                'reached_goal': (next_state == goal_state) if goal_state is not None else False
+            })
+            
+            if goal_state is not None and next_state == goal_state:
+                break
+                
+            state = next_state
+            
+        return trajectory
+
+    def print_optimal_path(self, use_optimal=False, num_trajectories=1, 
+                          max_steps=50, seed=42, show_probabilities=False,
+                          show_probabilities_first_n=5, goal_state=None):
+        """
+        Display optimal path(s) from initial state in a pretty format.
+        """
+        mdp = self.mdp
+        
+        if use_optimal:
+            pi = mdp.pi_star
+            policy_name = "Optimal Policy (π*)"
+        else:
+            if self.solver.pi is None:
+                raise ValueError("Run solver.run() first.")
+            pi = self.solver.pi
+            policy_name = "Learned Policy (π_FOGAS)"
+            
+        print(f"\n{'='*70}")
+        print(f"  OPTIMAL PATH VISUALIZATION - {policy_name}")
+        print(f"{'='*70}\n")
+        print(f"Initial State: {mdp.states[mdp.x0]}")
+        if goal_state is not None:
+            print(f"Goal State: {mdp.states[goal_state]}")
+        print(f"Discount Factor (γ): {mdp.gamma}")
+        print(f"\n{'-'*70}\n")
+        
+        for traj_idx in range(num_trajectories):
+            current_seed = seed + traj_idx if seed is not None else None
+            trajectory = self.simulate_trajectory(
+                pi=pi, 
+                max_steps=max_steps, 
+                seed=current_seed,
+                goal_state=goal_state
+            )
+            
+            if num_trajectories > 1:
+                print(f"\n  --- Trajectory {traj_idx + 1} ---\n")
+                
+            discounted_return = 0.0
+            
+            for i, step in enumerate(trajectory):
+                s, a, r, sp = step['state'], step['action'], step['reward'], step['next_state']
+                
+                state_name = mdp.states[s]
+                action_name = mdp.actions[a]
+                next_state_name = mdp.states[sp]
+                
+                discount_factor = (mdp.gamma ** i)
+                discounted_return += discount_factor * r
+                
+                step_str = f"Step {i:3d}"
+                state_str = f"State: {state_name}"
+                action_str = f"Action: {action_name}"
+                reward_str = f"Reward: {r:7.3f}"
+                next_str = f"→ {next_state_name}"
+                
+                indicators = ""
+                if step.get('was_self_loop', False):
+                    indicators += " ⚠️ SELF-LOOP"
+                if step.get('reached_goal', False):
+                    indicators += " 🎯 GOAL REACHED!"
+                
+                print(f"  {step_str} │ {state_str:15s} │ {action_str:15s} │ {reward_str} │ {next_str}{indicators}")
+                
+                if show_probabilities and i < show_probabilities_first_n:
+                    print(f"           │ Policy at state {s}:")
+                    for act_idx in range(mdp.A):
+                        prob = pi[s, act_idx]
+                        if isinstance(prob, torch.Tensor):
+                            prob = prob.item()
+                        bar_len = int(prob * 20)
+                        bar = "█" * bar_len + "░" * (20 - bar_len)
+                        print(f"           │   π(a={act_idx}|s={s}) = {prob:.3f} {bar}")
+                    print(f"           │")
+                    
+            final_state = trajectory[-1]['next_state']
+            
+            print(f"\n  {'─'*66}")
+            print(f"  Trajectory Length: {len(trajectory)} steps")
+            print(f"  Discounted Return: {discounted_return:.6f}")
+            print(f"  Final State: {mdp.states[final_state]}")
+            
+        print(f"\n{'-'*70}")
+        
+        v_pi, _ = mdp.evaluate_policy(pi)
+        v_x0 = v_pi[mdp.x0]
+        if isinstance(v_x0, torch.Tensor):
+            v_x0 = v_x0.item()
+        print(f"  Expected Return (from V): {v_x0:.6f}")
+        
+        v_star = mdp.v_star[mdp.x0]
+        if isinstance(v_star, torch.Tensor):
+            v_star = v_star.item()
+        print(f"  Optimal Return (π*): {v_star:.6f}")
+        
+        print(f"\n{'='*70}\n")

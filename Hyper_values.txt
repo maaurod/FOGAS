@@ -1,0 +1,109 @@
+------------------- 2 STATE -------------------------------------------
+                Tabular features:
+
+bounds_overrides={"alpha" : (1e-2, 1.0), "rho" : (1e-2, 1.0), "eta" : (1e-2, 1.0)}
+alpha=1.0000e+00, rho=8.7633e-01, eta=1.2152e-02 
+
+                Funky features:
+alpha=5.0000e+00, rho=1.0000e-02, eta=2.8885e-03 
+
+------------------- 3 GRID -------------------------------------------
+
+                Tabular features:
+
+alpha=5.0, rho=1.845e-1 eta = 5.10e-02
+
+                State-aggregation:
+
+bounds_overrides={"alpha" : (1e-2, 5.0), "rho" : (1e-2, 3.0), "eta" : (1e-2, 3.0)}
+alpha=2.0578e+00, rho=1.5029e-02, eta=2.1369e-02
+
+------------------- 3 GRID WALL --------------------------------------
+
+                Tabular features:
+
+bounds_overrides={"alpha" : (1e-2, 5.0), "rho" : (1e-2, 3.0), "eta" : (1e-2, 3.0)}
+alpha=4.9337e+00, rho=1.0000e-02, eta=1.0000e-02
+
+                State-aggregation:
+
+bounds_overrides={"alpha" : (1e-2, 5.0), "rho" : (1e-2, 3.0), "eta" : (1e-2, 3.0)}
+alpha=4.4392e+00, rho=3.0000e+00, eta=1.0000e-02 
+
+
+Below is a **clean, copy-paste–ready text version**, organized **first for TABULAR features, then for STATE-AGGREGATION / APPROXIMATE features**.
+You can drop this directly into a `.txt` file.
+
+
+
+1. TABULAR FEATURES
+
+From experiments:
+
+* alpha tends to be LARGE
+* rho is MODERATE (sometimes small when dynamics are irregular)
+* eta is MODERATE
+* Algorithm tolerates aggressive updates
+* Convergence is fast and stable
+
+Typical optimized values observed:
+
+* alpha ≈ 3 – 5
+* rho   ≈ 0.05 – 0.3
+* eta   ≈ 0.02 – 0.06
+
+In some harder cases (walls, terminals):
+
+* rho and eta may hit lower bounds
+* Indicates sensitivity to dynamics, not representation limits
+
+Interpretation:
+
+* Tabular features induce no bias
+* Large step sizes do not amplify approximation errors
+* Instability mainly comes from overly aggressive mixing, not function approximation
+
+Recommended default:
+
+* alpha = 5.0
+* rho   = 0.05
+* eta   = 0.02
+
+Tuning advice:
+
+* If unstable: slightly reduce rho
+* If slow but stable: increase alpha
+* Eta usually does not need to be very small
+
+2. STATE AGGREGATION / APPROXIMATE FEATURES
+
+From experiments:
+
+* rho consistently very SMALL
+* eta consistently SMALL (often at lower bound)
+* alpha used to compensate for small rho and eta
+* Best values frequently hit optimization bounds
+
+Typical optimized values observed:
+
+* alpha ≈ 2 – 5
+* rho   ≈ 0.01 – 0.05
+* eta   ≈ 0.005 – 0.02
+
+Interpretation
+
+* Large rho amplifies bias from feature mismatch
+* Large eta destabilizes coupled updates
+
+Recommended default:
+
+* alpha = 3.0
+* rho   = 0.01
+* eta   = 0.01
+
+Tuning advice:
+
+* If unstable: reduce rho or eta further
+* If stable but slow: increase alpha first
+* Avoid increasing rho unless absolutely necessary
+

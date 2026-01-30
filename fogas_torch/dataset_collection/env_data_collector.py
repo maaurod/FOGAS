@@ -36,7 +36,8 @@ class EnvDataCollector:
     """
 
     def __init__(self, mdp=None, env_name=None, env=None,
-                 max_steps=1000, terminal_states=None, seed=42):
+                 max_steps=1000, terminal_states=None, restricted_states=None, 
+                 initial_states=None, reset_probs=None, seed=42):
         """
         seed: random seed for reproducibility in environment and policy sampling
         """
@@ -54,6 +55,9 @@ class EnvDataCollector:
                 mdp,
                 max_steps=max_steps,
                 terminal_states=terminal_states,
+                restricted_states=restricted_states,
+                initial_states=initial_states,
+                reset_probs=reset_probs,
             )
 
         elif env_name is not None:
@@ -97,6 +101,23 @@ class EnvDataCollector:
             action_probs = self.policy_matrix[state]
             return random.choices(range(len(action_probs)), weights=action_probs)[0]
 
+    class EpsilonGreedyPolicy:
+        """
+        Wraps a base policy with epsilon-greedy exploration.
+        1 - epsilon probability: follow base_policy.sample(state)
+        epsilon probability: take a random action from action_space
+        """
+        def __init__(self, base_policy, epsilon, action_space):
+            self.base_policy = base_policy
+            self.epsilon = epsilon
+            self.action_space = action_space
+
+        def sample(self, state):
+            if random.random() < self.epsilon:
+                return self.action_space.sample()
+            else:
+                return self.base_policy.sample(state)
+
     # --------------------------------------------
     # Policy factory
     # --------------------------------------------
@@ -105,11 +126,21 @@ class EnvDataCollector:
         Accepts:
             - a policy object with .sample(state)
             - a torch tensor or numpy array (policy matrix of shape (N, A))
-            - or a string: "random", "uniform"
+            - a string: "random", "uniform"
+            - a tuple: (base_policy, epsilon) -> creates an EpsilonGreedyPolicy
 
         Returns:
             A policy object with method sample(state).
         """
+
+        # Epsilon-greedy check: tuple (base_policy, epsilon)
+        if isinstance(policy, tuple) and len(policy) == 2:
+            base_pol_input, epsilon = policy
+            if not isinstance(epsilon, (float, int)):
+                raise ValueError(f"Epsilon must be a number, got {type(epsilon)}")
+            
+            base_policy = self._make_policy(base_pol_input)
+            return self.EpsilonGreedyPolicy(base_policy, float(epsilon), self.env.action_space)
 
         # Already a policy object → return as is
         if hasattr(policy, "sample"):

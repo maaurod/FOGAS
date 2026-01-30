@@ -59,6 +59,51 @@ class FOGASHyperOptimizer:
     # =====================================================
     # Optimal search 
     # =====================================================
+    def simple_grid_search(
+        self,
+        param_name,
+        bounds,
+        n_points=10,
+        fixed_params=None,
+        log_scale=False,
+        num_runs=3,
+        print_results=False
+    ):
+        """
+        Performs a simple grid search for a single parameter.
+        Returns:
+            best_param (float): The parameter value that minimized the metric.
+            grid_values (np.ndarray): The values tested.
+            metric_values (np.ndarray): The corresponding metric values.
+        """
+        fixed_params = fixed_params or {}
+        a, b = bounds
+
+        if log_scale:
+            grid = np.logspace(np.log10(a), np.log10(b), n_points)
+        else:
+            grid = np.linspace(a, b, n_points)
+
+        X, y = [], []
+        for v in grid:
+            params = dict(fixed_params)
+            params[param_name] = v
+
+            val = self._evaluate(num_runs=num_runs, **params)
+            X.append(v)
+            y.append(val)
+
+            if print_results:
+                print(f"{param_name}={v:.4g}, metric={val:.4f}")
+
+        X = np.array(X)
+        y = np.array(y)
+        
+        best_idx = int(np.argmin(y))
+        best_param = float(X[best_idx])
+        
+        return best_param, X, y
+
     def optimal_search(
         self,
         param_name,

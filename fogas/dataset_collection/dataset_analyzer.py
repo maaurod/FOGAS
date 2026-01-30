@@ -31,7 +31,8 @@ class DatasetAnalyzer:
         self.csv_path = csv_path
         self.df = pd.read_csv(csv_path)
         
-        # Pre-compute pair counts for efficiency
+        # Pre-compute counts for efficiency
+        self._state_counts = self.df['state'].value_counts()
         self._pair_counts = self.df.groupby(['state', 'action']).size()
         self._pair_counts_df = self._pair_counts.reset_index(name='count')
     
@@ -39,7 +40,7 @@ class DatasetAnalyzer:
     # Specific Pair Queries
     # -------------------------------------------------------------------------
     
-    def count_pair(self, state: int, action: int) -> int:
+    def count_pair(self, state: int, action: Union[int, str], action_map: Optional[dict] = None) -> int:
         """
         Get the count of a specific (state, action) pair.
         
@@ -47,18 +48,62 @@ class DatasetAnalyzer:
         ----------
         state : int
             State index
-        action : int
-            Action index
+        action : int or str
+            Action index or action name (requires action_map)
+        action_map : dict, optional
+            Mapping from action names to indices (e.g., {'Down': 1})
             
         Returns
         -------
         int
             Number of times this (state, action) pair appears in the dataset
         """
+        if isinstance(action, str):
+            if action_map is None:
+                # Default mapping for standard GridWorld
+                action_map = {"Up": 0, "Down": 1, "Left": 2, "Right": 3}
+            
+            action_id = action_map.get(action)
+            if action_id is None:
+                return 0
+            action = action_id
+
         try:
             return self._pair_counts[(state, action)]
         except KeyError:
             return 0
+
+    def count_state(self, state: int) -> int:
+        """
+        Get the count of a specific state.
+        
+        Parameters
+        ----------
+        state : int
+            State index
+            
+        Returns
+        -------
+        int
+            Number of times this state appears in the dataset
+        """
+        return int(self._state_counts.get(state, 0))
+
+    def count_states(self, states: List[int]) -> dict:
+        """
+        Get counts for multiple states.
+        
+        Parameters
+        ----------
+        states : list of int
+            List of state indices to query
+            
+        Returns
+        -------
+        dict
+            Dictionary mapping state -> count
+        """
+        return {s: self.count_state(s) for s in states}
     
     def count_pairs(self, pairs: List[Tuple[int, int]]) -> dict:
         """
@@ -109,6 +154,38 @@ class DatasetAnalyzer:
         """
         action_data = self._pair_counts_df[self._pair_counts_df['action'] == action]
         return action_data[['state', 'count']].sort_values('count', ascending=False)
+
+    def analyze_custom_stats(self, states: List[int] = None, 
+                             pairs: List[Tuple[int, Union[int, str]]] = None, 
+                             action_map: Optional[dict] = None) -> None:
+        """
+        Print analysis for specific states and (state, action) pairs.
+        
+        Parameters
+        ----------
+        states : list of int, optional
+            States to count
+        pairs : list of (state, action) tuples, optional
+            Pairs to count
+        action_map : dict, optional
+            Mapping for action names
+        """
+        print("\n" + "=" * 40)
+        print("     CUSTOM DATASET ANALYSIS")
+        print("=" * 40)
+        
+        if states:
+            print("\n[State Visit Counts]")
+            for s in states:
+                print(f"  State {s:3d}: {self.count_state(s):6d}")
+                
+        if pairs:
+            print("\n[State-Action Pair Counts]")
+            for s, a in pairs:
+                count = self.count_pair(s, a, action_map)
+                print(f"  Pair ({s}, {a}): {count:6d}")
+        
+        print("\n" + "=" * 40 + "\n")
     
     # -------------------------------------------------------------------------
     # Global Statistics

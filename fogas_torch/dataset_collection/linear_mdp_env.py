@@ -14,6 +14,7 @@ Episodes:
 """
 
 import torch
+import random
 import gymnasium as gym
 from gymnasium import spaces
 
@@ -27,7 +28,9 @@ class LinearMDPEnv(gym.Env):
 
     metadata = {"render_modes": ["human"]}
 
-    def __init__(self, mdp, max_steps=100, terminal_states=None, tol=1e-8):
+    def __init__(self, mdp, max_steps=100, terminal_states=None, 
+                 restricted_states=None, initial_states=None, 
+                 reset_probs=None, tol=1e-8):
         super().__init__()
 
         self.mdp = mdp
@@ -52,6 +55,21 @@ class LinearMDPEnv(gym.Env):
             self.terminal_states = self._detect_absorbing_states(self.P, tol=tol)
         else:
             self.terminal_states = set(terminal_states)
+
+        # Handle restricted states for random restarts (walls, pits, etc.)
+        if restricted_states is None:
+            self.forbidden_resets = self.terminal_states.copy()
+        else:
+            self.forbidden_resets = set(restricted_states) | self.terminal_states
+        
+        # List of states that are valid for a random restart
+        self.valid_start_states = [int(s) for s in range(self.N) if int(s) not in self.forbidden_resets]
+        
+        # Custom initial states if provided by the user
+        self.custom_start_states = initial_states if initial_states is not None else []
+        
+        # Reset probabilities: e.g., {'x0': 0.2, 'random': 0.8, 'custom': 0.0}
+        self.reset_probs = reset_probs
 
     # ------------------------------------------------
     # Helper: detect absorbing states from P
@@ -100,8 +118,24 @@ class LinearMDPEnv(gym.Env):
         super().reset(seed=seed)
         self.step_count = 0
 
-        # Random initial state (uniform over states)
-        self.state = self.mdp.x0
+        # Determine starting state based on reset_probs
+        if self.reset_probs is not None:
+            # We expect reset_probs to be a dict e.g. {'x0': 0.2, 'random': 0.8}
+            modes = list(self.reset_probs.keys())
+            weights = list(self.reset_probs.values())
+            
+            mode = random.choices(modes, weights=weights)[0]
+            
+            if mode == 'random' and self.valid_start_states:
+                self.state = random.choice(self.valid_start_states)
+            elif mode == 'custom' and self.custom_start_states:
+                self.state = random.choice(self.custom_start_states)
+            else:
+                self.state = self.mdp.x0
+        else:
+            # Default behavior: always start at x0
+            self.state = self.mdp.x0
+            
         return int(self.state), {}
 
     # ------------------------------------------------

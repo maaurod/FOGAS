@@ -35,6 +35,15 @@ class DatasetAnalyzer:
         self._state_counts = self.df['state'].value_counts()
         self._pair_counts = self.df.groupby(['state', 'action']).size()
         self._pair_counts_df = self._pair_counts.reset_index(name='count')
+
+    @staticmethod
+    def _to_numpy(value) -> np.ndarray:
+        """
+        Convert numpy arrays, lists, or torch tensors to numpy arrays.
+        """
+        if hasattr(value, "detach"):
+            return value.detach().cpu().numpy()
+        return np.asarray(value)
     
     # -------------------------------------------------------------------------
     # Specific Pair Queries
@@ -230,6 +239,165 @@ class DatasetAnalyzer:
             stats['missing_pairs'] = total_possible - stats['unique_pairs']
         
         return stats
+
+    # -------------------------------------------------------------------------
+    # Feature Coverage (FOGAS)
+    # -------------------------------------------------------------------------
+    def feature_coverage_ratio(
+        self,
+        mdp,
+        beta: float = 0.0,
+        policy: Optional[np.ndarray] = None,
+        use_optimal_policy: bool = True,
+        return_details: bool = False,
+        verbose: bool = False,
+    ) -> Union[float, dict]:
+        """
+        Compute feature coverage ratio ||lambda_pi||_{Lambda_n^{-1}}^2.
+
+        Lambda_n = beta I + (1/n) sum_i phi_i phi_i^T
+        lambda_pi = Phi^T mu_pi
+
+        Parameters
+        ----------
+        mdp : LinearMDP or PolicySolver
+            Must expose states, actions, N, A, d, Phi, gamma, nu0 and
+            get_transition_matrix(). If policy is None and use_optimal_policy
+            is True, mdp must expose pi_star.
+        beta : float
+            Ridge term for empirical covariance.
+        policy : ndarray, optional
+            Policy matrix with shape (N, A). If None, uses mdp.pi_star.
+        use_optimal_policy : bool
+            Whether to default to mdp.pi_star when policy is None.
+        return_details : bool
+            If True, returns a dict with intermediate values.
+        verbose : bool
+            If True, prints a short summary.
+
+        Returns
+        -------
+        float or dict
+            Feature coverage ratio, or a dict with details.
+        """
+        if len(self.df) == 0:
+            raise ValueError("Dataset is empty; cannot compute coverage ratio.")
+
+        if policy is None:
+            if not use_optimal_policy:
+                raise ValueError("Provide policy or set use_optimal_policy=True.")
+            if not hasattr(mdp, "pi_star"):
+                raise ValueError("mdp does not expose pi_star; provide policy explicitly.")
+            policy = mdp.pi_star
+
+        # Map dataset states/actions to MDP indices (robust to non-0..N-1 labels)
+        states_arr = self._to_numpy(mdp.states).astype(int)
+        actions_arr = self._to_numpy(mdp.actions).astype(int)
+        state_index = {int(s): i for i, s in enumerate(states_arr)}
+        action_index = {int(a): i for i, a in enumerate(actions_arr)}
+
+        X_raw = self.df["state"].to_numpy(dtype=np.int64)
+        A_raw = self.df["action"].to_numpy(dtype=np.int64)
+        try:
+            X_idx = np.array([state_index[int(s)] for s in X_raw], dtype=np.int64)
+            A_idx = np.array([action_index[int(a)] for a in A_raw], dtype=np.int64)
+        except KeyError as exc:
+            raise ValueError("Dataset contains states/actions not present in the MDP.") from exc
+
+        N, A, d = int(mdp.N), int(mdp.A), int(mdp.d)
+        policy_np = self._to_numpy(policy).astype(float)
+        if policy_np.shape != (N, A):
+            raise ValueError(f"Policy must have shape ({N}, {A}); got {policy_np.shape}.")
+
+        # Build Phi tensors from MDP (N*A, d) -> (N, A, d)
+        Phi_full = self._to_numpy(mdp.Phi).reshape(N, A, d)
+        Phi_data = Phi_full[X_idx, A_idx]  # (n, d)
+
+        n = len(self.df)
+        Cov = beta * np.eye(d) + (Phi_data.T @ Phi_data) / n
+
+        # Compute occupancy measure mu_pi using numpy
+        if hasattr(mdp, "P") and mdp.P is not None:
+            P = mdp.P
+        else:
+            P = mdp.get_transition_matrix()
+        P_np = self._to_numpy(P).astype(float)
+        nu0_np = self._to_numpy(mdp.nu0).reshape(-1).astype(float)
+        gamma = float(mdp.gamma)
+
+        Comp_pi = np.zeros((N * A, N), dtype=float)
+        for x in range(N):
+            Comp_pi[x * A:(x + 1) * A, x] = policy_np[x]
+
+        rhs = (1.0 - gamma) * (Comp_pi @ nu0_np)
+        mu_pi = np.linalg.solve(np.eye(N * A) - gamma * Comp_pi @ P_np.T, rhs)
+
+        Phi_flat = Phi_full.reshape(N * A, d)
+        lambda_pi = Phi_flat.T @ mu_pi
+
+        ratio = float(lambda_pi.T @ np.linalg.solve(Cov, lambda_pi))
+
+        if verbose:
+            policy_src = "mdp.pi_star" if (policy is None and use_optimal_policy) else "provided"
+            mu_sum = float(mu_pi.sum())
+            mu_min = float(mu_pi.min())
+            mu_max = float(mu_pi.max())
+            lambda_l2 = float(np.linalg.norm(lambda_pi))
+            lambda_l1 = float(np.linalg.norm(lambda_pi, 1))
+            lambda_max = float(np.max(np.abs(lambda_pi)))
+
+            diag = np.diag(Cov)
+            diag_min = float(diag.min())
+            diag_max = float(diag.max())
+            diag_mean = float(diag.mean())
+
+            try:
+                eigs = np.linalg.eigvalsh(Cov)
+                eig_min = float(eigs.min())
+                eig_max = float(eigs.max())
+                cond = float(eig_max / eig_min) if eig_min > 0 else float("inf")
+            except np.linalg.LinAlgError:
+                eig_min = float("nan")
+                eig_max = float("nan")
+                cond = float("nan")
+
+            print("\nFeature Coverage Ratio Details")
+            print("------------------------------")
+            print(f"  Dataset size (n):         {n}")
+            print(f"  MDP dims (N, A, d):        ({N}, {A}, {d})")
+            print(f"  gamma:                    {gamma:.6g}")
+            print(f"  beta (ridge):             {beta:.6g}")
+            print(f"  policy source:            {policy_src}")
+            print("")
+            print("  Occupancy μ_pi summary:")
+            print(f"    sum:                    {mu_sum:.6g}")
+            print(f"    min / max:              {mu_min:.6g} / {mu_max:.6g}")
+            print("")
+            print("  Feature occupancy λ_pi summary:")
+            print(f"    ||λ||_2:                {lambda_l2:.6g}")
+            print(f"    ||λ||_1:                {lambda_l1:.6g}")
+            print(f"    max |λ_i|:              {lambda_max:.6g}")
+            print("")
+            print("  Empirical covariance Λ_n:")
+            print(f"    diag min / mean / max:  {diag_min:.6g} / {diag_mean:.6g} / {diag_max:.6g}")
+            print(f"    eig min / max:          {eig_min:.6g} / {eig_max:.6g}")
+            print(f"    condition number:       {cond:.6g}")
+            print("")
+            print(f"  Coverage ratio:           {ratio:.6g}")
+
+        if return_details:
+            details = {
+                "coverage_ratio": ratio,
+                "lambda_pi": lambda_pi,
+                "mu_pi": mu_pi,
+                "covariance": Cov,
+                "policy": policy_np,
+                "beta": beta,
+                "n": n,
+            }
+            return details
+
+        return ratio
     
     def get_all_pair_counts(self, sort_by: str = 'count', 
                             ascending: bool = False) -> pd.DataFrame:

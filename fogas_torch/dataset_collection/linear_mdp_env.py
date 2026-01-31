@@ -14,6 +14,7 @@ Episodes:
 """
 
 import torch
+import numpy as np
 import random
 import gymnasium as gym
 from gymnasium import spaces
@@ -117,6 +118,16 @@ class LinearMDPEnv(gym.Env):
     def reset(self, *, seed=None, options=None):
         super().reset(seed=seed)
         self.step_count = 0
+
+        # Set manual seeds for reproducibility if seed is provided
+        if seed is not None:
+            random.seed(seed)
+            np.random.seed(seed)
+            torch.manual_seed(seed)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed(seed)
+            if torch.backends.mps.is_available():
+                torch.mps.manual_seed(seed)
 
         # Determine starting state based on reset_probs
         if self.reset_probs is not None:

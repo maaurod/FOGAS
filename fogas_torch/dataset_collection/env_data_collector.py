@@ -46,6 +46,12 @@ class EnvDataCollector:
         # Set random seed for reproducibility
         if seed is not None:
             random.seed(seed)
+            np.random.seed(seed)
+            torch.manual_seed(seed)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed(seed)
+            if torch.backends.mps.is_available():
+                torch.mps.manual_seed(seed)
 
         if env is not None:
             self.env = env
@@ -65,6 +71,12 @@ class EnvDataCollector:
 
         else:
             raise ValueError("You must provide either mdp, env_name, or env.")
+
+        # Seed environment and spaces
+        if seed is not None:
+            self.env.action_space.seed(seed)
+            self.env.observation_space.seed(seed)
+            self.env.reset(seed=seed)
 
     class RandomPolicy:
         """Chooses actions uniformly at random from the env's action space."""
@@ -189,6 +201,12 @@ class EnvDataCollector:
         # Reset seed for reproducible data collection
         if self.seed is not None:
             random.seed(self.seed)
+            np.random.seed(self.seed)
+            torch.manual_seed(self.seed)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed(self.seed)
+            if torch.backends.mps.is_available():
+                torch.mps.manual_seed(self.seed)
         
         env = self.env
         policy = self._make_policy(policy)
@@ -270,6 +288,12 @@ class EnvDataCollector:
         # Reset seed for reproducible data collection
         if self.seed is not None:
             random.seed(self.seed)
+            np.random.seed(self.seed)
+            torch.manual_seed(self.seed)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed(self.seed)
+            if torch.backends.mps.is_available():
+                torch.mps.manual_seed(self.seed)
         
         # Validate inputs
         if not isinstance(policies, list):

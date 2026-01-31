@@ -1,4 +1,6 @@
 import torch
+import random
+import numpy as np
 
 from .fogas_parameters import FOGASParameters
 from tqdm import trange
@@ -34,9 +36,13 @@ class FOGASOracleSolver:
 
         # Set random seed for reproducibility
         if seed is not None:
+            random.seed(seed)
+            np.random.seed(seed)
             torch.manual_seed(seed)
             if torch.cuda.is_available():
                 torch.cuda.manual_seed(seed)
+            if torch.backends.mps.is_available():
+                torch.mps.manual_seed(seed)
 
         self.n = 10e6 if n is None else n
 

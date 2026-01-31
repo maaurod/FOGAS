@@ -1,4 +1,6 @@
 import torch
+import random
+import numpy as np
 
 from .fogas_dataset import FOGASDataset
 from .fogas_parameters import FOGASParameters
@@ -38,9 +40,13 @@ class FOGASSolverVectorized:
 
         # Set random seed for reproducibility
         if seed is not None:
+            random.seed(seed)
+            np.random.seed(seed)
             torch.manual_seed(seed)
             if torch.cuda.is_available():
                 torch.cuda.manual_seed(seed)
+            if torch.backends.mps.is_available():
+                torch.mps.manual_seed(seed)
 
         # Move MDP to device
         self.mdp.to(self.device)

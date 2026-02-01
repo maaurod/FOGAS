@@ -256,6 +256,111 @@ class EnvDataCollector:
 
         return df
 
+    def collect_dataset_terminal_aware(self, policy="random", n_steps=1000, save_path=None, verbose=True, extra_steps=5):
+        """
+        Collect transitions following behavior policy π_b and return an ordered DataFrame.
+        Similar to collect_dataset, but when an absorbing state is reached, the trajectory
+        stays for 'extra_steps' in that state before terminating and restarting.
+
+        Parameters
+        ----------
+        policy : str or object
+            Behavior policy ("random", "uniform", or object with .sample(state)).
+        n_steps : int
+            Number of environment steps to collect.
+        save_path : str or None
+            If provided, CSV path where (s, a, r, s') transitions are saved.
+        verbose : bool
+            If True, prints basic info when saving.
+        extra_steps : int
+            Number of additional transitions to record in the absorbing state. Default is 5.
+        """
+        # Reset seed for reproducible data collection
+        if self.seed is not None:
+            random.seed(self.seed)
+            np.random.seed(self.seed)
+            torch.manual_seed(self.seed)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed(self.seed)
+            if torch.backends.mps.is_available():
+                torch.mps.manual_seed(self.seed)
+        
+        env = self.env
+        policy = self._make_policy(policy)
+
+        data = {
+            "episode": [],
+            "step": [],
+            "state": [],
+            "action": [],
+            "reward": [],
+            "next_state": [],
+        }
+
+        episode, step = 0, 0
+        obs, _ = env.reset()
+        
+        # Track if we are currently staying in an absorbing state
+        extra_steps_remaining = -1
+        captured_reward = 0.0
+
+        for _ in range(n_steps):
+            action = policy.sample(obs)
+            next_obs, reward, terminated, truncated, _ = env.step(action)
+
+            # If we are already in the extra-stay phase (not the first hit of termination),
+            # override the environment's 0.0 reward with the captured one.
+            if extra_steps_remaining != -1:
+                reward = captured_reward
+
+            data["episode"].append(episode)
+            data["step"].append(step)
+            data["state"].append(obs)
+            data["action"].append(action)
+            data["reward"].append(reward)
+            data["next_state"].append(next_obs)
+
+            step += 1
+
+            if truncated:
+                # Truncation always causes an immediate reset
+                episode += 1
+                step = 0
+                obs, _ = env.reset()
+                extra_steps_remaining = -1
+            elif terminated:
+                # If we just reached a terminal (absorbing) state
+                if extra_steps_remaining == -1:
+                    # FIRST HIT: Start the extra-stay counter and capture the reward
+                    extra_steps_remaining = extra_steps
+                    captured_reward = reward
+                
+                if extra_steps_remaining > 0:
+                    # Stay in the absorbing state for extra steps
+                    extra_steps_remaining -= 1
+                    obs = next_obs # In LinearMDPEnv, next_obs == obs for terminal states
+                else:
+                    # After the extra steps, finally reset
+                    episode += 1
+                    step = 0
+                    obs, _ = env.reset()
+                    extra_steps_remaining = -1
+            else:
+                obs = next_obs
+
+        df = pd.DataFrame(data)
+
+        # Optional saving
+        if save_path is not None:
+            os.makedirs(os.path.dirname(save_path), exist_ok=True)
+            df[["state", "action", "reward", "next_state"]].to_csv(save_path, index=False)
+
+            if verbose:
+                print(f"✅ Terminal-aware dataset saved to: {save_path}")
+                print(f"   Total transitions: {len(df)}")
+
+        return df
+
     def collect_mixed_dataset(self, policies, proportions=None, n_steps=1000, 
                              save_path=None, verbose=True, episode_based=True):
         """

@@ -36,6 +36,7 @@ class LinearMDP:
         x0,
         psi=None,   # callable psi(xp)->(d,) OR dict {xp:(d,)} OR None
         P=None,
+        terminal_states=None,
     ):
         """
         Linear MDP with feature-based rewards and transitions.
@@ -53,6 +54,8 @@ class LinearMDP:
         self.actions = np.array(actions)
         self.N = len(self.states)
         self.A = len(self.actions)
+
+        self.terminal_states = set(terminal_states) if terminal_states is not None else set()
 
         self.phi = phi
         self.d = len(phi(self.states[0], self.actions[0]))

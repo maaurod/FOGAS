@@ -38,7 +38,9 @@ class LinearMDPEnv(gym.Env):
         self.states = mdp.states
         self.actions = mdp.actions
         self.N = mdp.N
+        self.N = mdp.N
         self.A = mdp.A
+        self.x0 = mdp.x0
 
         self.observation_space = spaces.Discrete(self.N)
         self.action_space = spaces.Discrete(self.A)
@@ -145,7 +147,7 @@ class LinearMDPEnv(gym.Env):
                 self.state = self.mdp.x0
         else:
             # Default behavior: always start at x0
-            self.state = self.mdp.x0
+            self.state = self.x0
             
         return int(self.state), {}
 

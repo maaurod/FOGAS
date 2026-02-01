@@ -25,7 +25,7 @@ import math
 class FOGASParameters:
     def __init__(self, mdp, n, delta=0.05,
                  T=None, alpha=None, eta=None, rho=None, D_theta=None,
-                 print_params=False):
+                 beta=None, print_params=False):
 
         # Store core inputs
         self.delta = delta
@@ -43,10 +43,11 @@ class FOGASParameters:
             "eta": eta,
             "rho": rho,
             "D_theta": D_theta,
+            "beta": beta,
         }
 
         # Compute all parameters
-        self.compute(T, alpha, eta, rho, D_theta)
+        self.compute(T, alpha, eta, rho, D_theta, beta)
 
         # Optional pretty-print summary
         if print_params:
@@ -55,7 +56,7 @@ class FOGASParameters:
     # ----------------------------------------------------------------------
     # PARAMETER COMPUTATION
     # ----------------------------------------------------------------------
-    def compute(self, T, alpha, eta, rho, D_theta):
+    def compute(self, T, alpha, eta, rho, D_theta, beta):
         delta = self.delta
         R = self.R
         n = self.n
@@ -89,7 +90,7 @@ class FOGASParameters:
 
         # --- Additional derived quantities ---
         self.D_pi = self.alpha * self.T * self.D_theta
-        self.beta = R**2 / (d * self.T)
+        self.beta = R**2 / (d * self.T) if beta is None else beta
 
     # ----------------------------------------------------------------------
     # PRETTY SUMMARY PRINT
@@ -146,7 +147,7 @@ class FOGASParameters:
         print(f"{'rho:':25s}       {fmt('rho', self.rho)}")
         print(f"{'eta:':25s}       {fmt('eta', self.eta)}")
         print(f"{'D_theta:':25s}   {fmt('D_theta', self.D_theta)}")
-        print(f"{'beta (ridge):':25s} {self.beta:.6f}")
+        print(f"{'beta (ridge):':25s} {fmt('beta', R**2 / (d * self.T))}")
         print(f"{'D_pi (derived):':25s} {self.D_pi:.6f}")
 
         print("\n=========================================================\n")

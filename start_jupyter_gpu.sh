@@ -14,7 +14,8 @@ echo "🔌 Port: $PORT"
 echo ""
 
 # Start interactive session with GPU
-srun --time=$TIME \
+srun --exclude=aga \
+     --time=$TIME \
      --gres=gpu:$GPU_COUNT \
      --mem=32G \
      --cpus-per-task=4 \

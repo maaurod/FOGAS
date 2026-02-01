@@ -23,6 +23,7 @@ class FOGASSolverVectorized:
         eta=None,
         rho=None,
         D_theta=None,
+        beta=None,
         print_params=False,
         dataset_verbose=False,
         seed=42,
@@ -89,6 +90,7 @@ class FOGASSolverVectorized:
             eta=eta,
             rho=rho,
             D_theta=D_theta,
+            beta=beta,
             print_params=print_params,
         )
 

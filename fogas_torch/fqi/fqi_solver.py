@@ -28,12 +28,14 @@ class FQISolver:
         dataset_verbose=False,
         seed=42,
         device=None,
+        augment_terminal_transitions=True,
     ):
         self.mdp = mdp
         # Allow overriding gamma, otherwise take from MDP
         self.gamma = gamma if gamma is not None else mdp.gamma
         self.ridge = ridge
         self.seed = seed
+        self.augment_terminal_transitions = augment_terminal_transitions
 
         # Set device
         if device is None:
@@ -70,34 +72,11 @@ class FQISolver:
         self.As = self.dataset.A.to(self.device)         # (n,)
         self.Rs = self.dataset.R.to(self.device)         # (n,)
         self.X_nexts = self.dataset.X_next.to(self.device) # (n,)
+        self._state_to_index = self._build_state_to_index()
+        self.added_terminal_samples = 0
 
-        # ------------------------------
-        # Done mask (terminal next-state)
-        # ------------------------------
-        if hasattr(self.mdp, "terminal_states"):
-            terminal_list = list(self.mdp.terminal_states)
-        elif hasattr(self.mdp, "T"):
-            terminal_list = list(self.mdp.T)
-        elif hasattr(self.mdp, "terminal_set"):
-            terminal_list = list(self.mdp.terminal_set)
-        else:
-            raise AttributeError("MDP must expose terminal states (e.g., mdp.T or mdp.terminal_states).")
-
-        terminal_states = torch.tensor(terminal_list, device=self.device)
-        self.done = torch.isin(self.X_nexts, terminal_states).to(torch.float64)  # (n,)
-
-        # ------------------------------
-        # Filter terminal-current samples
-        # ------------------------------
-        self.is_terminal_s = torch.isin(self.Xs, terminal_states)
-        keep = ~self.is_terminal_s
-
-        self.Xs = self.Xs[keep]
-        self.As = self.As[keep]
-        self.Rs = self.Rs[keep]
-        self.X_nexts = self.X_nexts[keep]
-        self.done = self.done[keep]
-        self.n = self.Xs.shape[0]
+        if self.augment_terminal_transitions:
+            self._augment_missing_terminal_transitions(dataset_verbose=dataset_verbose)
 
         # ------------------------------
         # Precompute Features
@@ -109,6 +88,110 @@ class FQISolver:
         self.theta_history = []
         self.final_theta = None
         self.pi = None
+
+    def _build_state_to_index(self):
+        """Build map from raw state value to row index in mdp.states."""
+        if not hasattr(self.mdp, "states"):
+            return None
+
+        state_to_index = {}
+        for idx, s in enumerate(self.mdp.states):
+            s_val = int(s.item()) if isinstance(s, torch.Tensor) else int(s)
+            state_to_index[s_val] = idx
+        return state_to_index
+
+    def _get_terminal_states(self):
+        """Extract terminal states from common MDP attributes."""
+        for attr in ("terminal_states", "T", "terminal_set"):
+            if hasattr(self.mdp, attr):
+                raw = getattr(self.mdp, attr)
+                return {
+                    int(s.item()) if isinstance(s, torch.Tensor) else int(s)
+                    for s in raw
+                }
+        return set()
+
+    def _state_action_row_index(self, state, action):
+        """Map (state value, action index) to row index in mdp.r / mdp.P."""
+        state = int(state)
+        action = int(action)
+        if self._state_to_index is None:
+            return state * self.A + action
+        if state not in self._state_to_index:
+            raise ValueError(f"State {state} not found in mdp.states.")
+        return self._state_to_index[state] * self.A + action
+
+    def _reward_from_mdp(self, state, action):
+        """
+        Resolve reward for a synthetic transition from model data.
+        Prefer mdp.r if available, otherwise fallback to <phi, omega>.
+        """
+        if hasattr(self.mdp, "r"):
+            row_idx = self._state_action_row_index(state, action)
+            r_val = self.mdp.r[row_idx]
+            if isinstance(r_val, torch.Tensor):
+                return float(r_val.item())
+            return float(r_val)
+
+        if not hasattr(self.mdp, "omega"):
+            raise AttributeError(
+                "Cannot infer synthetic reward: mdp must expose either `r` or `omega`."
+            )
+
+        feat = self.phi(state, action).to(dtype=torch.float64, device=self.device)
+        omega = self.mdp.omega
+        if isinstance(omega, torch.Tensor):
+            omega = omega.to(dtype=torch.float64, device=self.device)
+        else:
+            omega = torch.as_tensor(omega, dtype=torch.float64, device=self.device)
+        return float(torch.dot(feat, omega).item())
+
+    def _augment_missing_terminal_transitions(self, dataset_verbose=False):
+        """
+        Add one synthetic self-loop transition for every missing terminal (s, a).
+
+        This prevents degenerate bootstrapping when offline data never contains
+        terminal-state current samples (common when episodes reset immediately).
+        """
+        terminal_states = self._get_terminal_states()
+        if not terminal_states:
+            return
+
+        existing_pairs = {
+            (int(s.item()), int(a.item()))
+            for s, a in zip(self.Xs, self.As)
+        }
+        to_add = []
+
+        for s in sorted(terminal_states):
+            if self._state_to_index is not None and s not in self._state_to_index:
+                continue
+            for a in range(self.A):
+                if (s, a) in existing_pairs:
+                    continue
+                reward = self._reward_from_mdp(s, a)
+                to_add.append((s, a, reward, s))
+
+        if not to_add:
+            return
+
+        x_aug = torch.tensor([row[0] for row in to_add], dtype=self.Xs.dtype, device=self.device)
+        a_aug = torch.tensor([row[1] for row in to_add], dtype=self.As.dtype, device=self.device)
+        r_aug = torch.tensor([row[2] for row in to_add], dtype=self.Rs.dtype, device=self.device)
+        x_next_aug = torch.tensor([row[3] for row in to_add], dtype=self.X_nexts.dtype, device=self.device)
+
+        self.Xs = torch.cat([self.Xs, x_aug], dim=0)
+        self.As = torch.cat([self.As, a_aug], dim=0)
+        self.Rs = torch.cat([self.Rs, r_aug], dim=0)
+        self.X_nexts = torch.cat([self.X_nexts, x_next_aug], dim=0)
+        self.n = int(self.Xs.shape[0])
+        self.added_terminal_samples = len(to_add)
+
+        if dataset_verbose:
+            print(
+                f"Added {self.added_terminal_samples} synthetic terminal transitions "
+                "to improve terminal value bootstrapping."
+            )
 
     def _precompute_dataset_features(self):
         """
@@ -192,8 +275,8 @@ class FQISolver:
             # max_a' Q(x'_i, a') -> (n,)
             max_Q_next, _ = torch.max(Q_next_all, dim=1)
             
-            # Target y_i = r_i + gamma * (1 - done_i) * max_Q_next
-            targets = self.Rs + self.gamma * (1.0 - self.done) * max_Q_next
+            # Target y_i = r_i + gamma * max_Q_next
+            targets = self.Rs + self.gamma * max_Q_next
             
             # 2. Least Squares Solution (theta_{k+1}^+)
             # theta_plus = M @ targets
@@ -257,7 +340,8 @@ class FQISolver:
         A = self.A
         pi_mat = torch.zeros((N, A), dtype=torch.float64, device=self.device)
         
-        for x in range(N):
+        for x_idx, x_val in enumerate(self.mdp.states):
+            x = int(x_val.item()) if isinstance(x_val, torch.Tensor) else int(x_val)
             # Compute Q(x, :)
             q_vals = torch.zeros(A, dtype=torch.float64, device=self.device)
             for a in range(A):
@@ -265,7 +349,7 @@ class FQISolver:
                 q_vals[a] = torch.dot(theta, feat)
             
             best_a = torch.argmax(q_vals)
-            pi_mat[x, best_a] = 1.0
+            pi_mat[x_idx, best_a] = 1.0
             
         return pi_mat
 

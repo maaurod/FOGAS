@@ -30,12 +30,6 @@ alpha=4.9337e+00, rho=1.0000e-02, eta=1.0000e-02
 bounds_overrides={"alpha" : (1e-2, 5.0), "rho" : (1e-2, 3.0), "eta" : (1e-2, 3.0)}
 alpha=4.4392e+00, rho=3.0000e+00, eta=1.0000e-02 
 
-
-Below is a **clean, copy-paste–ready text version**, organized **first for TABULAR features, then for STATE-AGGREGATION / APPROXIMATE features**.
-You can drop this directly into a `.txt` file.
-
-
-
 1. TABULAR FEATURES
 
 From experiments:

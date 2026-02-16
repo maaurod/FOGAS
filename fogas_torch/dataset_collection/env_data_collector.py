@@ -302,16 +302,40 @@ class EnvDataCollector:
         
         # Track if we are currently staying in an absorbing state
         extra_steps_remaining = -1
-        captured_reward = 0.0
+
+        def _reward_from_env_state_action(state, action, fallback):
+            """
+            Recover reward for (state, action) directly from env model data.
+            Used to keep terminal self-loop rewards consistent in LinearMDPEnv.
+            """
+            if not (hasattr(env, "states") and hasattr(env, "A") and hasattr(env, "r")):
+                return fallback
+
+            try:
+                if isinstance(env.states, torch.Tensor):
+                    state_idx_tensor = (env.states == int(state)).nonzero(as_tuple=True)[0]
+                    if len(state_idx_tensor) == 0:
+                        return fallback
+                    state_idx = int(state_idx_tensor[0].item())
+                else:
+                    state_idx = int(state)
+
+                row_idx = state_idx * int(env.A) + int(action)
+                r_val = env.r[row_idx]
+                if isinstance(r_val, torch.Tensor):
+                    return float(r_val.item())
+                return float(r_val)
+            except Exception:
+                return fallback
 
         for _ in range(n_steps):
             action = policy.sample(obs)
             next_obs, reward, terminated, truncated, _ = env.step(action)
 
-            # If we are already in the extra-stay phase (not the first hit of termination),
-            # override the environment's 0.0 reward with the captured one.
+            # During terminal self-loops, LinearMDPEnv.step returns 0.0 by design.
+            # Replace it with the model-consistent reward for (terminal_state, action).
             if extra_steps_remaining != -1:
-                reward = captured_reward
+                reward = _reward_from_env_state_action(obs, action, reward)
 
             data["episode"].append(episode)
             data["step"].append(step)
@@ -331,9 +355,8 @@ class EnvDataCollector:
             elif terminated:
                 # If we just reached a terminal (absorbing) state
                 if extra_steps_remaining == -1:
-                    # FIRST HIT: Start the extra-stay counter and capture the reward
+                    # FIRST HIT: start extra-stay counter
                     extra_steps_remaining = extra_steps
-                    captured_reward = reward
                 
                 if extra_steps_remaining > 0:
                     # Stay in the absorbing state for extra steps

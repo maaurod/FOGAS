@@ -47,6 +47,126 @@ class FOGASEvaluator:
         if self.solver.pi is None:
             raise ValueError("Run solver.run() first.")
         return -1 * self.mdp.policy_return(self.solver.pi)
+    
+    def task_success(self, rho_start=None):
+        """
+        Compute J(π̂; ρ_start) - the expected return of the learned policy
+        starting from the initial state distribution.
+        
+        Parameters
+        ----------
+        rho_start : tensor, optional
+            Initial state distribution. If None, uses a point mass at mdp.x0.
+            
+        Returns
+        -------
+        float
+            Expected discounted return from the initial distribution.
+        """
+        if self.solver.pi is None:
+            raise ValueError("Run solver.run() first.")
+        
+        if rho_start is None:
+            # Default: point mass at initial state
+            rho_start = torch.zeros(self.mdp.N, dtype=torch.float64, device=self.mdp.r.device)
+            rho_start[self.mdp.x0] = 1.0
+        
+        # Compute value function for learned policy
+        v_pi, _ = self.mdp.evaluate_policy(self.solver.pi)
+        
+        # Expected return: E_{s~ρ_start}[V^π(s)]
+        J = (rho_start @ v_pi).item()
+        
+        return float(J)
+    
+    def on_data_quality(self, dataset):
+        """
+        Compute E_{s~d_data}[V*(s) - V^π̂(s)] - the expected suboptimality
+        on states visited in the dataset.
+        
+        Parameters
+        ----------
+        dataset : FOGASDataset
+            The offline dataset containing state visitations.
+            
+        Returns
+        -------
+        float
+            Average value gap on data distribution.
+        """
+        if self.solver.pi is None:
+            raise ValueError("Run solver.run() first.")
+        
+        # Get value functions
+        v_star = self.mdp.v_star
+        v_pi, _ = self.mdp.evaluate_policy(self.solver.pi)
+        
+        # Compute empirical distribution over states in dataset
+        states = dataset.X  # Tensor of states from dataset
+        
+        # Compute value gap for each state in dataset
+        gaps = v_star[states] - v_pi[states]
+        
+        # Return average gap
+        return float(gaps.mean().item())
+    
+    def optimal_states_quality(self, num_trajectories=1000, max_steps=100, seed=None):
+        """
+        Compute E_{s~d_π*}[V*(s) - V^π̂(s)] - the expected suboptimality
+        on states visited by the optimal policy.
+        
+        Parameters
+        ----------
+        num_trajectories : int
+            Number of trajectories to sample from optimal policy.
+        max_steps : int
+            Maximum steps per trajectory.
+        seed : int, optional
+            Random seed for reproducibility.
+            
+        Returns
+        -------
+        float
+            Average value gap on optimal policy distribution.
+        """
+        if self.solver.pi is None:
+            raise ValueError("Run solver.run() first.")
+        
+        if seed is not None:
+            random.seed(seed)
+            np.random.seed(seed)
+            torch.manual_seed(seed)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed(seed)
+            if torch.backends.mps.is_available():
+                torch.mps.manual_seed(seed)
+        
+        # Get value functions
+        v_star = self.mdp.v_star
+        v_pi, _ = self.mdp.evaluate_policy(self.solver.pi)
+        
+        # Collect states visited by optimal policy
+        visited_states = []
+        
+        for _ in range(num_trajectories):
+            trajectory = self.simulate_trajectory(
+                pi=self.mdp.pi_star,
+                max_steps=max_steps,
+                seed=None  # Already seeded above
+            )
+            
+            # Collect all states in this trajectory
+            for step in trajectory:
+                visited_states.append(step['state'])
+        
+        # Convert to tensor
+        visited_states = torch.tensor(visited_states, dtype=torch.int64, device=v_star.device)
+        
+        # Compute value gaps
+        gaps = v_star[visited_states] - v_pi[visited_states]
+        
+        # Return average gap
+        return float(gaps.mean().item())
 
     # =====================================================
     # --- Metric factory ---
@@ -67,6 +187,22 @@ class FOGASEvaluator:
 
         if name == "reward":
             return lambda: self.final_reward()
+        
+        if name == "task_success":
+            rho_start = kwargs.get("rho_start", None)
+            return lambda: self.task_success(rho_start)
+        
+        if name == "on_data_quality":
+            dataset = kwargs.get("dataset")
+            if dataset is None:
+                raise ValueError("on_data_quality metric requires 'dataset' argument")
+            return lambda: self.on_data_quality(dataset)
+        
+        if name == "optimal_states_quality":
+            num_trajectories = kwargs.get("num_trajectories", 1000)
+            max_steps = kwargs.get("max_steps", 100)
+            seed = kwargs.get("seed", None)
+            return lambda: self.optimal_states_quality(num_trajectories, max_steps, seed)
 
         raise ValueError(f"Unknown metric '{name}'")
 

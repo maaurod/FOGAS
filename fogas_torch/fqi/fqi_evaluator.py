@@ -21,6 +21,29 @@ class FQIEvaluator:
         # But often we just want the value. FOGASEvaluator returns -1 * return for minimization.
         # Here we just return the raw expected return (positive)
         return self.mdp.policy_return(self.solver.pi)
+    
+    def converged(self, tol=1e-8):
+        """
+        Check if FQI has converged by comparing the last two theta values.
+        
+        Parameters
+        ----------
+        tol : float
+            Convergence tolerance for change in theta.
+            
+        Returns
+        -------
+        bool
+            True if converged, False otherwise.
+        """
+        if not hasattr(self.solver, 'theta_history') or len(self.solver.theta_history) < 2:
+            return False
+        
+        theta_last = self.solver.theta_history[-1]
+        theta_prev = self.solver.theta_history[-2]
+        diff = torch.linalg.norm(theta_last - theta_prev).item()
+        
+        return diff < tol
 
     def compare_final_rewards(self):
         """

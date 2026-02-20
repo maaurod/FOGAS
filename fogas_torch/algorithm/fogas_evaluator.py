@@ -2,6 +2,7 @@ import torch
 import random
 import numpy as np
 import matplotlib.pyplot as plt
+import matplotlib.colors as mcolors
 
 class FOGASEvaluator:
     """
@@ -578,3 +579,125 @@ class FOGASEvaluator:
         print(f"  Optimal Return (π*): {v_star:.6f}")
         
         print(f"\n{'='*70}\n")
+
+    # =====================================================
+    # --- Reward Estimation Analysis ---
+    # =====================================================
+
+    def analyze_reward_approximation(self, walls=None, pits=None, goal=None, show_plot=True):
+        """
+        Analyze how well the linear features (Phi) represent the true reward function
+        using the solver's omega.
+        
+        Parameters
+        ----------
+        walls : list or set, optional
+            State indices of walls.
+        pits : list or set, optional
+            State indices of pits.
+        goal : int, optional
+            State index of the goal.
+        show_plot : bool
+            Whether to display the heatmap.
+        """
+        if self.solver.omega is None:
+            raise ValueError("Solver must have an 'omega' attribute (estimated or provided).")
+
+        omega = self.solver.omega.cpu()
+        Phi_cpu = self.mdp.Phi.cpu()
+        N, A = self.mdp.N, self.mdp.A
+
+        # Get true reward for all (s,a) pairs from the precomputed reward vector
+        r_true = self.mdp.r.cpu()
+        
+        # Linear approximation: r_hat = Phi @ omega
+        r_hat = Phi_cpu @ omega
+
+        error = r_hat - r_true
+        abs_error = error.abs()
+
+        print("\n" + "="*50)
+        print("     REWARD APPROXIMATION ANALYSIS")
+        print("="*50)
+        print(f"{'Metric':<30} {'Value':>12}")
+        print("─" * 44)
+        print(f"{'Max |error|':<30} {abs_error.max().item():>12.6f}")
+        print(f"{'Mean |error|':<30} {abs_error.mean().item():>12.6f}")
+        print(f"{'RMSE':<30} {(error**2).mean().sqrt().item():>12.6f}")
+        
+        r_true_var = r_true.var()
+        if r_true_var > 1e-12:
+            r2 = 1 - error.var() / r_true_var
+            print(f"{'R² (explained variance)':<30} {r2:>12.6f}")
+        else:
+            print(f"{'R² (explained variance)':<30} {'N/A (var=0)':>12}")
+        
+        print("\n" + "-"*50)
+        print(f"{'State':<6} {'Action':<10} {'r_true':>10} {'r_hat':>10} {'error':>10}")
+        print("─" * 50)
+        
+        action_names = ["↑ Up", "↓ Down", "← Left", "→ Right"]
+        
+        # Print all states with labels for special types
+        for x in range(N):
+            state_desc = str(x)
+            if walls and x in walls:
+                state_desc += " [Wall]"
+            elif pits and x in pits:
+                state_desc += " [Pit]"
+            elif goal is not None and x == goal:
+                state_desc += " [Goal]"
+                
+            for a in range(A):
+                idx = x * A + a
+                rt = r_true[idx].item()
+                rh = r_hat[idx].item()
+                err = rh - rt
+                marker = " ⚠️" if abs(err) > 0.3 else ""
+                # Adjust formatting to accommodate the potentially longer state description
+                print(f"{state_desc:<12} {action_names[a] if a < len(action_names) else a:<10} {rt:>10.4f} {rh:>10.4f} {err:>10.4f}{marker}")
+
+        if not show_plot:
+            return
+
+        # --- Visualization ---
+        grid_size = int(np.sqrt(N))
+        abs_error_grid = abs_error.reshape(N, A).mean(dim=1).reshape(grid_size, grid_size).numpy()
+        r_true_grid = r_true.reshape(N, A).mean(dim=1).reshape(grid_size, grid_size).numpy()
+
+        fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+        # Left: true reward heatmap
+        # Use SymLogNorm to see small differences in path rewards (-0.1) while showing pits (-5) and goals (+1)
+        norm0 = mcolors.SymLogNorm(linthresh=0.05, linscale=1.0, vmin=r_true_grid.min(), vmax=r_true_grid.max(), base=10)
+        im0 = axes[0].imshow(r_true_grid, cmap="RdYlGn", origin="upper", norm=norm0)
+        axes[0].set_title("True Reward (SymLog Scale)", fontsize=12)
+        plt.colorbar(im0, ax=axes[0], label="Reward Value")
+
+        # Right: |error| heatmap
+        # Use LogNorm to see small errors in path regions vs massive outliers in terminal states
+        vmin_err = max(1e-4, abs_error_grid.min())
+        norm1 = mcolors.LogNorm(vmin=vmin_err, vmax=abs_error_grid.max())
+        im1 = axes[1].imshow(abs_error_grid, cmap="hot_r", origin="upper", norm=norm1)
+        axes[1].set_title("Mean Absolute Error (Log Scale)", fontsize=12)
+        plt.colorbar(im1, ax=axes[1], label="|Estimated - True|")
+
+        # Overlay metadata
+        for ax in axes:
+            if walls:
+                for s in walls:
+                    r, c = divmod(s, grid_size)
+                    ax.add_patch(plt.Rectangle((c-0.5, r-0.5), 1, 1, color="black", alpha=0.8, label="Wall" if s == list(walls)[0] else ""))
+            if pits:
+                for s in pits:
+                    r, c = divmod(s, grid_size)
+                    ax.add_patch(plt.Rectangle((c-0.5, r-0.5), 1, 1, color="magenta", alpha=0.6, label="Pit" if s == list(pits)[0] else ""))
+            if goal is not None:
+                r, c = divmod(goal, grid_size)
+                ax.add_patch(plt.Rectangle((c-0.5, r-0.5), 1, 1, color="gold", alpha=0.8, label="Goal"))
+            
+            ax.set_xticks(range(grid_size))
+            ax.set_yticks(range(grid_size))
+
+        plt.tight_layout()
+        plt.show()

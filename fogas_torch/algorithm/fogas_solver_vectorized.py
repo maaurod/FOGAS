@@ -28,10 +28,14 @@ class FOGASSolverVectorized:
         dataset_verbose=False,
         seed=42,
         device=None,
+        csv_path_omega=None,
+        beta_omega=None,
     ):
         self.mdp = mdp
         self.delta = delta
         self.seed = seed
+        self.csv_path = csv_path
+        self.csv_path_omega = csv_path_omega if csv_path_omega is not None else csv_path
 
         # Set device (CUDA if available)
         if device is None:
@@ -71,8 +75,9 @@ class FOGASSolverVectorized:
         self.gamma = mdp.gamma
         self.R = mdp.R
         self.phi = mdp.phi
-        self.omega = mdp.omega.to(self.device) if isinstance(mdp.omega, torch.Tensor) else torch.tensor(mdp.omega, dtype=torch.float64, device=self.device)
+        
         self.x0 = mdp.x0
+        self._beta_omega = beta_omega
 
         # ------------------------------
         # Theoretical parameters
@@ -105,6 +110,21 @@ class FOGASSolverVectorized:
         # Precompute feature tensors and covariances
         self._build_feature_tensors()
         self._build_covariances()
+
+        # ------------------------------------------------------------------
+        # Omega resolution
+        # ------------------------------------------------------------------
+        # • mdp.omega is None  (reward_fn was used) → MUST estimate from data
+        # • beta_omega explicitly set               → estimate with that beta
+        # • mdp.omega given and beta_omega is None  → use mdp.omega as-is
+        # ------------------------------------------------------------------
+        if mdp.omega is None or self._beta_omega is not None:
+            self._estimate_omega(beta_omega=self._beta_omega)
+            if print_params:
+                print(f"Estimated omega (first 5 components): {self.omega[:5]}")
+        else:
+            self.omega = mdp.omega.to(self.device) if isinstance(mdp.omega, torch.Tensor) \
+                else torch.tensor(mdp.omega, dtype=torch.float64, device=self.device)
 
         # Results to be filled by run()
         self.theta_bar_history = None
@@ -142,6 +162,41 @@ class FOGASSolverVectorized:
 
         self.Cov_emp = Cov_emp
         self.Cov_emp_inv = Cov_emp_inv
+
+    # ------------------------------------------------------------------
+    # Estimate omega from dataset
+    # ------------------------------------------------------------------
+    def _estimate_omega(self, beta_omega=None):
+        """
+        Estimate omega via ridge regression on the dataset:
+            omega_hat = (Phi^T Phi + beta_omega * n * I)^{-1} Phi^T r
+
+        Parameters
+        ----------
+        beta_omega : float or None
+            Regularization for the regression. If None, uses the theoretical
+            beta = R^2 / (d * T) from FOGASParameters.
+        """
+        reg = self.beta if beta_omega is None else beta_omega
+
+        if self.csv_path_omega == self.csv_path:
+            n = self.n
+            Phi = self.Phi
+            R = self.Rs
+        else:
+            ds_omega = FOGASDataset(csv_path=self.csv_path_omega, verbose=False)
+            X_o = ds_omega.X.to(self.device).long()
+            A_o = ds_omega.A.to(self.device).long()
+            R = ds_omega.R.to(self.device)
+            n = ds_omega.n
+            Phi = self.PHI_XA[X_o, A_o]
+
+        Cov = reg * torch.eye(self.d, dtype=torch.float64, device=self.device) + (Phi.T @ Phi) / n
+        Cov_inv = torch.linalg.inv(Cov)
+        self.omega = Cov_inv @ (Phi.T @ R / n)
+        print(f"[FOGASSolverVectorized] omega estimated via regression "
+              f"(beta_omega={reg:.2e}, n={n})")
+
 
     # ------------------------------------------------------------------
     # Softmax policy (matrix)

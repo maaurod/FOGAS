@@ -16,6 +16,7 @@ class FOGASOracleSolverVectorized:
     def __init__(
         self,
         mdp,
+        csv_path_omega=None,
         delta=0.05,
         n=None,
         T=None,
@@ -29,6 +30,7 @@ class FOGASOracleSolverVectorized:
         device=None,
     ):
         self.mdp = mdp
+        self.csv_path_omega = csv_path_omega
         self.delta = delta
         self.seed = seed
 
@@ -59,7 +61,19 @@ class FOGASOracleSolverVectorized:
         self.gamma = mdp.gamma
         self.R = mdp.R
         self.phi = mdp.phi
-        self.omega = mdp.omega.to(self.device) if isinstance(mdp.omega, torch.Tensor) else torch.tensor(mdp.omega, dtype=torch.float64, device=self.device)
+        if mdp.omega is not None:
+            # True linear MDP: omega is known exactly. Store Phi^T @ (Phi @ omega) = Phi^T r.
+            omega_vec = mdp.omega.to(dtype=torch.float64, device=self.device) if isinstance(mdp.omega, torch.Tensor) else torch.tensor(mdp.omega, dtype=torch.float64, device=self.device)
+            Phi_dev = mdp.Phi.to(dtype=torch.float64, device=self.device)
+            self.r_feat = Phi_dev.T @ (Phi_dev @ omega_vec)  # (d,) = Phi^T r
+        else:
+            # reward_fn path: compute exact feature-reward vector Phi^T r
+            # without any regression. This is the true oracle quantity:
+            #   r_feat = Phi^T r   where r(x,a) = reward_fn(x, a) exactly.
+            # The empirical FOGAS estimates this from data; the oracle uses it exactly.
+            r_exact = mdp.get_reward(verbose=False).to(dtype=torch.float64, device=self.device)
+            Phi_dev = mdp.Phi.to(dtype=torch.float64, device=self.device)
+            self.r_feat = Phi_dev.T @ r_exact  # (d,)  — no regression, no approximation error
         self.x0 = mdp.x0
         self.Phi = mdp.Phi.to(self.device) if isinstance(mdp.Phi, torch.Tensor) else torch.tensor(mdp.Phi, dtype=torch.float64, device=self.device)
 
@@ -86,6 +100,21 @@ class FOGASOracleSolverVectorized:
         self.beta = self.params.beta
         self.D_pi = self.params.D_pi
 
+        # (omega deferred logic removed — r_feat is computed directly above)
+        
+        # Override omega and r_feat if csv_path_omega is provided
+        if self.csv_path_omega is not None:
+            if print_params:
+                print(f"Estimating omega from {self.csv_path_omega} for Oracle...")
+            self._estimate_omega()
+            # In Oracle, r_feat = Phi^T (Phi @ omega)
+            # Normalization scale should match the one used in non-csv path if possible,
+            # but usually r_feat in Oracle is unnormalized sum or normalized sum?
+            # From line 74: self.r_feat = Phi_dev.T @ r_exact. 
+            # r_exact is shape (N*A,). So r_feat is a sum over all S,A.
+            # So here: r_feat = (Phi.T @ Phi) @ omega
+            self.r_feat = self.Phi.T @ (self.Phi @ self.omega)
+
         # Precompute feature tensors
         self._build_feature_tensors()
 
@@ -97,6 +126,15 @@ class FOGASOracleSolverVectorized:
 
         self.cov_matrix = cov_matrix
 
+        # Compute omega (best linear fit) for compatibility and visualization
+        # This is the projection of the true reward onto the feature space
+        with torch.no_grad():
+            Cov_emp = self.beta * torch.eye(self.d, dtype=torch.float64, device=self.device) + (self.Phi.T @ self.Phi) / self.n
+            self.omega = torch.linalg.inv(Cov_emp) @ (self.r_feat / self.n)
+
+
+    # (removed _compute_omega — oracle now uses r_feat = Phi^T r directly)
+
     # ------------------------------------------------------------------
     # Feature tensors
     # ------------------------------------------------------------------
@@ -107,6 +145,29 @@ class FOGASOracleSolverVectorized:
             dim=0,
         ).to(dtype=torch.float64, device=self.device)
         self.PHI_XA = PHI_XA
+
+    # ------------------------------------------------------------------
+    # Estimate omega from CSV
+    # ------------------------------------------------------------------
+    def _estimate_omega(self):
+        from .fogas_dataset import FOGASDataset
+        ds_omega = FOGASDataset(csv_path=self.csv_path_omega, verbose=False)
+        X_o = ds_omega.X.to(self.device).long()
+        A_o = ds_omega.A.to(self.device).long()
+        R = ds_omega.R.to(self.device)
+        n = ds_omega.n
+        
+        # Build PHI_XA if not yet built (we need it for indexing)
+        # Or just compute features directly for the dataset
+        Phi_o = torch.stack([self.phi(int(x), int(a)) for x, a in zip(X_o, A_o)]).to(dtype=torch.float64, device=self.device)
+        
+        # Regularized least squares
+        # We use the same beta as the solver
+        Cov = self.beta * torch.eye(self.d, dtype=torch.float64, device=self.device) + (Phi_o.T @ Phi_o) / n
+        Cov_inv = torch.linalg.inv(Cov)
+        
+        sum_phi_r = (Phi_o.T @ R) / n
+        self.omega = Cov_inv @ sum_phi_r
 
     # ------------------------------------------------------------------
     # Softmax policy (matrix)
@@ -158,7 +219,7 @@ class FOGASOracleSolverVectorized:
 
         Phi = self.Phi
         gamma = self.gamma
-        omega = self.omega
+        r_feat = self.r_feat   # Phi^T r  (exact, no regression)
         d = self.d
         A = self.A
         N = self.N
@@ -218,7 +279,7 @@ class FOGASOracleSolverVectorized:
             # ---------------------------
             # λ update
             # ---------------------------
-            g = omega + gamma * Psi_v - theta_t
+            g = r_feat + gamma * Psi_v - theta_t
 
             if cov_matrix == "identity":
                 Lambda = torch.eye(d, dtype=torch.float64, device=device)

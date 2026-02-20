@@ -31,18 +31,20 @@ class LinearMDP:
         states,
         actions,
         phi,
-        omega,
-        gamma,
-        x0,
+        omega=None,
+        gamma=None,
+        x0=None,
         psi=None,   # callable psi(xp)->(d,) OR dict {xp:(d,)} OR None
         P=None,
         terminal_states=None,
+        reward_fn=None,  # Optional: direct reward function r(x, a) -> float
     ):
         """
         Linear MDP with feature-based rewards and transitions.
 
         Rewards:
-            r(x,a) = <phi(x,a), omega>
+            Either provide omega: r(x,a) = <phi(x,a), omega>
+            Or provide reward_fn: r(x,a) = reward_fn(x, a)
 
         Transitions:
             Either provide psi as a callable:
@@ -68,9 +70,20 @@ class LinearMDP:
                 norms.append(torch.linalg.norm(phi_val))
         self.R = torch.max(torch.stack(norms))
 
-        self.omega = omega.clone().to(dtype=torch.float64).reshape(-1)
-        if self.omega.shape != (self.d,):
-            raise ValueError(f"omega must have shape ({self.d},), got {self.omega.shape}")
+        # Handle reward specification: either omega or reward_fn
+        self.reward_fn = reward_fn
+        if omega is not None and reward_fn is not None:
+            raise ValueError("Cannot specify both omega and reward_fn")
+        
+        if omega is not None:
+            self.omega = omega.clone().to(dtype=torch.float64).reshape(-1)
+            if self.omega.shape != (self.d,):
+                raise ValueError(f"omega must have shape ({self.d},), got {self.omega.shape}")
+        elif reward_fn is not None:
+            # omega will be None, will be computed when needed
+            self.omega = None
+        else:
+            raise ValueError("Must provide either omega or reward_fn")
 
         # Store psi or P
         self.P = None
@@ -125,7 +138,8 @@ class LinearMDP:
         """Move all internal tensors to the specified device."""
         self.states = self.states.to(device)
         self.actions = self.actions.to(device)
-        self.omega = self.omega.to(device)
+        if self.omega is not None:
+            self.omega = self.omega.to(device)
         self.nu0 = self.nu0.to(device)
         self.Phi = self.Phi.to(device)
         if self.P is not None:
@@ -138,9 +152,17 @@ class LinearMDP:
     # Reward computation: r = Φω
     # ------------------------------------------------------------
     def get_reward(self, verbose=False):
-        # r = Phi @ omega
-        # Shapes: (N*A, d) @ (d,) -> (N*A,)
-        r = self.Phi @ self.omega
+        if self.omega is not None:
+            # r = Phi @ omega
+            # Shapes: (N*A, d) @ (d,) -> (N*A,)
+            r = self.Phi @ self.omega
+        else:
+            # Use reward_fn directly
+            r_list = []
+            for x in range(self.N):
+                for a in range(self.A):
+                    r_list.append(self.reward_fn(self.states[x].item(), self.actions[a].item()))
+            r = torch.tensor(r_list, dtype=torch.float64)
 
         if verbose:
             print("\n=== Reward Vector r ===")

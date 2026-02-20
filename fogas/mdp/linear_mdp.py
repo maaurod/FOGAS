@@ -31,9 +31,10 @@ class LinearMDP:
         states,
         actions,
         phi,
-        omega,
         gamma,
         x0,
+        omega=None,
+        reward_fn=None,
         psi=None,   # callable psi(xp)->(d,) OR dict {xp:(d,)} OR None
         P=None,
         terminal_states=None,
@@ -41,8 +42,10 @@ class LinearMDP:
         """
         Linear MDP with feature-based rewards and transitions.
 
-        Rewards:
-            r(x,a) = <phi(x,a), omega>
+        Rewards (exactly one of the following must be provided):
+            omega     : linear weights s.t. r(x,a) = <phi(x,a), omega>
+            reward_fn : callable r(x, a) -> float  (used directly; omega is
+                        then estimated from data inside the FOGAS solver)
 
         Transitions:
             Either provide psi as a callable:
@@ -67,9 +70,31 @@ class LinearMDP:
             for a in self.actions
         ])
 
-        self.omega = np.array(omega).reshape(-1)
-        if self.omega.shape != (self.d,):
-            raise ValueError(f"omega must have shape ({self.d},), got {self.omega.shape}")
+        # ------------------------------------------------------------------
+        # Reward: exactly one of omega / reward_fn must be provided
+        # ------------------------------------------------------------------
+        if omega is None and reward_fn is None:
+            raise ValueError(
+                "Provide either omega (linear reward weights) or "
+                "reward_fn (callable r(x, a) -> float)."
+            )
+        if omega is not None and reward_fn is not None:
+            raise ValueError(
+                "Provide either omega or reward_fn, not both."
+            )
+
+        if omega is not None:
+            self.omega = np.array(omega).reshape(-1)
+            if self.omega.shape != (self.d,):
+                raise ValueError(
+                    f"omega must have shape ({self.d},), got {self.omega.shape}"
+                )
+            self.reward_fn = None
+        else:
+            if not callable(reward_fn):
+                raise TypeError("reward_fn must be callable: r(x, a) -> float")
+            self.omega = None
+            self.reward_fn = reward_fn
 
         # Store psi or P
         self.P = None
@@ -119,14 +144,20 @@ class LinearMDP:
         self.Psi = None  # cache
 
     # ------------------------------------------------------------
-    # Reward computation: r = Φω
+    # Reward computation: r = Φω  OR  r = reward_fn
     # ------------------------------------------------------------
+    def _reward(self, x, a):
+        """Return the scalar reward for state x and action a."""
+        if self.omega is not None:
+            return float(self.phi(x, a) @ self.omega)
+        return float(self.reward_fn(x, a))
+
     def get_reward(self, verbose=False):
         r = np.zeros(self.N * self.A)
         idx = 0
         for x in range(self.N):
             for a in range(self.A):
-                r[idx] = self.phi(x, a) @ self.omega
+                r[idx] = self._reward(x, a)
                 idx += 1
 
         if verbose:
@@ -134,7 +165,7 @@ class LinearMDP:
             print("Shape:", r.shape)
             for x in range(self.N):
                 for a in range(self.A):
-                    print(f"r(s={x}, a={a}) = {self.phi(x,a) @ self.omega:.4f}")
+                    print(f"r(s={x}, a={a}) = {self._reward(x,a):.4f}")
             print("")
         return r
 

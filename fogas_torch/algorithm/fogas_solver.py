@@ -18,6 +18,7 @@ class FOGASSolver:
         self,
         mdp,
         csv_path,
+        csv_path_omega=None,
         delta=0.05,
         T=None,
         alpha=None,
@@ -30,6 +31,8 @@ class FOGASSolver:
         device=None,
     ):
         self.mdp = mdp
+        self.csv_path = csv_path
+        self.csv_path_omega = csv_path_omega if csv_path_omega is not None else csv_path
         self.delta = delta
         self.seed = seed
 
@@ -71,7 +74,14 @@ class FOGASSolver:
         self.gamma = mdp.gamma
         self.R = mdp.R
         self.phi = mdp.phi
-        self.omega = mdp.omega.to(self.device) if isinstance(mdp.omega, torch.Tensor) else torch.tensor(mdp.omega, dtype=torch.float64, device=self.device)
+        
+        # Handle omega: use from MDP if available, otherwise estimate from dataset
+        if mdp.omega is not None:
+            self.omega = mdp.omega.to(self.device) if isinstance(mdp.omega, torch.Tensor) else torch.tensor(mdp.omega, dtype=torch.float64, device=self.device)
+        else:
+            if print_params:
+                print("MDP omega not provided. Estimating from dataset...")
+            self.omega = None
         self.x0 = mdp.x0
 
         # ------------------------------
@@ -104,6 +114,12 @@ class FOGASSolver:
         # Build covariance matrices
         self._build_covariances()
 
+        # Estimate omega if needed
+        if self.omega is None:
+            self._estimate_omega()
+            if print_params:
+                print(f"Estimated omega (first 5 components): {self.omega[:5]}")
+
         # Results to be filled by run()
         self.theta_bar_history = None
         self.pi = None
@@ -130,6 +146,40 @@ class FOGASSolver:
         self.Phi = Phi
         self.Cov_emp = Cov_emp
         self.Cov_emp_inv = Cov_emp_inv
+
+    # ------------------------------------------------------------------
+    # Estimate omega from dataset
+    # ------------------------------------------------------------------
+    def _estimate_omega(self):
+        """
+        Estimate omega from the omega dataset using regularized least squares.
+        """
+        # If the paths are the same, use precomputed tensors to save time
+        if self.csv_path_omega == self.csv_path:
+            n = self.n
+            Phi = self.Phi
+            R = self.Rs
+            Cov_inv = self.Cov_emp_inv
+        else:
+            # Load the second dataset
+            ds_omega = FOGASDataset(csv_path=self.csv_path_omega, verbose=False)
+            Xs_o = ds_omega.X.to(self.device)
+            As_o = ds_omega.A.to(self.device)
+            R = ds_omega.R.to(self.device)
+            n = ds_omega.n
+            
+            # Compute features for this dataset
+            Phi_list = [self.phi(int(x.item()), int(a.item())).to(dtype=torch.float64, device=self.device) 
+                        for x, a in zip(Xs_o, As_o)]
+            Phi = torch.vstack(Phi_list)
+            
+            # Compute local covariance for estimation
+            Cov = self.beta * torch.eye(self.d, dtype=torch.float64, device=self.device) + (Phi.T @ Phi) / n
+            Cov_inv = torch.linalg.inv(Cov)
+        
+        # omega_hat = Cov_inv @ (Phi^T @ R / n)
+        sum_phi_r = (Phi.T @ R) / n
+        self.omega = Cov_inv @ sum_phi_r
 
     # ------------------------------------------------------------------
     # Softmax policy

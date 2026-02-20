@@ -12,6 +12,7 @@ class FOGASOracleSolver:
     def __init__(
         self,
         mdp,
+        csv_path_omega=None,
         delta=0.05,
         n=None,
         T=None,
@@ -25,6 +26,7 @@ class FOGASOracleSolver:
         device=None,
     ):
         self.mdp = mdp
+        self.csv_path_omega = csv_path_omega
         self.delta = delta
         self.seed = seed
 
@@ -55,7 +57,14 @@ class FOGASOracleSolver:
         self.gamma = mdp.gamma
         self.R = mdp.R
         self.phi = mdp.phi
-        self.omega = mdp.omega.to(self.device) if isinstance(mdp.omega, torch.Tensor) else torch.tensor(mdp.omega, dtype=torch.float64, device=self.device)
+        
+        # Handle omega: use from MDP if available.
+        # If csv_path_omega is provided, it will be estimated later after beta is available.
+        if mdp.omega is not None:
+            self.omega = mdp.omega.to(self.device) if isinstance(mdp.omega, torch.Tensor) else torch.tensor(mdp.omega, dtype=torch.float64, device=self.device)
+        else:
+            self.omega = None
+        
         self.x0 = mdp.x0
         self.Phi = mdp.Phi.to(self.device) if isinstance(mdp.Phi, torch.Tensor) else torch.tensor(mdp.Phi, dtype=torch.float64, device=self.device)
 
@@ -82,6 +91,15 @@ class FOGASOracleSolver:
         self.beta = self.params.beta
         self.D_pi = self.params.D_pi
 
+        # Override omega if csv_path_omega is provided
+        if self.csv_path_omega is not None:
+            if print_params:
+                print(f"Estimating omega from {self.csv_path_omega} for Oracle...")
+            self._estimate_omega()
+        elif self.omega is None:
+            # Fallback for Oracle if nothing is provided
+            self.omega = torch.zeros(self.d, dtype=torch.float64, device=self.device)
+
         # Results to be filled by run()
         self.theta_bar_history = None
         self.pi = None
@@ -89,6 +107,33 @@ class FOGASOracleSolver:
         self.lambda_T = None
 
         self.cov_matrix = cov_matrix
+
+    # ------------------------------------------------------------------
+    # Estimate omega from dataset
+    # ------------------------------------------------------------------
+    def _estimate_omega(self):
+        """
+        Estimate omega from the omega dataset using regularized least squares.
+        """
+        from .fogas_dataset import FOGASDataset
+        ds_omega = FOGASDataset(csv_path=self.csv_path_omega, verbose=False)
+        Xs_o = ds_omega.X.to(self.device)
+        As_o = ds_omega.A.to(self.device)
+        R = ds_omega.R.to(self.device)
+        n = ds_omega.n
+        
+        # Compute features for this dataset
+        Phi_list = [self.phi(int(x.item()), int(a.item())).to(dtype=torch.float64, device=self.device) 
+                    for x, a in zip(Xs_o, As_o)]
+        Phi = torch.vstack(Phi_list)
+        
+        # Compute local covariance for estimation
+        Cov = self.beta * torch.eye(self.d, dtype=torch.float64, device=self.device) + (Phi.T @ Phi) / n
+        Cov_inv = torch.linalg.inv(Cov)
+        
+        # omega_hat = Cov_inv @ (Phi^T @ R / n)
+        sum_phi_r = (Phi.T @ R) / n
+        self.omega = Cov_inv @ sum_phi_r
 
     # ------------------------------------------------------------------
     # Softmax policy

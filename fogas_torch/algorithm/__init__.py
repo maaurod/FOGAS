@@ -11,7 +11,6 @@ from .fogas_oraclesolver_vectorized import FOGASOracleSolverVectorized
 from .fogas_oraclesolver_vectorized import FOGASOracleSolverVectorized
 from ..fqi.fqi_solver import FQISolver
 from ..fqi.fqi_evaluator import FQIEvaluator
-from ..fqi.dataset_grid_search import run_coverage_grid_search
 
 __all__ = [
     "FOGASSolver",
@@ -24,6 +23,5 @@ __all__ = [
     "FOGASOracleSolverVectorized",
     "FQISolver",
     "FQIEvaluator",
-    "run_coverage_grid_search",
 ]
 

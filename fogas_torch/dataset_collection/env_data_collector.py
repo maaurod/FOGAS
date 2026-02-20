@@ -304,29 +304,7 @@ class EnvDataCollector:
         extra_steps_remaining = -1
 
         def _reward_from_env_state_action(state, action, fallback):
-            """
-            Recover reward for (state, action) directly from env model data.
-            Used to keep terminal self-loop rewards consistent in LinearMDPEnv.
-            """
-            if not (hasattr(env, "states") and hasattr(env, "A") and hasattr(env, "r")):
-                return fallback
-
-            try:
-                if isinstance(env.states, torch.Tensor):
-                    state_idx_tensor = (env.states == int(state)).nonzero(as_tuple=True)[0]
-                    if len(state_idx_tensor) == 0:
-                        return fallback
-                    state_idx = int(state_idx_tensor[0].item())
-                else:
-                    state_idx = int(state)
-
-                row_idx = state_idx * int(env.A) + int(action)
-                r_val = env.r[row_idx]
-                if isinstance(r_val, torch.Tensor):
-                    return float(r_val.item())
-                return float(r_val)
-            except Exception:
-                return fallback
+            return self._get_reward_from_env(state, action, fallback)
 
         for _ in range(n_steps):
             action = policy.sample(obs)
@@ -542,3 +520,192 @@ class EnvDataCollector:
                 print(f"✅ Mixed dataset saved to: {save_path}")
         
         return df
+
+    def collect_mixed_dataset_terminal_aware(self, policies, proportions=None, n_steps=1000, 
+                                             save_path=None, verbose=True, episode_based=True, extra_steps=5):
+        """
+        Collect transitions using multiple policies with specified proportions,
+        while handling absorbing states by staying for 'extra_steps'.
+
+        Parameters
+        ----------
+        policies : list
+            List of policies.
+        proportions : list of float, optional
+            Proportions for each policy.
+        n_steps : int
+            Total number of steps.
+        save_path : str or None
+            CSV save path.
+        verbose : bool
+            Print status info.
+        episode_based : bool
+            Switch policy at episode boundaries.
+        extra_steps : int
+            Number of additional transitions to record in the absorbing state.
+
+        Returns
+        -------
+        df : pd.DataFrame
+        """
+        # Reset seed for reproducible data collection
+        if self.seed is not None:
+            random.seed(self.seed)
+            np.random.seed(self.seed)
+            torch.manual_seed(self.seed)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed(self.seed)
+            if torch.backends.mps.is_available():
+                torch.mps.manual_seed(self.seed)
+        
+        # Validate inputs
+        if not isinstance(policies, list):
+            raise ValueError("policies must be a list")
+        
+        num_policies = len(policies)
+        if num_policies < 2:
+            raise ValueError("Must provide at least 2 policies.")
+        
+        # Convert all policies to policy objects
+        policies = [self._make_policy(p) for p in policies]
+        
+        # Set proportions
+        if proportions is None:
+            proportions = [1.0 / num_policies] * num_policies
+        else:
+            if len(proportions) != num_policies:
+                raise ValueError(f"proportions must have {num_policies} elements to match policies")
+            if abs(sum(proportions) - 1.0) > 1e-9:
+                raise ValueError(f"proportions must sum to 1.0, got {sum(proportions)}")
+        
+        env = self.env
+        
+        data = {
+            "episode": [],
+            "step": [],
+            "state": [],
+            "action": [],
+            "reward": [],
+            "next_state": [],
+            "policy_id": [],
+        }
+        
+        # Track statistics
+        policy_step_counts = [0] * num_policies
+        policy_episode_counts = [0] * num_policies
+        
+        episode, step = 0, 0
+        obs, _ = env.reset()
+        extra_steps_remaining = -1
+        
+        if episode_based:
+            current_policy_idx = random.choices(range(num_policies), weights=proportions)[0]
+            current_policy = policies[current_policy_idx]
+            policy_episode_counts[current_policy_idx] += 1
+        
+        for global_step in range(n_steps):
+            if episode_based:
+                policy_idx = current_policy_idx
+                policy = current_policy
+            else:
+                policy_idx = random.choices(range(num_policies), weights=proportions)[0]
+                policy = policies[policy_idx]
+            
+            action = policy.sample(obs)
+            next_obs, reward, terminated, truncated, _ = env.step(action)
+            
+            # Use model reward for extra terminal steps
+            if extra_steps_remaining != -1:
+                reward = self._get_reward_from_env(obs, action, reward)
+            
+            # Record transition
+            data["episode"].append(episode)
+            data["step"].append(step)
+            data["state"].append(obs)
+            data["action"].append(action)
+            data["reward"].append(reward)
+            data["next_state"].append(next_obs)
+            data["policy_id"].append(policy_idx)
+            
+            policy_step_counts[policy_idx] += 1
+            step += 1
+            
+            if truncated:
+                episode += 1
+                step = 0
+                obs, _ = env.reset()
+                extra_steps_remaining = -1
+                if episode_based:
+                    current_policy_idx = random.choices(range(num_policies), weights=proportions)[0]
+                    current_policy = policies[current_policy_idx]
+                    policy_episode_counts[current_policy_idx] += 1
+            elif terminated:
+                if extra_steps_remaining == -1:
+                    extra_steps_remaining = extra_steps
+                
+                if extra_steps_remaining > 0:
+                    extra_steps_remaining -= 1
+                    obs = next_obs
+                else:
+                    episode += 1
+                    step = 0
+                    obs, _ = env.reset()
+                    extra_steps_remaining = -1
+                    if episode_based:
+                        current_policy_idx = random.choices(range(num_policies), weights=proportions)[0]
+                        current_policy = policies[current_policy_idx]
+                        policy_episode_counts[current_policy_idx] += 1
+            else:
+                obs = next_obs
+        
+        df = pd.DataFrame(data)
+        
+        if verbose:
+            print(f"\n{'='*60}")
+            print(f"  MIXED TERMINAL-AWARE DATASET COLLECTION SUMMARY (TORCH)")
+            print(f"{'='*60}")
+            print(f"Total transitions: {len(df)}")
+            print(f"Total episodes: {episode}")
+            print(f"Extra steps: {extra_steps}")
+            print(f"\nPolicy Distribution:")
+            for i, (count, prop) in enumerate(zip(policy_step_counts, proportions)):
+                actual_prop = count / len(df) if len(df) > 0 else 0
+                print(f"  Policy {i}: {count:5d} steps ({actual_prop:5.1%}) | Target: {prop:5.1%}", end="")
+                if episode_based:
+                    print(f" | Episodes: {policy_episode_counts[i]}")
+                else:
+                    print()
+            print(f"{'='*60}\n")
+
+        if save_path is not None:
+            os.makedirs(os.path.dirname(save_path), exist_ok=True)
+            df[["state", "action", "reward", "next_state", "policy_id"]].to_csv(save_path, index=False)
+            if verbose:
+                print(f"✅ Mixed terminal-aware dataset saved to: {save_path}")
+        
+        return df
+
+    def _get_reward_from_env(self, state, action, fallback):
+        """
+        Internal helper to recover original reward from env model for terminal self-loops.
+        """
+        env = self.env
+        if not (hasattr(env, "states") and hasattr(env, "A") and hasattr(env, "r")):
+            return fallback
+
+        try:
+            if isinstance(env.states, torch.Tensor):
+                state_idx_tensor = (env.states == int(state)).nonzero(as_tuple=True)[0]
+                if len(state_idx_tensor) == 0:
+                    return fallback
+                state_idx = int(state_idx_tensor[0].item())
+            else:
+                state_idx = int(state)
+
+            row_idx = state_idx * int(env.A) + int(action)
+            r_val = env.r[row_idx]
+            if isinstance(r_val, torch.Tensor):
+                return float(r_val.item())
+            return float(r_val)
+        except Exception:
+            return fallback

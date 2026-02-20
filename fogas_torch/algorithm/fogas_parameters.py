@@ -147,7 +147,7 @@ class FOGASParameters:
         print(f"{'rho:':25s}       {fmt('rho', self.rho)}")
         print(f"{'eta:':25s}       {fmt('eta', self.eta)}")
         print(f"{'D_theta:':25s}   {fmt('D_theta', self.D_theta)}")
-        print(f"{'beta (ridge):':25s} {fmt('beta', R**2 / (d * self.T))}")
+        print(f"{'beta (ridge):':25s} {fmt('beta', self.R**2 / (self.d * self.T))}")
         print(f"{'D_pi (derived):':25s} {self.D_pi:.6f}")
 
         print("\n=========================================================\n")

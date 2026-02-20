@@ -24,6 +24,7 @@ class FOGASSolverVectorized:
         print_params=False,
         dataset_verbose=False,
         seed=42,
+        beta_omega=None,
     ):
         self.mdp = mdp
         self.delta = delta
@@ -52,11 +53,13 @@ class FOGASSolverVectorized:
         self.gamma = mdp.gamma
         self.R = mdp.R
         self.phi = mdp.phi
-        self.omega = mdp.omega
         self.x0 = mdp.x0
 
+        # Store beta_omega for omega resolution after FOGASParameters
+        self._beta_omega = beta_omega
+
         # ------------------------------
-        # Theoretical parameters
+        # Theoretical parameters (needed before omega resolution)
         # ------------------------------
         self.params = FOGASParameters(
             mdp=mdp,
@@ -78,6 +81,18 @@ class FOGASSolverVectorized:
         self.beta = self.params.beta
         self.D_pi = self.params.D_pi
 
+        # ------------------------------
+        # Omega resolution
+        # ------------------------------
+        # • mdp.omega is None  (reward_fn was used) → MUST estimate from data
+        # • beta_omega explicitly set               → estimate with that beta
+        # • mdp.omega given and beta_omega is None  → use mdp.omega as-is
+        # ------------------------------
+        if mdp.omega is None or self._beta_omega is not None:
+            self.omega = self._estimate_omega(self._beta_omega)
+        else:
+            self.omega = mdp.omega
+
         # Precompute feature tensors and covariances
         self._build_feature_tensors()
         self._build_covariances()
@@ -87,6 +102,42 @@ class FOGASSolverVectorized:
         self.pi = None
         self.mod_alpha = self.alpha
         self.lambda_T = None
+
+    # ------------------------------------------------------------------
+    # Omega regression
+    # ------------------------------------------------------------------
+    def _estimate_omega(self, beta_omega=None):
+        """
+        Estimate omega via ridge regression on the dataset:
+            omega_hat = argmin_w  ||Phi w - R||^2 + beta_omega * n * ||w||^2
+
+        Parameters
+        ----------
+        beta_omega : float or None
+            Ridge regularization for the regression. If None, uses the
+            theoretical beta = R^2 / (d * T) from FOGASParameters.
+
+        Returns
+        -------
+        omega_hat : np.ndarray of shape (d,)
+        """
+        phi = self.phi
+        Xs = self.Xs.astype(int)
+        As = self.As.astype(int)
+        Rs = self.Rs
+        n  = self.n
+        d  = self.d
+
+        Phi_data = np.stack([phi(x, a) for x, a in zip(Xs, As)])  # (n, d)
+
+        reg = self.beta if beta_omega is None else beta_omega
+        A_mat = Phi_data.T @ Phi_data + reg * n * np.eye(d)
+        b_vec = Phi_data.T @ Rs
+        omega_hat = np.linalg.solve(A_mat, b_vec)
+
+        print(f"[FOGASSolverVectorized] omega estimated via regression "
+              f"(beta_omega={reg:.2e}, n={n})")
+        return omega_hat
 
     # ------------------------------------------------------------------
     # Feature tensors

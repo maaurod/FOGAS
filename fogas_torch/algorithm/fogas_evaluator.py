@@ -668,10 +668,8 @@ class FOGASEvaluator:
         fig, axes = plt.subplots(1, 2, figsize=(14, 5))
 
         # Left: true reward heatmap
-        # Use SymLogNorm to see small differences in path rewards (-0.1) while showing pits (-5) and goals (+1)
-        norm0 = mcolors.SymLogNorm(linthresh=0.05, linscale=1.0, vmin=r_true_grid.min(), vmax=r_true_grid.max(), base=10)
-        im0 = axes[0].imshow(r_true_grid, cmap="RdYlGn", origin="upper", norm=norm0)
-        axes[0].set_title("True Reward (SymLog Scale)", fontsize=12)
+        im0 = axes[0].imshow(r_true_grid, cmap="RdYlGn", origin="upper", vmin=r_true_grid.min(), vmax=r_true_grid.max())
+        axes[0].set_title("True Reward (Linear Scale)", fontsize=12)
         plt.colorbar(im0, ax=axes[0], label="Reward Value")
 
         # Right: |error| heatmap

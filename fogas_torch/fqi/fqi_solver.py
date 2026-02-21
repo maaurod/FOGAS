@@ -24,7 +24,7 @@ class FQISolver:
         mdp,
         csv_path,
         gamma=None,
-        ridge=1e-6,
+        ridge=1.0,
         dataset_verbose=False,
         seed=42,
         device=None,
@@ -250,10 +250,10 @@ class FQISolver:
         Run Algorithm 9.
         
         Args:
-            K (int): Number of iterations
-            tau (float): Step size / Soft update parameter (tau * theta_old + (1-tau) * theta_new)
-                         Note: The prompt algorithm says: theta_{k+1} = tau * theta_k + (1 - tau) * theta_{k+1}^+
-            theta_init (torch.Tensor): Initial theta (d,). If None, starts at 0.
+            K (int): Number of iterations.
+            tau (float): Soft-update weight for old theta
+                         (theta_{k+1} = tau * theta_k + (1-tau) * theta_{k+1}^+).
+            theta_init (torch.Tensor): Initial theta (d,). If None, starts at zeros.
         """
         d = self.d
         device = self.device

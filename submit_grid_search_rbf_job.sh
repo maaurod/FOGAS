@@ -1,17 +1,17 @@
 #!/bin/bash
-# Submit FOGAS Grid Search as a batch job on a GPU node
-# Usage: ./submit_grid_search_job.sh [time] [gpu_count]
+# Submit FOGAS RBF Grid Search as a batch job on a GPU node
+# Usage: ./submit_grid_search_rbf_job.sh [time] [gpu_count]
 
-TIME=${1:-"12:00:00"}      # Default: 24 hours
+TIME=${1:-"12:00:00"}      # Default: 12 hours
 GPU_COUNT=${2:-1}          # Default: 1 GPU
-JOB_NAME="grid_tabular"
+JOB_NAME="grid_rbf"
 LOG_DIR="/shared/home/mauro.diaz/logs/fogas"
 mkdir -p "$LOG_DIR"
 LOG_FILE="$LOG_DIR/${JOB_NAME}_%j.log"
 
-echo "📤 Submitting FOGAS Grid Search job to GPU node..."
+echo "📤 Submitting FOGAS RBF Grid Search job to GPU node..."
 
-sbatch <<EOF
+sbatch <<SBATCH_EOF
 #!/bin/bash
 #SBATCH --job-name=$JOB_NAME
 #SBATCH --time=$TIME
@@ -30,12 +30,12 @@ echo "🎮 GPUs available:"
 nvidia-smi --query-gpu=index,name,memory.total --format=csv,noheader
 echo ""
 
-# Run the grid search script
-python3 /shared/home/mauro.diaz/work/FOGAS/testing_vectorized/utils/grid_search_sbatch.py
+# Run the RBF grid search script
+python3 /shared/home/mauro.diaz/work/FOGAS/testing_vectorized/utils/grid_search_sbatch_rbf.py
 
 echo ""
 echo "✅ Job finished at: \$(date)"
-EOF
+SBATCH_EOF
 
 echo ""
 echo "✅ Job submitted! Monitor it with: squeue -u \$(whoami)"

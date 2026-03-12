@@ -169,6 +169,63 @@ class FOGASEvaluator:
         # Return average gap
         return float(gaps.mean().item())
 
+    def convergence_to_goal(self, goal_state=None, max_steps=100, seed=42):
+        """
+        Compute how close the learned policy's optimal path gets to the goal.
+        A lower value is better (closer to goal). Returns 0 if goal is reached.
+        
+        Parameters
+        ----------
+        goal_state : int, optional
+            The target state. If None, tries to find it in the MDP.
+        max_steps : int
+            Maximum steps to simulate.
+        seed : int
+            Seed for simulation.
+            
+        Returns
+        -------
+        float
+            Euclidean distance to goal in grid-world coordinates.
+        """
+        if goal_state is None:
+            # Fallback for MDPs that store the goal state index
+            if hasattr(self.mdp, 'goal'):
+                goal_state = self.mdp.goal
+            else:
+                 # Check if goal is in mdp object attributes (common in this project)
+                 if hasattr(self.mdp, 'target_state'):
+                     goal_state = self.mdp.target_state
+                 else:
+                     raise ValueError("goal_state must be provided.")
+
+        try:
+            trajectory = self.simulate_trajectory(
+                pi=self.solver.pi,
+                max_steps=max_steps,
+                seed=seed,
+                goal_state=goal_state
+            )
+        except Exception as e:
+            # Return high penalty instead of failing
+            return 999.0
+            
+        if not trajectory:
+             return 999.0
+             
+        last_state = trajectory[-1]['next_state']
+        
+        if last_state == goal_state:
+            return 0.0
+            
+        # Grid world assumption: calculate distance based on sqrt(N) grid
+        grid_size = int(np.sqrt(self.mdp.N))
+        r_goal, c_goal = divmod(goal_state, grid_size)
+        r_last, c_last = divmod(last_state, grid_size)
+        
+        distance = np.sqrt((r_goal - r_last)**2 + (c_goal - c_last)**2)
+        return float(distance)
+
     # =====================================================
     # --- Metric factory ---
     # =====================================================
@@ -204,6 +261,12 @@ class FOGASEvaluator:
             max_steps = kwargs.get("max_steps", 100)
             seed = kwargs.get("seed", None)
             return lambda: self.optimal_states_quality(num_trajectories, max_steps, seed)
+
+        if name == "convergence":
+            goal = kwargs.get("goal_state", None)
+            max_steps = kwargs.get("max_steps", 50)
+            seed = kwargs.get("seed", 42)
+            return lambda: self.convergence_to_goal(goal, max_steps, seed)
 
         raise ValueError(f"Unknown metric '{name}'")
 
@@ -584,7 +647,7 @@ class FOGASEvaluator:
     # --- Reward Estimation Analysis ---
     # =====================================================
 
-    def analyze_reward_approximation(self, walls=None, pits=None, goal=None, show_plot=True):
+    def analyze_reward_approximation(self, walls=None, pits=None, goal=None, show_plot=True, print_each=False):
         """
         Analyze how well the linear features (Phi) represent the true reward function
         using the solver's omega.
@@ -599,6 +662,8 @@ class FOGASEvaluator:
             State index of the goal.
         show_plot : bool
             Whether to display the heatmap.
+        print_each : bool
+            Whether to print the reward approximation for every state-action pair.
         """
         if self.solver.omega is None:
             raise ValueError("Solver must have an 'omega' attribute (estimated or provided).")
@@ -632,30 +697,31 @@ class FOGASEvaluator:
         else:
             print(f"{'R² (explained variance)':<30} {'N/A (var=0)':>12}")
         
-        print("\n" + "-"*50)
-        print(f"{'State':<6} {'Action':<10} {'r_true':>10} {'r_hat':>10} {'error':>10}")
-        print("─" * 50)
-        
-        action_names = ["↑ Up", "↓ Down", "← Left", "→ Right"]
-        
-        # Print all states with labels for special types
-        for x in range(N):
-            state_desc = str(x)
-            if walls and x in walls:
-                state_desc += " [Wall]"
-            elif pits and x in pits:
-                state_desc += " [Pit]"
-            elif goal is not None and x == goal:
-                state_desc += " [Goal]"
-                
-            for a in range(A):
-                idx = x * A + a
-                rt = r_true[idx].item()
-                rh = r_hat[idx].item()
-                err = rh - rt
-                marker = " ⚠️" if abs(err) > 0.3 else ""
-                # Adjust formatting to accommodate the potentially longer state description
-                print(f"{state_desc:<12} {action_names[a] if a < len(action_names) else a:<10} {rt:>10.4f} {rh:>10.4f} {err:>10.4f}{marker}")
+        if print_each:
+            print("\n" + "-"*50)
+            print(f"{'State':<6} {'Action':<10} {'r_true':>10} {'r_hat':>10} {'error':>10}")
+            print("─" * 50)
+            
+            action_names = ["↑ Up", "↓ Down", "← Left", "→ Right"]
+            
+            # Print all states with labels for special types
+            for x in range(N):
+                state_desc = str(x)
+                if walls and x in walls:
+                    state_desc += " [Wall]"
+                elif pits and x in pits:
+                    state_desc += " [Pit]"
+                elif goal is not None and x == goal:
+                    state_desc += " [Goal]"
+                    
+                for a in range(A):
+                    idx = x * A + a
+                    rt = r_true[idx].item()
+                    rh = r_hat[idx].item()
+                    err = rh - rt
+                    marker = " ⚠️" if abs(err) > 0.3 else ""
+                    # Adjust formatting to accommodate the potentially longer state description
+                    print(f"{state_desc:<12} {action_names[a] if a < len(action_names) else a:<10} {rt:>10.4f} {rh:>10.4f} {err:>10.4f}{marker}")
 
         if not show_plot:
             return

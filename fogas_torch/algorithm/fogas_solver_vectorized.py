@@ -216,6 +216,7 @@ class FOGASSolverVectorized:
         alpha=None,
         eta=None,
         rho=None,
+        gamma=None,
         D_theta=None,
         lambda_init=None,
         theta_bar_init=None,
@@ -230,13 +231,13 @@ class FOGASSolverVectorized:
         alpha = self.params.alpha if alpha is None else alpha
         eta = self.params.eta if eta is None else eta
         rho = self.params.rho if rho is None else rho
+        gamma = self.gamma if gamma is None else gamma
         D_theta = self.params.D_theta if D_theta is None else D_theta
 
         self.mod_alpha = alpha  # store alpha used
 
         N, A, d = self.N, self.A, self.d
         n = self.n
-        gamma = self.gamma
         PHI_XA = self.PHI_XA
         Phi = self.Phi
         Xn = self.X_nexts.long()

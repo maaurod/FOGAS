@@ -209,7 +209,7 @@ FOGAS_PARAMS = {
     'alpha': 0.001 / 2,
     'eta': 0.0002,
     'rho': 0.05,
-    'T': 12000
+    'T': 13000          # ← bumped from 12000 to match notebook tuned value
 }
 
 # --- Precompute exact suboptimality metrics ---
@@ -224,8 +224,16 @@ beta_val = 1e-4
 temp_dir = "temp_grid_search_rbf"
 os.makedirs(temp_dir, exist_ok=True)
 
+extra_steps_values = [0, 1, 3]   # 3 = known-working value from notebook
+
 results = []
-total_iters = len(dataset_sizes) * len(epsilon_values) * len(proportion_configs) * len(reset_configs)
+total_iters = (
+    len(dataset_sizes)
+    * len(epsilon_values)
+    * len(proportion_configs)
+    * len(reset_configs)
+    * len(extra_steps_values)
+)
 
 print(f"\n🚀 Starting RBF Grid Search ({total_iters} scenarios)...")
 print(f"   Computing 5 metrics per scenario:")
@@ -248,99 +256,100 @@ with tqdm(total=total_iters, desc="Grid Searching") as pbar:
             seed=seed
         )
 
-        for prop_label, (props, prop_name) in proportion_configs.items():
-            for eps in epsilon_values:
-                epsilon_policy = (mdp.pi_star, eps)
+        for extra_steps in extra_steps_values:
+            for prop_label, (props, prop_name) in proportion_configs.items():
+                for eps in epsilon_values:
+                    epsilon_policy = (mdp.pi_star, eps)
 
-                for n_steps in dataset_sizes:
-                    fname = f"gs_rbf_{reset_label}_{prop_label}_eps{eps}_n{n_steps}.csv"
-                    save_path = os.path.join(temp_dir, fname)
+                    for n_steps in dataset_sizes:
+                        fname = f"gs_rbf_{reset_label}_extra{extra_steps}_{prop_label}_eps{eps}_n{n_steps}.csv"
+                        save_path = os.path.join(temp_dir, fname)
 
-                    # A. Collect Dataset
-                    try:
-                        collector.collect_mixed_dataset(
-                            policies=[epsilon_policy, "random"],
-                            proportions=props,
-                            n_steps=n_steps,
-                            episode_based=True,
-                            save_path=save_path,
-                            verbose=False
-                        )
-                    except Exception as e:
-                        print(f"\n⚠️  Dataset collection failed: {e}")
-                        pbar.update(1)
-                        continue
-
-                    # B. Analyze Feature Coverage
-                    try:
-                        analyzer = DatasetAnalyzer(save_path)
-                        coverage_ratio = analyzer.feature_coverage_ratio(
-                            mdp=mdp, beta=beta_val, use_optimal_policy=True, verbose=False
-                        )
-                    except Exception:
-                        coverage_ratio = np.nan
-
-                    # C. Train FOGAS and Compute Metrics
-                    # omega is None in mdp → FOGASSolverVectorized will estimate it
-                    # from the dataset via ridge regression automatically.
-                    try:
-                        temp_solver = FOGASSolverVectorized(
-                            mdp=mdp, csv_path=save_path, device=device,
-                            beta=beta_val, seed=seed
-                        )
-                        temp_solver.run(
-                            alpha=FOGAS_PARAMS['alpha'],
-                            eta=FOGAS_PARAMS['eta'],
-                            rho=FOGAS_PARAMS['rho'],
-                            T=FOGAS_PARAMS['T'],
-                            tqdm_print=False
-                        )
-
-                        temp_eval = FOGASEvaluator(temp_solver)
-
-                        # Metric 1: Convergence
+                        # A. Collect Dataset (terminal-aware mixed)
                         try:
-                            traj = temp_eval.simulate_trajectory(
-                                pi=None, max_steps=200, seed=42, goal_state=99
+                            collector.collect_mixed_dataset_terminal_aware(
+                                policies=[epsilon_policy, "random"],
+                                proportions=props,
+                                n_steps=n_steps,
+                                episode_based=True,
+                                save_path=save_path,
+                                verbose=False,
+                                extra_steps=extra_steps,
                             )
-                            convergence = int(traj[-1]['next_state'] == 99)
+                        except Exception as e:
+                            print(f"\n⚠️  Dataset collection failed: {e}")
+                            pbar.update(1)
+                            continue
+
+                        # B. Analyze Feature Coverage
+                        try:
+                            analyzer = DatasetAnalyzer(save_path)
+                            coverage_ratio = analyzer.feature_coverage_ratio(
+                                mdp=mdp, beta=beta_val, use_optimal_policy=True, verbose=False
+                            )
                         except Exception:
-                            convergence = np.nan
+                            coverage_ratio = np.nan
 
-                        # Metric 2: Final Reward
-                        final_reward = temp_eval.final_reward()
+                        # C. Train FOGAS and Compute Metrics
+                        try:
+                            temp_solver = FOGASSolverVectorized(
+                                mdp=mdp, csv_path=save_path, device=device,
+                                beta=beta_val, seed=seed
+                            )
+                            temp_solver.run(
+                                alpha=FOGAS_PARAMS['alpha'],
+                                eta=FOGAS_PARAMS['eta'],
+                                rho=FOGAS_PARAMS['rho'],
+                                T=FOGAS_PARAMS['T'],
+                                tqdm_print=False
+                            )
 
-                        # Metrics 3 & 4: Exact Suboptimality Gaps
-                        v_pi, q_pi = mdp.evaluate_policy(temp_solver.pi)
-                        v_pi_cpu       = v_pi.cpu()
-                        q_pi_flat_cpu  = q_pi.reshape(-1).cpu()
+                            temp_eval = FOGASEvaluator(temp_solver)
 
-                        v_gap = (_d_star * (_v_star - v_pi_cpu)).sum().item()
-                        q_gap = (_mu_star_norm * (_q_star_flat - q_pi_flat_cpu)).sum().item()
+                            # Metric 1: Convergence
+                            try:
+                                traj = temp_eval.simulate_trajectory(
+                                    pi=None, max_steps=200, seed=42, goal_state=99
+                                )
+                                convergence = int(traj[-1]['next_state'] == 99)
+                            except Exception:
+                                convergence = np.nan
 
-                    except Exception as e:
-                        print(f"\n⚠️  FOGAS training/evaluation failed: {e}")
-                        convergence  = np.nan
-                        final_reward = np.nan
-                        v_gap        = np.nan
-                        q_gap        = np.nan
+                            # Metric 2: Final Reward
+                            final_reward = temp_eval.final_reward()
 
-                    results.append({
-                        "Dataset Size":   n_steps,
-                        "Epsilon":        eps,
-                        "Proportions":    prop_name,
-                        "Init Mode":      reset_label,
-                        "Coverage Ratio": coverage_ratio,
-                        "Log Coverage":   np.log10(coverage_ratio) if (not np.isnan(coverage_ratio) and coverage_ratio > 0) else np.nan,
-                        "Convergence":    convergence,
-                        "Final Reward":   final_reward,
-                        "V Optimal Gap":  v_gap,
-                        "Q Optimal Gap":  q_gap,
-                    })
+                            # Metrics 3 & 4: Exact Suboptimality Gaps
+                            v_pi, q_pi = mdp.evaluate_policy(temp_solver.pi)
+                            v_pi_cpu       = v_pi.cpu()
+                            q_pi_flat_cpu  = q_pi.reshape(-1).cpu()
 
-                    if os.path.exists(save_path):
-                        os.remove(save_path)
-                    pbar.update(1)
+                            v_gap = (_d_star * (_v_star - v_pi_cpu)).sum().item()
+                            q_gap = (_mu_star_norm * (_q_star_flat - q_pi_flat_cpu)).sum().item()
+
+                        except Exception as e:
+                            print(f"\n⚠️  FOGAS training/evaluation failed: {e}")
+                            convergence  = np.nan
+                            final_reward = np.nan
+                            v_gap        = np.nan
+                            q_gap        = np.nan
+
+                        results.append({
+                            "Dataset Size":   n_steps,
+                            "Epsilon":        eps,
+                            "Proportions":    prop_name,
+                            "Init Mode":      reset_label,
+                            "Extra Steps":    extra_steps,
+                            "Coverage Ratio": coverage_ratio,
+                            "Log Coverage":   np.log10(coverage_ratio) if (not np.isnan(coverage_ratio) and coverage_ratio > 0) else np.nan,
+                            "Convergence":    convergence,
+                            "Final Reward":   final_reward,
+                            "V Optimal Gap":  v_gap,
+                            "Q Optimal Gap":  q_gap,
+                        })
+
+                        if os.path.exists(save_path):
+                            os.remove(save_path)
+                        pbar.update(1)
 
 # Cleanup
 if os.path.exists(temp_dir):

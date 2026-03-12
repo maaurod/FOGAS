@@ -9,41 +9,52 @@ from ..algorithm.fogas_dataset import FOGASDataset
 class FQISolver:
     """
     Fitted Q Iteration implementation.
-    
+
+    Two modes:
+    - Dataset-based (default): targets from dataset transitions only.
+      target_i = r_i + gamma * max_a' Q(x'_i, a'; theta_k), fit on (x_i, a_i).
+      With few RBF centers, many (s,a) share similar features so the fit can fail.
+    - Model-based (use_model_based_backup=True): use full MDP (P, r) to compute
+      targets for every state-action: target(s,a) = r(s,a) + gamma * E_s'[max_a' Q(s',a')].
+      Then fit theta on all (s,a). Works with RBF/linear features when the model is known.
+    - Optimal Model-based (use_optimal_target_backup=True): same as Model-based, but
+      targets use the true V* from the MDP: target(s,a) = r(s,a) + gamma * E_s'[V*(s')].
+      This regresses the feature weights towards the best possible feature representation of Q*.
+
     Update rule:
-      1. target_i = r_i + gamma * max_a' Q(x'_i, a'; theta_k)
-      2. theta_{k+1}^+ = argmin_theta sum_i (target_i - Q(x_i, a_i; theta))^2
-                       = (Phi^T Phi)^(-1) Phi^T Y
+      1. target_i = r_i + gamma * max_a' Q(x'_i, a'; theta_k)  [or full model / optimal V*]
+      2. theta_{k+1}^+ = argmin_theta sum (target - Q(.; theta))^2 = (Phi^T Phi + ridge I)^{-1} Phi^T Y
       3. theta_{k+1} = tau * theta_k + (1 - tau) * theta_{k+1}^+
-      
+
     Where Q(s, a; theta) = phi(s, a)^T theta.
     """
 
     def __init__(
         self,
         mdp,
-        csv_path,
+        csv_path=None,
         gamma=None,
         ridge=1.0,
         dataset_verbose=False,
         seed=42,
         device=None,
         augment_terminal_transitions=True,
+        use_model_based_backup=False,
+        use_optimal_target_backup=False,
     ):
         self.mdp = mdp
-        # Allow overriding gamma, otherwise take from MDP
         self.gamma = gamma if gamma is not None else mdp.gamma
         self.ridge = ridge
         self.seed = seed
         self.augment_terminal_transitions = augment_terminal_transitions
+        self.use_model_based_backup = use_model_based_backup
+        self.use_optimal_target_backup = use_optimal_target_backup
 
-        # Set device
         if device is None:
             self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         else:
             self.device = torch.device(device)
 
-        # Set random seed
         if seed is not None:
             random.seed(seed)
             np.random.seed(seed)
@@ -51,43 +62,63 @@ class FQISolver:
             if torch.cuda.is_available():
                 torch.cuda.manual_seed(seed)
 
-        # Move MDP to device
-        # Note: We assume mdp has a .to() method (LinearMDP does)
         if hasattr(self.mdp, 'to'):
             self.mdp.to(self.device)
 
-        # Global MDP info
         self.A = mdp.A
         self.d = mdp.d
-        self.phi = mdp.phi  # Function phi(s, a)
+        self.phi = mdp.phi
+        self.N = getattr(mdp, 'N', None)
 
-        # ------------------------------
-        # Dataset
-        # ------------------------------
-        self.dataset = FOGASDataset(csv_path=csv_path, verbose=dataset_verbose)
-        self.n = self.dataset.n
+        if use_model_based_backup or use_optimal_target_backup:
+            self._init_model_based()
+        else:
+            if csv_path is None:
+                raise ValueError("csv_path is required when use_model_based_backup or use_optimal_target_backup is False.")
+            self._init_dataset_based(csv_path, dataset_verbose)
 
-        # Move dataset tensors to device
-        self.Xs = self.dataset.X.to(self.device)         # (n,)
-        self.As = self.dataset.A.to(self.device)         # (n,)
-        self.Rs = self.dataset.R.to(self.device)         # (n,)
-        self.X_nexts = self.dataset.X_next.to(self.device) # (n,)
-        self._state_to_index = self._build_state_to_index()
-        self.added_terminal_samples = 0
-
-        if self.augment_terminal_transitions:
-            self._augment_missing_terminal_transitions(dataset_verbose=dataset_verbose)
-
-        # ------------------------------
-        # Precompute Features
-        # ------------------------------
-        self._precompute_dataset_features()
-        self._build_regression_solver()
-        
-        # Results
         self.theta_history = []
         self.final_theta = None
         self.pi = None
+
+    def _init_model_based(self):
+        """Use full MDP P and r for Bellman backup over all state-actions (no dataset)."""
+        if self.N is None:
+            self.N = len(self.mdp.states)
+        # Phi: (N*A, d) in row order (s0,a0), (s0,a1), ..., (sN-1, aA-1)
+        Phi_full = self.mdp.Phi.to(dtype=torch.float64, device=self.device)
+        r = self.mdp.get_reward().to(dtype=torch.float64, device=self.device)
+        P = self.mdp.get_transition_matrix().to(dtype=torch.float64, device=self.device)
+        if Phi_full.shape[0] != self.N * self.A or P.shape != (self.N * self.A, self.N):
+            raise ValueError(
+                "Model-based FQI requires mdp.Phi (N*A, d) and transition matrix P (N*A, N)."
+            )
+        Gram = Phi_full.T @ Phi_full + self.ridge * torch.eye(
+            self.d, dtype=torch.float64, device=self.device
+        )
+        self.M = torch.linalg.solve(Gram, Phi_full.T)
+        self.Phi_full = Phi_full
+        self.r_full = r
+        self.P_full = P
+        self.n = self.N * self.A
+        self._state_to_index = self._build_state_to_index()
+
+    def _init_dataset_based(self, csv_path, dataset_verbose):
+        """Standard FQI: load dataset and build regression from dataset samples."""
+        self.dataset = FOGASDataset(csv_path=csv_path, verbose=dataset_verbose)
+        self.n = self.dataset.n
+        self.Xs = self.dataset.X.to(self.device)
+        self.As = self.dataset.A.to(self.device)
+        self.Rs = self.dataset.R.to(self.device)
+        self.X_nexts = self.dataset.X_next.to(self.device)
+        self._state_to_index = self._build_state_to_index()
+        self.added_terminal_samples = 0
+        if self.augment_terminal_transitions:
+            self._augment_missing_terminal_transitions(dataset_verbose=dataset_verbose)
+        self._precompute_dataset_features()
+        self._build_regression_solver()
+        if self.N is None:
+            self.N = len(self.mdp.states)
 
     def _build_state_to_index(self):
         """Build map from raw state value to row index in mdp.states."""
@@ -247,61 +278,91 @@ class FQISolver:
 
     def run(self, K=100, tau=0.1, theta_init=None, verbose=False):
         """
-        Run Algorithm 9.
-        
+        Run FQI for K iterations.
+
         Args:
             K (int): Number of iterations.
-            tau (float): Soft-update weight for old theta
-                         (theta_{k+1} = tau * theta_k + (1-tau) * theta_{k+1}^+).
+            tau (float): Soft-update weight (theta_{k+1} = tau*theta_k + (1-tau)*theta_plus).
             theta_init (torch.Tensor): Initial theta (d,). If None, starts at zeros.
+            verbose (bool): Whether to show progress.
         """
         d = self.d
         device = self.device
-        
+
         if theta_init is None:
             theta = torch.zeros(d, dtype=torch.float64, device=device)
         else:
             theta = theta_init.clone().to(dtype=torch.float64, device=device)
-            
+
         params_history = []
-        
         iterator = trange(K, desc="FQI", disable=not verbose)
-        
-        for k in iterator:
-            # 1. Compute Regression Targets
-            # Q(x'_i, a') for all a': (n, A, d) @ theta -> (n, A)
-            Q_next_all = torch.einsum('nad,d->na', self.Phi_next_all, theta)
-            
-            # max_a' Q(x'_i, a') -> (n,)
-            max_Q_next, _ = torch.max(Q_next_all, dim=1)
-            
-            # Target y_i = r_i + gamma * max_Q_next
-            targets = self.Rs + self.gamma * max_Q_next
-            
-            # 2. Least Squares Solution (theta_{k+1}^+)
-            # theta_plus = M @ targets
-            theta_plus = self.M @ targets
-            
-            # 3. Soft Update
-            # theta_{k+1} = tau * theta_k + (1 - tau) * theta_plus
-            theta_next = tau * theta + (1 - tau) * theta_plus
-            
-            # Update
-            theta = theta_next
-            
-            # Store
-            params_history.append(theta.clone())
-            
-            if verbose and (k % 10 == 0):
-                norm = torch.linalg.norm(theta).item()
-                iterator.set_postfix(theta_norm=f"{norm:.4f}")
-        
+
+        if self.use_optimal_target_backup:
+            self._run_optimal_target_based(theta, params_history, iterator, tau, verbose)
+        elif self.use_model_based_backup:
+            self._run_model_based(theta, params_history, iterator, tau, verbose)
+        else:
+            self._run_dataset_based(theta, params_history, iterator, tau, verbose)
+
         self.final_theta = theta
         self.theta_history = params_history
         self.pi = self.get_policy_matrix(theta)
-        
-        # Return a policy function wrapper
         return self.get_greedy_policy(theta)
+
+    def _run_model_based(self, theta, params_history, iterator, tau, verbose=False):
+        """Bellman backup using full P and r over all state-actions."""
+        N, A = self.N, self.A
+        Phi_full = self.Phi_full
+        r = self.r_full
+        P = self.P_full
+        for k in iterator:
+            # Q(s,a) for all (s,a): (N*A,) from (N*A, d) @ (d,)
+            Q_vec = Phi_full @ theta
+            # V(s) = max_a Q(s,a): (N,)
+            Q_mat = Q_vec.reshape(N, A)
+            V, _ = torch.max(Q_mat, dim=1)
+            # target(s,a) = r(s,a) + gamma * sum_s' P(s'|s,a) V(s')
+            targets = r + self.gamma * (P @ V)
+            theta_plus = self.M @ targets
+            theta.mul_(tau).add_(theta_plus, alpha=1.0 - tau)
+            params_history.append(theta.clone())
+            if verbose and (k % 10 == 0):
+                iterator.set_postfix(theta_norm=f"{torch.linalg.norm(theta).item():.4f}")
+
+    def _run_optimal_target_based(self, theta, params_history, iterator, tau, verbose=False):
+        """Bellman backup using full P and r, but fixed V* from PolicySolver."""
+        if not hasattr(self.mdp, 'v_star'):
+             raise AttributeError("Optimal target backup requires mdp to have 'v_star' (e.g. PolicySolver).")
+        
+        N, A = self.N, self.A
+        r = self.r_full
+        P = self.P_full
+        V_star = self.mdp.v_star.to(dtype=torch.float64, device=self.device)
+        
+        # target(s,a) = r(s,a) + gamma * sum_s' P(s'|s,a) V*(s')
+        # This target is fixed!
+        targets = r + self.gamma * (P @ V_star)
+        
+        # Precompute theta_plus once since targets are fixed
+        theta_plus = self.M @ targets
+        
+        for k in iterator:
+            theta.mul_(tau).add_(theta_plus, alpha=1.0 - tau)
+            params_history.append(theta.clone())
+            if verbose and (k % 10 == 0):
+                iterator.set_postfix(theta_norm=f"{torch.linalg.norm(theta).item():.4f}")
+
+    def _run_dataset_based(self, theta, params_history, iterator, tau, verbose=False):
+        """Bellman backup using only dataset transitions (standard FQI)."""
+        for k in iterator:
+            Q_next_all = torch.einsum('nad,d->na', self.Phi_next_all, theta)
+            max_Q_next, _ = torch.max(Q_next_all, dim=1)
+            targets = self.Rs + self.gamma * max_Q_next
+            theta_plus = self.M @ targets
+            theta.mul_(tau).add_(theta_plus, alpha=1.0 - tau)
+            params_history.append(theta.clone())
+            if verbose and (k % 10 == 0):
+                iterator.set_postfix(theta_norm=f"{torch.linalg.norm(theta).item():.4f}")
 
     def get_greedy_policy(self, theta=None):
         """

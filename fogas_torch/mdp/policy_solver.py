@@ -168,6 +168,14 @@ class PolicySolver(LinearMDP):
 
         return mu
 
+    @property
+    def state_mu_star(self):
+        """
+        Marginalized optimal state occupancy measure mu*(s).
+        Returns a tensor of shape (N,) summing mu*(s, a) over all actions.
+        """
+        return self.mu_star.reshape(self.N, self.A).sum(dim=1)
+
     # ------------------------------------------------------------
     # Pretty-print occupancy measure 
     # ------------------------------------------------------------

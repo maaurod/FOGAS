@@ -20,6 +20,7 @@ class FOGASHyperOptimizer:
         "alpha": {"bounds": lambda theory, cur: (theory["alpha"], 5.0), "log_scale": True},
         "rho":   {"bounds": lambda theory, cur: (1e-2, 5.0),  "log_scale": True},
         "eta":   {"bounds": lambda theory, cur: (theory["eta"], 3.0),   "log_scale": True},
+        "gamma": {"bounds": (0.8, 0.999), "log_scale": False},
     }
 
     def __init__(self, solver, metric_callable, seed=42):
@@ -117,6 +118,7 @@ class FOGASHyperOptimizer:
         print_each=False,
         return_history=False,
         num_runs=3,
+        **kwargs
     ):
         assert search_method in {"bo", "random"}
         fixed_params = fixed_params or {}
@@ -132,6 +134,7 @@ class FOGASHyperOptimizer:
         for v in grid:
             params = dict(fixed_params)
             params[param_name] = v
+            params.update(kwargs) # Forward extra run params like T
 
             val = self._evaluate(num_runs=num_runs, **params)
             X.append(v)
@@ -161,7 +164,8 @@ class FOGASHyperOptimizer:
                 fixed_params,
                 bo_iters,
                 print_each,
-                num_runs
+                num_runs,
+                **kwargs
             )
         else:
             X, y = self._optimize_random(
@@ -174,7 +178,8 @@ class FOGASHyperOptimizer:
                 random_candidates,
                 log_scale,
                 print_each,
-                num_runs
+                num_runs,
+                **kwargs
             )
 
         best_idx = int(np.argmin(y))
@@ -195,6 +200,7 @@ class FOGASHyperOptimizer:
         bo_iters,
         print_each,
         num_runs,
+        **kwargs
     ):
         def expected_improvement(x, gp, y_best, xi=0.01):
             mu, sigma = gp.predict(x.reshape(-1, 1), return_std=True)
@@ -229,6 +235,7 @@ class FOGASHyperOptimizer:
 
             params = dict(fixed_params)
             params[param_name] = x_next
+            params.update(kwargs)
 
             y_next = self._evaluate(num_runs=num_runs, **params)
 
@@ -254,6 +261,7 @@ class FOGASHyperOptimizer:
         log_scale,
         print_each,
         num_runs,
+        **kwargs
     ):
         if log_scale:
             candidates = np.exp(
@@ -269,6 +277,7 @@ class FOGASHyperOptimizer:
         for i, x in enumerate(candidates):
             params = dict(fixed_params)
             params[param_name] = x
+            params.update(kwargs)
 
             y_val = self._evaluate(num_runs=num_runs, **params)
 
@@ -294,6 +303,7 @@ class FOGASHyperOptimizer:
         num_runs=3,
         order=("alpha", "rho", "eta"),
         bounds_overrides=None,
+        **kwargs
     ):
         """
         Sequential tuning in arbitrary order.
@@ -317,6 +327,7 @@ class FOGASHyperOptimizer:
             "alpha": float(self.solver.alpha),
             "rho":   float(self.solver.rho),
             "eta":   float(self.solver.eta),
+            "gamma": float(self.solver.gamma),
         }
 
         # current best-known params start at theory values
@@ -371,6 +382,7 @@ class FOGASHyperOptimizer:
                 random_candidates=random_candidates,
                 print_each=print_search,
                 num_runs=num_runs,
+                **kwargs
             )
 
             # update and evaluate exactly at the new triplet
@@ -380,7 +392,7 @@ class FOGASHyperOptimizer:
             metrics[key] = float(self.metric())
 
             if print_main:
-                pretty = ", ".join([f"{k}={current[k]:.4e}" for k in ("alpha","rho","eta")])
+                pretty = ", ".join([f"{k}={current[k]:.4e}" for k in current.keys()])
                 print(f"[After {p}*] {pretty} | metric = {metrics[key]:.4f}")
 
             stage_labels.append(f"{p}*")
@@ -397,10 +409,42 @@ class FOGASHyperOptimizer:
             plt.tight_layout()
             plt.show()
 
-        return {
-            "alpha": current["alpha"],
-            "rho": current["rho"],
-            "eta": current["eta"],
+        result = {k: v for k, v in current.items()}
+        result.update({
             "metrics": metrics,
             "order": tuple(order),
-        }
+        })
+        return result
+
+    def tune_convergence(
+        self,
+        goal_state=None,
+        max_steps=100,
+        order=("alpha", "eta"),
+        search_method="bo",
+        num_runs=1,
+        **kwargs
+    ):
+        """
+        Specialized tuning for reaching a goal state.
+        Automatically uses the 'convergence' metric (distance to goal).
+        """
+        from .fogas_evaluator import FOGASEvaluator
+        
+        # Temporarily switch to the convergence metric
+        evaluator = FOGASEvaluator(self.solver)
+        old_metric = self.metric
+        self.metric = evaluator.get_metric("convergence", goal_state=goal_state, max_steps=max_steps)
+        
+        try:
+            results = self.optimize_fogas_hyperparameters(
+                order=order,
+                search_method=search_method,
+                num_runs=num_runs,
+                **kwargs
+            )
+        finally:
+            # Restore original metric if needed
+            self.metric = old_metric
+            
+        return results

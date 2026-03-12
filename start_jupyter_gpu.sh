@@ -3,22 +3,24 @@
 # Usage: ./start_jupyter_gpu.sh [time] [gpu_count]
 # Example: ./start_jupyter_gpu.sh 4:00:00 1
 
-TIME=${1:-"12:00:00"}      # Default: 4 hours
-GPU_COUNT=${2:-1}         # Default: 1 GPU
-PORT=${3:-8888}           # Default port
+TIME=${1:-"12:00:00"}      # Default: 12 hours
+GPU_COUNT=${2:-1}          # Default: 1 GPU
+PORT=${3:-8888}            # Default port
 
 echo "🚀 Starting Jupyter Lab on GPU node..."
 echo "⏱️  Time: $TIME"
 echo "🎮 GPUs: $GPU_COUNT"
 echo "🔌 Port: $PORT"
+echo "🚫 Excluding node: apl (slower L4 GPU)"
 echo ""
 
-# Start interactive session with GPU
-srun --exclude=aga \
+# Start interactive session excluding the slower 'apl' node
+srun \
      --time=$TIME \
      --gres=gpu:$GPU_COUNT \
+     --exclude=apl \
      --mem=32G \
-     --cpus-per-task=4 \
+     --cpus-per-task=8 \
      --pty bash -c '
      cd /shared/home/mauro.diaz/work/FOGAS && \
      source venv/bin/activate && \

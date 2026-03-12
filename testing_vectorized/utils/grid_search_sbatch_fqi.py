@@ -113,10 +113,9 @@ FQI_PARAMS = {
     'ridge': 1e-2,
 }
 
-dataset_sizes = [10000, 15000, 20000, 25000, 30000]
+dataset_sizes  = [4000, 8000, 12000, 16000, 20000]   # ← aligned with FOGAS
 epsilon_values = [0.1, 0.3, 0.5, 0.7, 0.9]
-extra_steps_values = [0, 1, 3, 5]
-
+extra_steps_values = [0, 1]
 proportion_configs = {
     "100/0": ([1.0, 0.0], "100% Eps-Greedy"),
     "80/20": ([0.8, 0.2], "80% Eps-Greedy / 20% Random"),
@@ -134,7 +133,7 @@ reset_configs = {
     "0/100": {'random': 1.0, 'x0': 0.0},
 }
 
-beta_val = 1e-2          # coverage ratio regularization
+beta_val = 1e-4          # ← aligned with FOGAS (was 1e-2)
 temp_dir = "temp_grid_search_fqi"
 os.makedirs(temp_dir, exist_ok=True)
 

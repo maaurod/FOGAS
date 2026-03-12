@@ -522,7 +522,8 @@ class EnvDataCollector:
         return df
 
     def collect_mixed_dataset_terminal_aware(self, policies, proportions=None, n_steps=1000, 
-                                             save_path=None, verbose=True, episode_based=True, extra_steps=5):
+                                             save_path=None, verbose=True, episode_based=True, extra_steps=5,
+                                             manual_states=None, manual_samples_per_pair=10):
         """
         Collect transitions using multiple policies with specified proportions,
         while handling absorbing states by staying for 'extra_steps'.
@@ -543,6 +544,10 @@ class EnvDataCollector:
             Switch policy at episode boundaries.
         extra_steps : int
             Number of additional transitions to record in the absorbing state.
+        manual_states : list of int, optional
+            List of states to manually sample every action for.
+        manual_samples_per_pair : int
+            Number of manual samples per (s, a) pair.
 
         Returns
         -------
@@ -683,7 +688,407 @@ class EnvDataCollector:
             if verbose:
                 print(f"✅ Mixed terminal-aware dataset saved to: {save_path}")
         
+        # Integrated manual augmentation if requested
+        if manual_states:
+            if verbose:
+                print(f"\nPerforming integrated manual augmentation for {len(manual_states)} states...")
+            df_manual = self.add_manual_samples(
+                states=manual_states, 
+                samples_per_pair=manual_samples_per_pair, 
+                save_path=save_path, 
+                verbose=verbose
+            )
+            # Combine the DataFrames for the return value
+            # We only keep the core overlapping columns
+            cols = ["state", "action", "reward", "next_state"]
+            df = pd.concat([df[cols], df_manual[cols]], ignore_index=True)
+
         return df
+
+    def collect_mixed_dataset_terminal_aware_with_restricted(self, policies, proportions=None, n_steps=1000, 
+                                             save_path=None, verbose=True, episode_based=True, extra_steps=5, restricted_max_steps=1):
+        """
+        Collect transitions using multiple policies with specified proportions,
+        while handling absorbing states by staying for 'extra_steps', AND specifically
+        handling transitions that start in restricted states by forcing random action 
+        choice and a defined truncation length.
+
+        Parameters
+        ----------
+        policies : list
+            List of policies.
+        proportions : list of float, optional
+            Proportions for each policy.
+        n_steps : int
+            Total number of steps.
+        save_path : str or None
+            CSV save path.
+        verbose : bool
+            Print status info.
+        episode_based : bool
+            Switch policy at episode boundaries.
+        extra_steps : int
+            Number of additional transitions to record in the absorbing state.
+        restricted_max_steps : int
+            Number of max steps permitted when spawning randomly in a restricted state. Actions are completely random.
+
+        Returns
+        -------
+        df : pd.DataFrame
+        """
+        # Reset seed for reproducible data collection
+        if self.seed is not None:
+            random.seed(self.seed)
+            np.random.seed(self.seed)
+            torch.manual_seed(self.seed)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed(self.seed)
+            if torch.backends.mps.is_available():
+                torch.mps.manual_seed(self.seed)
+        
+        # Validate inputs
+        if not isinstance(policies, list):
+            raise ValueError("policies must be a list")
+        
+        num_policies = len(policies)
+        if num_policies < 2:
+            raise ValueError("Must provide at least 2 policies.")
+        
+        # Convert all policies to policy objects
+        policies = [self._make_policy(p) for p in policies]
+        
+        # Set proportions
+        if proportions is None:
+            proportions = [1.0 / num_policies] * num_policies
+        else:
+            if len(proportions) != num_policies:
+                raise ValueError(f"proportions must have {num_policies} elements to match policies")
+            if abs(sum(proportions) - 1.0) > 1e-9:
+                raise ValueError(f"proportions must sum to 1.0, got {sum(proportions)}")
+        
+        env = self.env
+        
+        data = {
+            "episode": [],
+            "step": [],
+            "state": [],
+            "action": [],
+            "reward": [],
+            "next_state": [],
+            "policy_id": [],
+        }
+        
+        # Track statistics
+        policy_step_counts = [0] * num_policies
+        policy_episode_counts = [0] * num_policies
+        
+        episode, step = 0, 0
+        obs, info = env.reset()
+        is_restricted_start = info.get("restricted_start", False)
+        
+        extra_steps_remaining = -1
+        restricted_steps_count = 0
+        
+        if episode_based:
+            current_policy_idx = random.choices(range(num_policies), weights=proportions)[0]
+            current_policy = policies[current_policy_idx]
+            policy_episode_counts[current_policy_idx] += 1
+        
+        for global_step in range(n_steps):
+            if episode_based:
+                policy_idx = current_policy_idx
+                policy = current_policy
+            else:
+                policy_idx = random.choices(range(num_policies), weights=proportions)[0]
+                policy = policies[policy_idx]
+            
+            if is_restricted_start:
+                # Force Random Action to touch every action when randomly started on a wall.
+                action = env.action_space.sample()
+                restricted_steps_count += 1
+            else:
+                action = policy.sample(obs)
+                
+            next_obs, reward, terminated, truncated, info = env.step(action)
+            
+            if is_restricted_start and restricted_steps_count >= restricted_max_steps:
+               truncated = True
+               
+            # Use model reward for extra terminal steps
+            if extra_steps_remaining != -1:
+                reward = self._get_reward_from_env(obs, action, reward)
+            
+            # Record transition
+            data["episode"].append(episode)
+            data["step"].append(step)
+            data["state"].append(obs)
+            data["action"].append(action)
+            data["reward"].append(reward)
+            data["next_state"].append(next_obs)
+            data["policy_id"].append(-1 if is_restricted_start else policy_idx)
+            
+            if not is_restricted_start:
+               policy_step_counts[policy_idx] += 1
+            step += 1
+            
+            if truncated:
+                episode += 1
+                step = 0
+                obs, info = env.reset()
+                is_restricted_start = info.get("restricted_start", False)
+                extra_steps_remaining = -1
+                restricted_steps_count = 0
+                if episode_based:
+                    current_policy_idx = random.choices(range(num_policies), weights=proportions)[0]
+                    current_policy = policies[current_policy_idx]
+                    policy_episode_counts[current_policy_idx] += 1
+            elif terminated:
+                if extra_steps_remaining == -1:
+                    extra_steps_remaining = extra_steps
+                
+                if extra_steps_remaining > 0:
+                    extra_steps_remaining -= 1
+                    obs = next_obs
+                else:
+                    episode += 1
+                    step = 0
+                    obs, info = env.reset()
+                    is_restricted_start = info.get("restricted_start", False)
+                    extra_steps_remaining = -1
+                    restricted_steps_count = 0
+                    if episode_based:
+                        current_policy_idx = random.choices(range(num_policies), weights=proportions)[0]
+                        current_policy = policies[current_policy_idx]
+                        policy_episode_counts[current_policy_idx] += 1
+            else:
+                obs = next_obs
+        
+        df = pd.DataFrame(data)
+        
+        if verbose:
+            print(f"\n{'='*60}")
+            print(f"  MIXED TERMINAL-AWARE (RESTRICTED) DATASET COLLECTION")
+            print(f"{'='*60}")
+            print(f"Total transitions: {len(df)}")
+            print(f"Total episodes: {episode}")
+            print(f"Extra steps: {extra_steps}")
+            print(f"Max restricted start steps: {restricted_max_steps}")
+            print(f"\nPolicy Distribution (excluding forced restricted random steps):")
+            for i, (count, prop) in enumerate(zip(policy_step_counts, proportions)):
+                actual_prop = count / len(df) if len(df) > 0 else 0
+                print(f"  Policy {i}: {count:5d} steps ({actual_prop:5.1%}) | Target: {prop:5.1%}", end="")
+                if episode_based:
+                    print(f" | Episodes: {policy_episode_counts[i]}")
+                else:
+                    print()
+            print(f"{'='*60}\n")
+
+        if save_path is not None:
+            os.makedirs(os.path.dirname(save_path), exist_ok=True)
+            df[["state", "action", "reward", "next_state", "policy_id"]].to_csv(save_path, index=False)
+            if verbose:
+                print(f"✅ Mixed restricted dataset saved to: {save_path}")
+        
+        return df
+
+    def collect_uniform_dataset(self, samples_per_pair=1, save_path=None, verbose=True):
+        """
+        Collect exactly 'samples_per_pair' for every possible (state, action) pair
+        in the environment. This performs a complete sweep of the MDP state-action
+        space, ignoring trajectory-related constraints like 'max_steps', 'restricted_states',
+        or 'reset_probs'.
+
+        Parameters
+        ----------
+        samples_per_pair : int
+            Number of transitions to record for each (s, a) pair.
+        save_path : str or None
+            Path to save the CSV.
+        verbose : bool
+            Whether to print progress.
+
+        Returns
+        -------
+        df : pd.DataFrame
+        """
+        # Reset seed for reproducibility
+        if self.seed is not None:
+            random.seed(self.seed)
+            np.random.seed(self.seed)
+            torch.manual_seed(self.seed)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed(self.seed)
+
+        env = self.env
+        
+        # Determine valid states and actions for a uniform sweep
+        if hasattr(env, "N") and hasattr(env, "A"):
+            # LinearMDPEnv path: Include ALL states
+            states_to_sample = range(env.N)
+            actions_to_sample = range(env.A)
+        elif hasattr(env, "observation_space") and isinstance(env.observation_space, gym.spaces.Discrete) \
+             and hasattr(env, "action_space") and isinstance(env.action_space, gym.spaces.Discrete):
+            # General Discrete Env path
+            states_to_sample = range(env.observation_space.n)
+            actions_to_sample = range(env.action_space.n)
+        else:
+            raise ValueError("collect_uniform_dataset requires a discrete environment (like LinearMDPEnv).")
+
+
+        data = {
+            "episode": [],
+            "step": [],
+            "state": [],
+            "action": [],
+            "reward": [],
+            "next_state": [],
+        }
+
+        if verbose:
+            total = len(states_to_sample) * len(actions_to_sample) * samples_per_pair
+            print(f"Collecting UNIFORM dataset: {len(states_to_sample)} states, {len(actions_to_sample)} actions, {samples_per_pair} samples/pair.")
+            print(f"Total transitions: {total}")
+
+        idx = 0
+        for s in states_to_sample:
+            for a in actions_to_sample:
+                for _ in range(samples_per_pair):
+                    # Manual state injection (requires env to support .state assignment)
+                    try:
+                        env.state = s
+                    except AttributeError:
+                        raise AttributeError("Environment does not support manual state assignment via .state.")
+                    
+                    if hasattr(env, "step_count"):
+                        env.step_count = 0
+                    
+                    next_obs, reward, terminated, truncated, _ = env.step(a)
+                    
+                    # Consistent rewards for terminal self-loops
+                    if terminated and s in getattr(env, "terminal_states", []):
+                        reward = self._get_reward_from_env(s, a, reward)
+
+                    data["episode"].append(idx)
+                    data["step"].append(0)
+                    data["state"].append(s)
+                    data["action"].append(a)
+                    data["reward"].append(reward)
+                    data["next_state"].append(next_obs)
+                    idx += 1
+
+        df = pd.DataFrame(data)
+
+        if save_path is not None:
+            os.makedirs(os.path.dirname(save_path), exist_ok=True)
+            df[["state", "action", "reward", "next_state"]].to_csv(save_path, index=False)
+            if verbose:
+                print(f"✅ Uniform dataset saved to: {save_path}")
+
+        return df
+
+    def add_manual_samples(self, states, samples_per_pair=10, save_path=None, verbose=True):
+        """
+        Manually add 'samples_per_pair' for every possible action in each provided state.
+        This is useful for ensuring specific states (e.g. near goals or difficult areas) 
+        are sufficiently represented in the dataset.
+        
+        Parameters
+        ----------
+        states : list of int
+            List of state indices to sample.
+        samples_per_pair : int
+            Number of transitions to record for each (state, action) pair.
+        save_path : str or None
+            If provided, the CSV path to update or save to.
+        verbose : bool
+            Whether to print progress.
+            
+        Returns
+        -------
+        df : pd.DataFrame
+            The newly collected manual transitions.
+        """
+        # Reset seed for reproducibility
+        if self.seed is not None:
+            random.seed(self.seed)
+            np.random.seed(self.seed)
+            torch.manual_seed(self.seed)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed(self.seed)
+
+        env = self.env
+        
+        # Determine valid actions
+        if hasattr(env, "A"):
+            actions_to_sample = range(env.A)
+        elif hasattr(env, "action_space") and isinstance(env.action_space, gym.spaces.Discrete):
+            actions_to_sample = range(env.action_space.n)
+        else:
+            raise ValueError("add_manual_samples requires a discrete environment.")
+
+        data = {
+            "episode": [],
+            "step": [],
+            "state": [],
+            "action": [],
+            "reward": [],
+            "next_state": [],
+        }
+
+        if verbose:
+            total = len(states) * len(actions_to_sample) * samples_per_pair
+            print(f"Adding MANUAL samples: {len(states)} states, {len(actions_to_sample)} actions, {samples_per_pair} samples/pair.")
+            print(f"Total transitions to add: {total}")
+
+        idx = 0
+        for s in states:
+            # Ensure s is int
+            s_val = int(s)
+            for a in actions_to_sample:
+                for _ in range(samples_per_pair):
+                    # Manual state injection (requires env to support .state assignment)
+                    try:
+                        env.state = s_val
+                    except AttributeError:
+                        raise AttributeError("Environment does not support manual state assignment via .state.")
+                    
+                    if hasattr(env, "step_count"):
+                        env.step_count = 0
+                    
+                    next_obs, reward, terminated, truncated, _ = env.step(a)
+                    
+                    # Consistent rewards for terminal self-loops
+                    if terminated and s_val in getattr(env, "terminal_states", []):
+                        reward = self._get_reward_from_env(s_val, a, reward)
+
+                    data["episode"].append(-1) # Mark as manual/augmented
+                    data["step"].append(0)
+                    data["state"].append(s_val)
+                    data["action"].append(a)
+                    data["reward"].append(reward)
+                    data["next_state"].append(next_obs)
+                    idx += 1
+
+        df_manual = pd.DataFrame(data)
+
+        if save_path is not None:
+            # If file exists, append; otherwise create
+            if os.path.exists(save_path):
+                # We only need the columns that matched the original dataset
+                cols = ["state", "action", "reward", "next_state"]
+                df_existing = pd.read_csv(save_path)
+                df_combined = pd.concat([df_existing, df_manual[cols]], ignore_index=True)
+                df_combined.to_csv(save_path, index=False)
+                if verbose:
+                    print(f"✅ Manual samples appended to: {save_path}")
+                    print(f"   Total transitions now: {len(df_combined)}")
+            else:
+                os.makedirs(os.path.dirname(save_path), exist_ok=True)
+                df_manual.to_csv(save_path, index=False)
+                if verbose:
+                    print(f"✅ Manual samples saved to: {save_path}")
+
+        return df_manual
 
     def _get_reward_from_env(self, state, action, fallback):
         """

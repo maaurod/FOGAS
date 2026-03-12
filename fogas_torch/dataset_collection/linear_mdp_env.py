@@ -68,6 +68,12 @@ class LinearMDPEnv(gym.Env):
         # List of states that are valid for a random restart
         self.valid_start_states = [int(s) for s in range(self.N) if int(s) not in self.forbidden_resets]
         
+        # States that are originally restricted but could be forced as custom restricted starts
+        if restricted_states is not None:
+            self.restricted_states_list = [int(s) for s in restricted_states if s not in self.terminal_states]
+        else:
+            self.restricted_states_list = []
+        
         # Custom initial states if provided by the user
         self.custom_start_states = initial_states if initial_states is not None else []
         
@@ -132,8 +138,9 @@ class LinearMDPEnv(gym.Env):
                 torch.mps.manual_seed(seed)
 
         # Determine starting state based on reset_probs
+        is_restricted_start = False
         if self.reset_probs is not None:
-            # We expect reset_probs to be a dict e.g. {'x0': 0.2, 'random': 0.8}
+            # We expect reset_probs to be a dict e.g. {'x0': 0.2, 'random': 0.8, 'restricted': 0.0}
             modes = list(self.reset_probs.keys())
             weights = list(self.reset_probs.values())
             
@@ -143,13 +150,60 @@ class LinearMDPEnv(gym.Env):
                 self.state = random.choice(self.valid_start_states)
             elif mode == 'custom' and self.custom_start_states:
                 self.state = random.choice(self.custom_start_states)
+            elif mode == 'restricted' and self.restricted_states_list:
+                self.state = random.choice(self.restricted_states_list)
+                is_restricted_start = True
+            elif mode == 'occupancy_uniform' and hasattr(self.mdp, 'state_mu_star'):
+                # Sample UNIFORMLY from states that have non-zero occupancy, masking terminal/restricted
+                probs = self.mdp.state_mu_star
+                if torch.is_tensor(probs):
+                    probs = probs.detach().cpu().numpy()
+                
+                # Create mask for states with non-negligible occupancy
+                mask = (probs > 1e-8)
+                
+                # Zero out forbidden resets (walls, goals, etc.)
+                if hasattr(self, 'forbidden_resets'):
+                    for s in self.forbidden_resets:
+                        if s < len(mask):
+                            mask[s] = False
+                
+                touched_states = np.where(mask)[0]
+                if len(touched_states) > 0:
+                    self.state = random.choice(touched_states)
+                else:
+                    # Fallback to random valid state if no occupancy touches valid states
+                    self.state = random.choice(self.valid_start_states) if self.valid_start_states else self.mdp.x0
+
+            elif mode == 'occupancy' and hasattr(self.mdp, 'state_mu_star'):
+                # Sample based on optimal state occupancy measure, masking terminal/restricted states
+                probs = self.mdp.state_mu_star
+                if torch.is_tensor(probs):
+                    probs = probs.detach().cpu().numpy()
+                
+                probs = probs.astype(np.float64).copy()
+                
+                # Zero out probabilities for states we shouldn't reset to (walls, goals, pits)
+                # This makes the sampling focus on transient 'interesting' states
+                if hasattr(self, 'forbidden_resets'):
+                    for s in self.forbidden_resets:
+                        if s < len(probs):
+                            probs[s] = 0.0
+                
+                if probs.sum() > 1e-12:
+                    probs = probs / probs.sum()
+                    self.state = np.random.choice(len(probs), p=probs)
+                else:
+                    # Fallback to random valid state if occupancy is zero/empty
+                    self.state = random.choice(self.valid_start_states) if self.valid_start_states else self.mdp.x0
             else:
                 self.state = self.mdp.x0
         else:
             # Default behavior: always start at x0
             self.state = self.x0
             
-        return int(self.state), {}
+        info = {"restricted_start": is_restricted_start}
+        return int(self.state), info
 
     # ------------------------------------------------
     # Step

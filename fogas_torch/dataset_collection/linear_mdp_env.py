@@ -176,25 +176,25 @@ class LinearMDPEnv(gym.Env):
                     self.state = random.choice(self.valid_start_states) if self.valid_start_states else self.mdp.x0
 
             elif mode == 'occupancy' and hasattr(self.mdp, 'state_mu_star'):
-                # Sample based on optimal state occupancy measure, masking terminal/restricted states
                 probs = self.mdp.state_mu_star
                 if torch.is_tensor(probs):
                     probs = probs.detach().cpu().numpy()
-                
+
                 probs = probs.astype(np.float64).copy()
-                
-                # Zero out probabilities for states we shouldn't reset to (walls, goals, pits)
-                # This makes the sampling focus on transient 'interesting' states
+
+                # Remove small negative numerical artifacts from the occupancy solve
+                probs = np.maximum(probs, 0.0)
+
                 if hasattr(self, 'forbidden_resets'):
                     for s in self.forbidden_resets:
                         if s < len(probs):
                             probs[s] = 0.0
-                
-                if probs.sum() > 1e-12:
-                    probs = probs / probs.sum()
+
+                total = probs.sum()
+                if total > 1e-12:
+                    probs = probs / total
                     self.state = np.random.choice(len(probs), p=probs)
                 else:
-                    # Fallback to random valid state if occupancy is zero/empty
                     self.state = random.choice(self.valid_start_states) if self.valid_start_states else self.mdp.x0
             else:
                 self.state = self.mdp.x0

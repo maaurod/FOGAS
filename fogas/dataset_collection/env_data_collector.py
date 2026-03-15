@@ -142,6 +142,21 @@ class EnvDataCollector:
         r_c, c_c = r_f // factor, c_f // factor
         return int(r_c * coarse_size + c_c)
 
+    @staticmethod
+    def _encode_macro_action_pair(a1, a2, num_fine_actions=4):
+        """
+        Encode an ordered pair of fine actions into a single macro action index.
+        """
+        return int(num_fine_actions * int(a1) + int(a2))
+
+    @staticmethod
+    def _decode_macro_action_pair(a_macro, num_fine_actions=4):
+        """
+        Decode a macro action index into an ordered pair of fine actions.
+        """
+        a_macro = int(a_macro)
+        return a_macro // num_fine_actions, a_macro % num_fine_actions
+
     # --------------------------------------------
     # Dataset collection
     # --------------------------------------------
@@ -468,6 +483,125 @@ class EnvDataCollector:
             print(f"Collected {len(df)} macro transitions.")
 
         return df
+
+    def collect_macro_dataset_action_pairs(
+        self,
+        policy="random",
+        n_macro_steps=1000,
+        gamma=0.99,
+        fine_size=20,
+        coarse_size=10,
+        factor=2,
+        save_path=None,
+        verbose=True,
+    ):
+        """
+        Collect a macro dataset where one macro action is an ordered pair of fine actions.
+
+        Each macro transition stores:
+            (coarse(s_t), encode(a_t, a_{t+1}), r_t + gamma * r_{t+1}, coarse(s_{t+2}))
+        """
+        if self.seed is not None:
+            np.random.seed(self.seed)
+
+        env = self.env
+        policy = self._make_policy(policy)
+
+        data = {
+            "episode": [],
+            "macro_step": [],
+            "fine_state": [],
+            "state": [],
+            "action": [],
+            "reward": [],
+            "next_fine_state": [],
+            "next_state": [],
+            "a1": [],
+            "a2": [],
+        }
+
+        episode, macro_step = 0, 0
+        obs, _ = env.reset()
+        collected = 0
+
+        while collected < n_macro_steps:
+            fine_state = int(obs)
+            coarse_state = type(self)._fine_to_coarse_state(
+                fine_state,
+                fine_size=fine_size,
+                coarse_size=coarse_size,
+                factor=factor,
+            )
+
+            a1 = int(policy.sample(obs))
+            obs_1, reward_1, terminated_1, truncated_1, _ = env.step(a1)
+
+            a2 = int(policy.sample(obs_1))
+            obs_2, reward_2, terminated_2, truncated_2, _ = env.step(a2)
+
+            if terminated_1 and not truncated_1:
+                reward_2 = self._get_reward_from_env(obs_1, a2, reward_2)
+
+            macro_action = type(self)._encode_macro_action_pair(a1, a2, env.action_space.n)
+            next_fine_state = int(obs_2)
+            next_coarse_state = type(self)._fine_to_coarse_state(
+                next_fine_state,
+                fine_size=fine_size,
+                coarse_size=coarse_size,
+                factor=factor,
+            )
+            macro_reward = float(reward_1) + float(gamma) * float(reward_2)
+
+            data["episode"].append(episode)
+            data["macro_step"].append(macro_step)
+            data["fine_state"].append(fine_state)
+            data["state"].append(coarse_state)
+            data["action"].append(macro_action)
+            data["reward"].append(macro_reward)
+            data["next_fine_state"].append(next_fine_state)
+            data["next_state"].append(next_coarse_state)
+            data["a1"].append(a1)
+            data["a2"].append(a2)
+
+            collected += 1
+            macro_step += 1
+
+            if terminated_1 or truncated_1 or terminated_2 or truncated_2:
+                episode += 1
+                macro_step = 0
+                obs, _ = env.reset()
+            else:
+                obs = obs_2
+
+        df = pd.DataFrame(data)
+
+        if save_path is not None:
+            os.makedirs(os.path.dirname(save_path), exist_ok=True)
+            df[["state", "action", "reward", "next_state"]].to_csv(save_path, index=False)
+
+            if verbose:
+                print(f"✅ Macro action-pair dataset saved to: {save_path}")
+                print(f"   Total macro transitions: {len(df)}")
+
+        elif verbose:
+            print(f"Collected {len(df)} macro transitions.")
+
+        return df
+
+    def _get_reward_from_env(self, state, action, fallback):
+        """
+        Internal helper to recover original reward from env model for terminal self-loops.
+        """
+        env = self.env
+        if not (hasattr(env, "states") and hasattr(env, "A") and hasattr(env, "r")):
+            return fallback
+
+        try:
+            state_idx = int(np.where(env.states == int(state))[0][0])
+            row_idx = state_idx * int(env.A) + int(action)
+            return float(env.r[row_idx])
+        except Exception:
+            return fallback
 
     def _get_reward_from_env(self, state, action, fallback):
         """

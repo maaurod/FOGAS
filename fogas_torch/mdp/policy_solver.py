@@ -238,3 +238,48 @@ class PolicySolver(LinearMDP):
         mu_star = self.mu_star
         return self.Phi.T @ mu_star
 
+    def policy_from_optimal_q(self, mode="set", temperature=0.05, tie_eps=1e-10):
+        """
+        Build a policy from the optimal Q-function self.q_star.
+
+        Args:
+            mode:
+                - "set": uniform over the optimal / epsilon-optimal action set
+                - "softmax": softmax over self.q_star with temperature
+                - "masked_softmax": softmax over only the epsilon-optimal action set
+            temperature: softmax temperature (small tau => sharper policy)
+            tie_eps: tolerance for defining the optimal set
+
+        Returns:
+            pi: tensor of shape (N, A), a stochastic policy derived from q*
+        """
+        q = self.q_star
+        device = q.device
+        dtype = q.dtype
+
+        if mode == "set":
+            qmax = q.max(dim=1, keepdim=True).values
+            mask = q >= (qmax - tie_eps)
+
+            pi = mask.to(dtype)
+            pi /= pi.sum(dim=1, keepdim=True)
+            return pi
+
+        elif mode == "softmax":
+            logits = (q - q.max(dim=1, keepdim=True).values) / temperature
+            return torch.softmax(logits, dim=1)
+
+        elif mode == "masked_softmax":
+            qmax = q.max(dim=1, keepdim=True).values
+            mask = q >= (qmax - tie_eps)
+
+            logits = (q - qmax) / temperature
+            logits = torch.where(
+                mask,
+                logits,
+                torch.full_like(logits, -torch.inf)
+            )
+            return torch.softmax(logits, dim=1)
+
+        else:
+            raise ValueError("mode must be 'set', 'softmax', or 'masked_softmax'")

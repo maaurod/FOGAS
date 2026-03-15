@@ -15,10 +15,10 @@ echo "🚫 Excluding node: apl (slower L4 GPU)"
 echo ""
 
 # Start interactive session excluding the slower 'apl' node
+# --exclude=apl \ after gres
 srun \
      --time=$TIME \
      --gres=gpu:$GPU_COUNT \
-     --exclude=apl \
      --mem=32G \
      --cpus-per-task=8 \
      --pty bash -c '

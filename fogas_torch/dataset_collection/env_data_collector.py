@@ -180,6 +180,15 @@ class EnvDataCollector:
             "Policy must be a string, tensor/array (policy matrix), or an object with a .sample() method."
         )
 
+    @staticmethod
+    def _fine_to_coarse_state(x_fine, fine_size=20, coarse_size=10, factor=2):
+        """
+        Map a fine-grid state index to its coarse-grid cell.
+        """
+        r_f, c_f = divmod(int(x_fine), fine_size)
+        r_c, c_c = r_f // factor, c_f // factor
+        return int(r_c * coarse_size + c_c)
+
     # --------------------------------------------
     # Dataset collection
     # --------------------------------------------
@@ -359,6 +368,112 @@ class EnvDataCollector:
             if verbose:
                 print(f"✅ Terminal-aware dataset saved to: {save_path}")
                 print(f"   Total transitions: {len(df)}")
+
+        return df
+
+    def collect_macro_dataset_repeated_actions(
+        self,
+        policy="random",
+        n_macro_steps=1000,
+        gamma=0.99,
+        fine_size=20,
+        coarse_size=10,
+        factor=2,
+        save_path=None,
+        verbose=True,
+    ):
+        """
+        Collect a macro dataset by repeating the same fine action twice.
+
+        Each macro transition stores:
+            (coarse(s_t), a_t, r_t + gamma * r_{t+1}, coarse(s_{t+2}))
+
+        The second fine step is always executed. This assumes terminal states are
+        absorbing, so stepping again after reaching one is valid.
+        """
+        if self.seed is not None:
+            random.seed(self.seed)
+            np.random.seed(self.seed)
+            torch.manual_seed(self.seed)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed(self.seed)
+            if torch.backends.mps.is_available():
+                torch.mps.manual_seed(self.seed)
+
+        env = self.env
+        policy = self._make_policy(policy)
+
+        data = {
+            "episode": [],
+            "macro_step": [],
+            "fine_state": [],
+            "state": [],
+            "action": [],
+            "reward": [],
+            "next_fine_state": [],
+            "next_state": [],
+            "macro_complete": [],
+        }
+
+        episode, macro_step = 0, 0
+        obs, _ = env.reset()
+        collected = 0
+
+        while collected < n_macro_steps:
+            fine_state = int(obs)
+            coarse_state = self._fine_to_coarse_state(
+                fine_state,
+                fine_size=fine_size,
+                coarse_size=coarse_size,
+                factor=factor,
+            )
+
+            action = int(policy.sample(obs))
+
+            obs_1, reward_1, terminated_1, truncated_1, _ = env.step(action)
+            obs_2, reward_2, terminated_2, truncated_2, _ = env.step(action)
+
+            next_fine_state = int(obs_2)
+            next_coarse_state = self._fine_to_coarse_state(
+                next_fine_state,
+                fine_size=fine_size,
+                coarse_size=coarse_size,
+                factor=factor,
+            )
+            macro_reward = float(reward_1) + float(gamma) * float(reward_2)
+
+            data["episode"].append(episode)
+            data["macro_step"].append(macro_step)
+            data["fine_state"].append(fine_state)
+            data["state"].append(coarse_state)
+            data["action"].append(action)
+            data["reward"].append(macro_reward)
+            data["next_fine_state"].append(next_fine_state)
+            data["next_state"].append(next_coarse_state)
+            data["macro_complete"].append(True)
+
+            collected += 1
+            macro_step += 1
+
+            if terminated_1 or truncated_1 or terminated_2 or truncated_2:
+                episode += 1
+                macro_step = 0
+                obs, _ = env.reset()
+            else:
+                obs = obs_2
+
+        df = pd.DataFrame(data)
+
+        if save_path is not None:
+            os.makedirs(os.path.dirname(save_path), exist_ok=True)
+            df[["state", "action", "reward", "next_state"]].to_csv(save_path, index=False)
+
+            if verbose:
+                print(f"✅ Macro dataset saved to: {save_path}")
+                print(f"   Total macro transitions: {len(df)}")
+
+        elif verbose:
+            print(f"Collected {len(df)} macro transitions.")
 
         return df
 

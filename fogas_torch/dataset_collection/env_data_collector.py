@@ -421,7 +421,7 @@ class EnvDataCollector:
 
         while collected < n_macro_steps:
             fine_state = int(obs)
-            coarse_state = self._fine_to_coarse_state(
+            coarse_state = type(self)._fine_to_coarse_state(
                 fine_state,
                 fine_size=fine_size,
                 coarse_size=coarse_size,
@@ -433,8 +433,11 @@ class EnvDataCollector:
             obs_1, reward_1, terminated_1, truncated_1, _ = env.step(action)
             obs_2, reward_2, terminated_2, truncated_2, _ = env.step(action)
 
+            if terminated_1 and not truncated_1:
+                reward_2 = self._get_reward_from_env(obs_1, action, reward_2)
+
             next_fine_state = int(obs_2)
-            next_coarse_state = self._fine_to_coarse_state(
+            next_coarse_state = type(self)._fine_to_coarse_state(
                 next_fine_state,
                 fine_size=fine_size,
                 coarse_size=coarse_size,

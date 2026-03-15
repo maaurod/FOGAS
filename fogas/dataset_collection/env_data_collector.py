@@ -410,7 +410,7 @@ class EnvDataCollector:
 
         while collected < n_macro_steps:
             fine_state = int(obs)
-            coarse_state = self._fine_to_coarse_state(
+            coarse_state = type(self)._fine_to_coarse_state(
                 fine_state,
                 fine_size=fine_size,
                 coarse_size=coarse_size,
@@ -422,8 +422,11 @@ class EnvDataCollector:
             obs_1, reward_1, terminated_1, truncated_1, _ = env.step(action)
             obs_2, reward_2, terminated_2, truncated_2, _ = env.step(action)
 
+            if terminated_1 and not truncated_1:
+                reward_2 = self._get_reward_from_env(obs_1, action, reward_2)
+
             next_fine_state = int(obs_2)
-            next_coarse_state = self._fine_to_coarse_state(
+            next_coarse_state = type(self)._fine_to_coarse_state(
                 next_fine_state,
                 fine_size=fine_size,
                 coarse_size=coarse_size,
@@ -465,3 +468,18 @@ class EnvDataCollector:
             print(f"Collected {len(df)} macro transitions.")
 
         return df
+
+    def _get_reward_from_env(self, state, action, fallback):
+        """
+        Internal helper to recover original reward from env model for terminal self-loops.
+        """
+        env = self.env
+        if not (hasattr(env, "states") and hasattr(env, "A") and hasattr(env, "r")):
+            return fallback
+
+        try:
+            state_idx = int(np.where(env.states == int(state))[0][0])
+            row_idx = state_idx * int(env.A) + int(action)
+            return float(env.r[row_idx])
+        except Exception:
+            return fallback

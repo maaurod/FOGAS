@@ -20,6 +20,7 @@ srun \
      --time=$TIME \
      --gres=gpu:$GPU_COUNT \
      --mem=32G \
+     --exclude=apl \
      --cpus-per-task=8 \
      --pty bash -c '
      cd /shared/home/mauro.diaz/work/FOGAS && \

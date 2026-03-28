@@ -548,7 +548,8 @@ class FOGASEvaluator:
 
     def print_optimal_path(self, use_optimal=False, num_trajectories=1, 
                           max_steps=50, seed=42, show_probabilities=False,
-                          show_probabilities_first_n=5, goal_state=None):
+                          show_probabilities_first_n=5, goal_state=None,
+                          show_value_info=True):
         """
         Display optimal path(s) from initial state in a pretty format.
         """
@@ -628,19 +629,19 @@ class FOGASEvaluator:
             print(f"  Discounted Return: {discounted_return:.6f}")
             print(f"  Final State: {mdp.states[final_state]}")
             
-        print(f"\n{'-'*70}")
-        
-        v_pi, _ = mdp.evaluate_policy(pi)
-        v_x0 = v_pi[mdp.x0]
-        if isinstance(v_x0, torch.Tensor):
-            v_x0 = v_x0.item()
-        print(f"  Expected Return (from V): {v_x0:.6f}")
-        
-        v_star = mdp.v_star[mdp.x0]
-        if isinstance(v_star, torch.Tensor):
-            v_star = v_star.item()
-        print(f"  Optimal Return (π*): {v_star:.6f}")
-        
+        if show_value_info:
+            print(f"\n{'-'*70}")
+            v_pi, _ = mdp.evaluate_policy(pi)
+            v_x0 = v_pi[mdp.x0]
+            if isinstance(v_x0, torch.Tensor):
+                v_x0 = v_x0.item()
+            print(f"  Expected Return (from V): {v_x0:.6f}")
+
+            v_star = mdp.v_star[mdp.x0]
+            if isinstance(v_star, torch.Tensor):
+                v_star = v_star.item()
+            print(f"  Optimal Return (π*): {v_star:.6f}")
+
         print(f"\n{'='*70}\n")
 
     # =====================================================

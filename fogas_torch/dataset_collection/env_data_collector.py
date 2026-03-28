@@ -495,6 +495,138 @@ class EnvDataCollector:
 
         return df
 
+    def collect_macro_dataset_n_repeated_actions(
+        self,
+        policy="random",
+        n_macro_steps=1000,
+        gamma=0.99,
+        fine_size=20,
+        coarse_size=10,
+        factor=2,
+        n_repeats=None,
+        save_path=None,
+        verbose=True,
+    ):
+        """
+        Collect a macro dataset by repeating the same fine action `n_repeats` times.
+
+        `n_repeats` defaults to `factor` (the natural choice when each macro step
+        should cover exactly one coarse cell, e.g. factor=5 for 100→20).
+
+        Each macro transition stores:
+            (coarse(s_t), a_t, Σ_{k=0}^{n_repeats-1} gamma^k * r_{t+k}, coarse(s_{t+n_repeats}))
+
+        Terminal states are assumed absorbing: stepping from them keeps returning
+        the same state with the model-consistent reward.
+        """
+        if n_repeats is None:
+            n_repeats = factor
+
+        if self.seed is not None:
+            random.seed(self.seed)
+            np.random.seed(self.seed)
+            torch.manual_seed(self.seed)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed(self.seed)
+            if torch.backends.mps.is_available():
+                torch.mps.manual_seed(self.seed)
+
+        env = self.env
+        policy = self._make_policy(policy)
+
+        data = {
+            "episode": [],
+            "macro_step": [],
+            "fine_state": [],
+            "state": [],
+            "action": [],
+            "reward": [],
+            "next_fine_state": [],
+            "next_state": [],
+            "macro_complete": [],
+        }
+
+        episode, macro_step = 0, 0
+        obs, _ = env.reset()
+        collected = 0
+
+        while collected < n_macro_steps:
+            fine_state = int(obs)
+            coarse_state = type(self)._fine_to_coarse_state(
+                fine_state,
+                fine_size=fine_size,
+                coarse_size=coarse_size,
+                factor=factor,
+            )
+
+            action = int(policy.sample(obs))
+
+            macro_reward = 0.0
+            any_terminated = False
+            any_truncated = False
+            prev_terminated = False
+
+            for k in range(n_repeats):
+                next_obs, reward, terminated, truncated, _ = env.step(action)
+
+                # If already in absorbing state, get model-consistent reward
+                if prev_terminated:
+                    reward = self._get_reward_from_env(obs, action, reward)
+
+                macro_reward += (gamma ** k) * float(reward)
+
+                obs = next_obs
+                prev_terminated = terminated
+
+                if terminated:
+                    any_terminated = True
+                if truncated:
+                    any_truncated = True
+                    break  # truncation ends the episode immediately
+
+            next_fine_state = int(obs)
+            next_coarse_state = type(self)._fine_to_coarse_state(
+                next_fine_state,
+                fine_size=fine_size,
+                coarse_size=coarse_size,
+                factor=factor,
+            )
+
+            data["episode"].append(episode)
+            data["macro_step"].append(macro_step)
+            data["fine_state"].append(fine_state)
+            data["state"].append(coarse_state)
+            data["action"].append(action)
+            data["reward"].append(macro_reward)
+            data["next_fine_state"].append(next_fine_state)
+            data["next_state"].append(next_coarse_state)
+            data["macro_complete"].append(not any_truncated)
+
+            collected += 1
+            macro_step += 1
+
+            if any_terminated or any_truncated:
+                episode += 1
+                macro_step = 0
+                obs, _ = env.reset()
+
+        df = pd.DataFrame(data)
+
+        if save_path is not None:
+            os.makedirs(os.path.dirname(save_path), exist_ok=True)
+            df[["state", "action", "reward", "next_state"]].to_csv(save_path, index=False)
+
+            if verbose:
+                print(f"✅ Macro dataset ({n_repeats}-step repeat) saved to: {save_path}")
+                print(f"   Total macro transitions : {len(df)}")
+                print(f"   Episodes                : {episode}")
+                print(f"   gamma_macro             : {gamma}^{1 / n_repeats} = {gamma**(1 / n_repeats):.6f}")
+
+        elif verbose:
+            print(f"Collected {len(df)} macro transitions ({n_repeats} fine steps each).")
+
+        return df
+
     def collect_macro_dataset_action_pairs(
         self,
         policy="random",

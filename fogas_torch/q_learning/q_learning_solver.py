@@ -118,9 +118,7 @@ class QLearningSolver:
 
         epsilon = float(epsilon_start)
         if epsilon_decay_rate is None:
-            epsilon_decay_rate = (
-                (epsilon_start - epsilon_end) / episodes if episodes > 0 else 0.0
-            )
+            epsilon_decay_rate = 2.0 / episodes if episodes > 0 else 0.0
 
         for ep in range(episodes):
             obs, _ = env.reset(seed=None if run_seed is None else run_seed + ep)

@@ -58,6 +58,40 @@ mdp = PolicySolver(
 )
 ```
 
+#### Option C: Discretized Continuous Problem
+```python
+from fogas_torch import (
+    BoxStateDiscretizer,
+    DiscreteActionDiscretizer,
+    DiscretizedLinearMDP,
+)
+
+state_disc = BoxStateDiscretizer(
+    low=[-1.2, -0.07],
+    high=[0.6, 0.07],
+    bins=[20, 20],
+    terminal_obs_predicate=lambda obs: obs[0] >= 0.5 and obs[1] >= 0.0,
+)
+
+action_disc = DiscreteActionDiscretizer(
+    action_values=[0, 1, 2],
+    action_labels={0: "left", 1: "coast", 2: "right"},
+)
+
+def mountaincar_transition(obs, env_action):
+    # user-defined model step on representative continuous observations
+    next_obs, reward, done = ...
+    return next_obs, reward, done
+
+mdp = DiscretizedLinearMDP(
+    state_discretizer=state_disc,
+    action_discretizer=action_disc,
+    transition_fn=mountaincar_transition,
+    gamma=0.9,
+    initial_obs=[-0.5, 0.0],
+)
+```
+
 ### 2. **Dataset Collection** (Optional - if you need to generate data)
 
 ```python

@@ -7,6 +7,9 @@ from fogas import (
     # 1. MDP Definition
     LinearMDP,              # Basic linear MDP
     PolicySolver,           # MDP with policy evaluation
+    DiscretizedLinearMDP,   # Continuous -> abstract MDP adapter
+    BoxStateDiscretizer,    # Uniform state discretization
+    DiscreteActionDiscretizer, # Finite action wrapper
     
     # 2. Data Collection (Optional)
     LinearMDPEnv,           # Gymnasium environment

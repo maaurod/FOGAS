@@ -248,6 +248,7 @@ class DatasetAnalyzer:
         mdp,
         beta: float = 0.0,
         policy: Optional[np.ndarray] = None,
+        pi_star: Optional[np.ndarray] = None,
         use_optimal_policy: bool = True,
         return_details: bool = False,
         verbose: bool = False,
@@ -267,9 +268,14 @@ class DatasetAnalyzer:
         beta : float
             Ridge term for empirical covariance.
         policy : ndarray, optional
-            Policy matrix with shape (N, A). If None, uses mdp.pi_star.
+            Policy matrix with shape (N, A).
+        pi_star : ndarray, optional
+            Alias for passing an explicit target policy matrix with shape (N, A).
+            This is useful when no PolicySolver object is available and you want
+            to evaluate coverage against an externally computed policy.
         use_optimal_policy : bool
-            Whether to default to mdp.pi_star when policy is None.
+            Whether to default to mdp.pi_star when neither policy nor pi_star
+            is provided.
         return_details : bool
             If True, returns a dict with intermediate values.
         verbose : bool
@@ -283,12 +289,21 @@ class DatasetAnalyzer:
         if len(self.df) == 0:
             raise ValueError("Dataset is empty; cannot compute coverage ratio.")
 
-        if policy is None:
+        provided_policy = policy if policy is not None else pi_star
+
+        if policy is not None and pi_star is not None:
+            raise ValueError("Provide only one of policy or pi_star, not both.")
+
+        if provided_policy is None:
             if not use_optimal_policy:
-                raise ValueError("Provide policy or set use_optimal_policy=True.")
+                raise ValueError("Provide policy/pi_star or set use_optimal_policy=True.")
             if not hasattr(mdp, "pi_star"):
-                raise ValueError("mdp does not expose pi_star; provide policy explicitly.")
-            policy = mdp.pi_star
+                raise ValueError("mdp does not expose pi_star; provide policy or pi_star explicitly.")
+            policy_np = self._to_numpy(mdp.pi_star).astype(float)
+            policy_src = "mdp.pi_star"
+        else:
+            policy_np = self._to_numpy(provided_policy).astype(float)
+            policy_src = "provided"
 
         # Map dataset states/actions to MDP indices (robust to non-0..N-1 labels)
         states_arr = self._to_numpy(mdp.states).astype(int)
@@ -305,7 +320,6 @@ class DatasetAnalyzer:
             raise ValueError("Dataset contains states/actions not present in the MDP.") from exc
 
         N, A, d = int(mdp.N), int(mdp.A), int(mdp.d)
-        policy_np = self._to_numpy(policy).astype(float)
         if policy_np.shape != (N, A):
             raise ValueError(f"Policy must have shape ({N}, {A}); got {policy_np.shape}.")
 
@@ -338,7 +352,6 @@ class DatasetAnalyzer:
         ratio = float(lambda_pi.T @ np.linalg.solve(Cov, lambda_pi))
 
         if verbose:
-            policy_src = "mdp.pi_star" if (policy is None and use_optimal_policy) else "provided"
             mu_sum = float(mu_pi.sum())
             mu_min = float(mu_pi.min())
             mu_max = float(mu_pi.max())

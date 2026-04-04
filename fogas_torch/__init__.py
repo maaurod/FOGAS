@@ -24,6 +24,10 @@ from .algorithm.fogas_oraclesolver import FOGASOracleSolver
 from .dataset_collection.linear_mdp_env import LinearMDPEnv
 from .dataset_collection.env_data_collector import EnvDataCollector
 from .dataset_collection.continuous_env_data_collector import ContinuousEnvDataCollector
+from .dataset_collection.abstract_env_data_collector import (
+    build_uniform_reset_distribution_from_policy_trajectory,
+    collect_change_of_state_dataset_from_env_policy,
+)
 
 __all__ = [
     "LinearMDP",
@@ -42,6 +46,8 @@ __all__ = [
     "LinearMDPEnv",
     "EnvDataCollector",
     "ContinuousEnvDataCollector",
+    "build_uniform_reset_distribution_from_policy_trajectory",
+    "collect_change_of_state_dataset_from_env_policy",
     "FOGASEvaluator",
     "FOGASHyperOptimizer",
     "FOGASOracleSolver",

@@ -283,11 +283,18 @@ class FeatureOnlyAbstractMDP:
                     f"omega must have shape ({self.d},), got {self.omega.shape}"
                 )
 
+        Phi = []
+        for s in self.states:
+            for a in self.actions:
+                Phi.append(self.phi(s.item(), a.item()).to(dtype=torch.float64))
+        self.Phi = torch.vstack(Phi)
+
     def to(self, device):
         self.states = self.states.to(device)
         self.actions = self.actions.to(device)
         if self.omega is not None:
             self.omega = self.omega.to(device)
+        self.Phi = self.Phi.to(device)
         return self
 
     def print_policy(self, pi):

@@ -10,6 +10,7 @@ from .mdp.abstract_mdp import (
     DiscretizedLinearMDP,
     TabularFeatureMap,
 )
+from .q_learning.q_learning_solver import QLearningResult, QLearningSolver, run_q_learning
 
 # --- FOGAS algorithm ---
 from .algorithm.fogas_solver import FOGASSolver
@@ -32,6 +33,9 @@ __all__ = [
     "BoxActionDiscretizer",
     "TabularFeatureMap",
     "DiscretizedLinearMDP",
+    "QLearningResult",
+    "QLearningSolver",
+    "run_q_learning",
     "FOGASSolver",
     "FOGASDataset",
     "FOGASParameters",

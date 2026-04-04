@@ -8,8 +8,6 @@ import gymnasium as gym
 import numpy as np
 import torch
 
-from ..dataset_collection.linear_mdp_env import LinearMDPEnv
-
 
 @dataclass
 class QLearningResult:
@@ -21,11 +19,8 @@ class QLearningResult:
 
 class QLearningSolver:
     """
-    Tabular Q-learning for finite state-action problems.
-
-    Supports two common setups:
-    - finite MDPs already represented in the library (PolicySolver / LinearMDP)
-    - Gymnasium environments with a user-provided abstraction obs -> state_id
+    Tabular Q-learning for Gymnasium environments with a user-provided
+    abstraction obs -> state_id.
     """
 
     def __init__(
@@ -54,39 +49,6 @@ class QLearningSolver:
             raise ValueError("n_states must be positive")
         if self.n_actions <= 0:
             raise ValueError("n_actions must be positive")
-
-    @classmethod
-    def from_mdp(
-        cls,
-        mdp,
-        max_steps: int = 1000,
-        terminal_states=None,
-        initial_state_id: Optional[int] = None,
-        action_id_to_label: Optional[Callable[[int], str]] = None,
-        seed: Optional[int] = 42,
-    ) -> "QLearningSolver":
-        terminal_states = mdp.terminal_states if terminal_states is None else terminal_states
-        terminal_states = {int(s) for s in terminal_states}
-        terminal_state_id = next(iter(terminal_states)) if len(terminal_states) == 1 else None
-
-        def env_factory(render: bool = False):
-            return LinearMDPEnv(
-                mdp=mdp,
-                max_steps=max_steps,
-                terminal_states=terminal_states,
-            )
-
-        return cls(
-            env_factory=env_factory,
-            n_states=mdp.N,
-            n_actions=mdp.A,
-            obs_to_state_id=lambda obs: int(obs),
-            terminal_state_id=terminal_state_id,
-            initial_state_id=mdp.x0 if initial_state_id is None else initial_state_id,
-            action_id_to_label=action_id_to_label,
-            default_gamma=getattr(mdp, "gamma", None),
-            seed=seed,
-        )
 
     @classmethod
     def from_env_id(
@@ -274,7 +236,6 @@ def run_q_learning(
     render: bool = False,
     seed: Optional[int] = 44,
     *,
-    mdp=None,
     env_id: Optional[str] = None,
     env_kwargs: Optional[dict] = None,
     env_factory: Optional[Callable[..., gym.Env]] = None,
@@ -297,18 +258,10 @@ def run_q_learning(
         q_values, greedy_actions, rewards_per_episode
 
     Usage patterns:
-    - run_q_learning(mdp=my_policy_solver, ...)
     - run_q_learning(env_id=\"MountainCar-v0\", obs_to_state_id=..., n_states=..., ...)
     - run_q_learning(env_factory=my_env_factory, obs_to_state_id=..., n_states=..., ...)
     """
-    if mdp is not None:
-        solver = QLearningSolver.from_mdp(
-            mdp=mdp,
-            initial_state_id=initial_state_id,
-            action_id_to_label=action_id_to_label,
-            seed=seed,
-        )
-    elif env_factory is not None:
+    if env_factory is not None:
         if n_states is None or n_actions is None:
             raise ValueError("n_states and n_actions are required when env_factory is used")
         solver = QLearningSolver(
@@ -336,7 +289,7 @@ def run_q_learning(
             seed=seed,
         )
     else:
-        raise ValueError("Provide one of: mdp, env_id, or env_factory")
+        raise ValueError("Provide one of: env_id or env_factory")
 
     result = solver.run(
         episodes=episodes,

@@ -8,6 +8,7 @@ from .mdp.abstract_mdp import (
     BoxStateDiscretizer,
     DiscreteActionDiscretizer,
     DiscretizedLinearMDP,
+    FeatureOnlyAbstractMDP,
     TabularFeatureMap,
 )
 from .q_learning.q_learning_solver import QLearningResult, QLearningSolver, run_q_learning
@@ -37,6 +38,7 @@ __all__ = [
     "BoxActionDiscretizer",
     "TabularFeatureMap",
     "DiscretizedLinearMDP",
+    "FeatureOnlyAbstractMDP",
     "QLearningResult",
     "QLearningSolver",
     "run_q_learning",

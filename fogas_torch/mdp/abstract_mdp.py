@@ -230,6 +230,78 @@ class TabularFeatureMap:
         return feat
 
 
+class FeatureOnlyAbstractMDP:
+    """
+    Lightweight finite MDP container for offline feature-based methods such as
+    FOGAS that do not require an explicit reward or transition model.
+
+    Unlike LinearMDP, this class does not require:
+        - omega
+        - reward_fn
+        - P
+        - psi
+
+    It only stores the state/action space, feature map, discount, initial
+    state, and optionally reward weights if they are known.
+    """
+
+    def __init__(
+        self,
+        states,
+        actions,
+        phi,
+        gamma: float,
+        x0: int,
+        omega=None,
+        dtype=torch.float64,
+    ):
+        self.states = states.clone()
+        self.actions = actions.clone()
+        self.N = len(self.states)
+        self.A = len(self.actions)
+        self.phi = phi
+        self.gamma = float(gamma)
+        self.x0 = int(x0)
+        self.dtype = dtype
+
+        phi0 = self.phi(self.states[0].item(), self.actions[0].item())
+        self.d = len(phi0)
+
+        norms = []
+        for s in self.states:
+            for a in self.actions:
+                phi_val = self.phi(s.item(), a.item()).to(dtype=torch.float64)
+                norms.append(torch.linalg.norm(phi_val))
+        self.R = torch.max(torch.stack(norms))
+
+        if omega is None:
+            self.omega = None
+        else:
+            self.omega = torch.as_tensor(omega, dtype=torch.float64).reshape(-1).clone()
+            if self.omega.shape != (self.d,):
+                raise ValueError(
+                    f"omega must have shape ({self.d},), got {self.omega.shape}"
+                )
+
+    def to(self, device):
+        self.states = self.states.to(device)
+        self.actions = self.actions.to(device)
+        if self.omega is not None:
+            self.omega = self.omega.to(device)
+        return self
+
+    def print_policy(self, pi):
+        for i, s in enumerate(self.states):
+            best_a_idx = torch.argmax(pi[i]).item()
+            best_action = self.actions[best_a_idx]
+
+            print(f"  State {s}: ", end="")
+            for j, a in enumerate(self.actions):
+                print(f"π(a={a}|s={s}) = {pi[i, j].item():.2f}  ", end="")
+            print(f"--> best action: {best_action}")
+        print()
+
+
 class DiscretizedLinearMDP(LinearMDP):
     """
     Builds a finite abstract MDP from continuous states/actions and a

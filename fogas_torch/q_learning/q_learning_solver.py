@@ -110,6 +110,8 @@ class QLearningSolver:
             random.seed(run_seed)
             np.random.seed(run_seed)
             torch.manual_seed(run_seed)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(run_seed)
 
         env = self._make_env(render=render)
         rng = np.random.default_rng(run_seed)
@@ -192,8 +194,6 @@ class QLearningSolver:
         return int(self.obs_to_state_id(obs))
 
     def _sample_action(self, env, rng: np.random.Generator) -> int:
-        if hasattr(env, "action_space") and hasattr(env.action_space, "sample"):
-            return int(env.action_space.sample())
         return int(rng.integers(self.n_actions))
 
     def _print_summary(self, q_values: torch.Tensor, greedy_actions: torch.Tensor) -> None:

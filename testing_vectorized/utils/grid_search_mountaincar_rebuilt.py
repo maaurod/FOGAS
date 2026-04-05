@@ -29,7 +29,6 @@ from fogas_torch import (  # noqa: E402
     BoxStateDiscretizer,
     DiscreteActionDiscretizer,
     FeatureOnlyAbstractMDP,
-    TabularFeatureMap,
     build_uniform_reset_distribution_from_policy_trajectory,
     collect_change_of_state_dataset_from_env_policy,
     run_q_learning,
@@ -66,8 +65,8 @@ Q_LEARNING_CONFIG = {
 }
 
 DATASET_GRID = {
-    "n_transitions": [10_000, 20_000, 30_000, 40_000, 50_000],
-    "epsilon": [0.0, 0.2, 0.4, 0.6, 0.8, 1.0],
+    "n_transitions": [30_000, 50_000],
+    "epsilon": [0.0, 0.2, 0.4, 0.6],
     "proportions": [
         (1.0, 0.0),
         (0.8, 0.2),
@@ -91,7 +90,7 @@ RESET_CONFIGS = [
     {"name": "x0_100_custom_0", "reset_probs": {"x0": 1.0, "custom": 0.0}},
 ]
 
-FEATURE_TYPES = ("tabular", "rbf")
+FEATURE_TYPES = ("rbf",)
 
 FOGAS_CONFIG = {
     "beta": 1e-6,
@@ -129,23 +128,6 @@ def build_abstraction():
         action_labels=ACTION_LABELS,
     )
     return state_disc, action_disc
-
-
-def build_tabular_mdp(state_disc, action_disc):
-    states = torch.arange(state_disc.n_states, dtype=torch.int64)
-    actions = torch.arange(action_disc.n_actions, dtype=torch.int64)
-    phi_tabular = TabularFeatureMap(
-        n_states=state_disc.n_states,
-        n_actions=action_disc.n_actions,
-    )
-    return FeatureOnlyAbstractMDP(
-        states=states,
-        actions=actions,
-        phi=phi_tabular,
-        gamma=GAMMA ** 5,
-        x0=state_disc.obs_to_state_id(INITIAL_OBS_REFERENCE),
-        omega=None,
-    )
 
 
 def build_rbf_mdp(state_disc, action_disc):
@@ -193,8 +175,6 @@ def build_rbf_mdp(state_disc, action_disc):
 
 
 def build_mdp(feature_type, state_disc, action_disc):
-    if feature_type == "tabular":
-        return build_tabular_mdp(state_disc, action_disc)
     if feature_type == "rbf":
         return build_rbf_mdp(state_disc, action_disc)
     raise ValueError(f"Unsupported feature_type: {feature_type}")

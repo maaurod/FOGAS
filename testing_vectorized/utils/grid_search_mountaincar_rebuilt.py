@@ -55,7 +55,7 @@ ACTION_LABELS = {0: "left", 1: "coast", 2: "right"}
 INITIAL_OBS_REFERENCE = np.array([-0.5, 0.0], dtype=np.float64)
 
 RBF_BINS = np.array([15, 15], dtype=np.int64)
-VARIANCE_SCALE = 0.1
+VARIANCE_SCALE = 0.05
 
 Q_LEARNING_CONFIG = {
     "episodes": 5000,
@@ -65,8 +65,8 @@ Q_LEARNING_CONFIG = {
 }
 
 DATASET_GRID = {
-    "n_transitions": [30_000, 50_000],
-    "epsilon": [0.0, 0.2, 0.4, 0.6],
+    "n_transitions": [25_000],
+    "epsilon": [0.0, 0.1, 0.2, 0.4, 0.6],
     "proportions": [
         (1.0, 0.0),
         (0.8, 0.2),

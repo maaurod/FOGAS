@@ -36,7 +36,7 @@ from fogas_torch import (  # noqa: E402
 from fogas_torch.algorithm import FOGASSolverVectorized  # noqa: E402
 
 
-SEED = 42
+SEED = 44
 ENV_ID = "MountainCar-v0"
 GAMMA = 0.9
 GOAL_POSITION = 0.5
@@ -113,7 +113,7 @@ def set_global_seed(seed):
     np.random.seed(seed)
     torch.manual_seed(seed)
     if torch.cuda.is_available():
-        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
 
 
 def build_abstraction():

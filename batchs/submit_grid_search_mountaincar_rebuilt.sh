@@ -20,6 +20,7 @@ sbatch <<SBATCH_EOF
 #SBATCH --job-name=$JOB_NAME
 #SBATCH --time=$TIME
 #SBATCH --partition=frida
+#SBATCH --exclude=apl
 #SBATCH --gres=gpu:A100_80GB:$GPU_COUNT
 #SBATCH --mem=32G
 #SBATCH --cpus-per-task=8

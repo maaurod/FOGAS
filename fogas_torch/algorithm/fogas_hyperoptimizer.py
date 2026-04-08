@@ -1,5 +1,6 @@
 import numpy as np
 import matplotlib.pyplot as plt
+import inspect
 from scipy.stats import norm
 from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.gaussian_process.kernels import Matern, WhiteKernel, ConstantKernel
@@ -20,7 +21,6 @@ class FOGASHyperOptimizer:
         "alpha": {"bounds": lambda theory, cur: (theory["alpha"], 5.0), "log_scale": True},
         "rho":   {"bounds": lambda theory, cur: (1e-2, 5.0),  "log_scale": True},
         "eta":   {"bounds": lambda theory, cur: (theory["eta"], 3.0),   "log_scale": True},
-        "gamma": {"bounds": (0.8, 0.999), "log_scale": False},
     }
 
     def __init__(self, solver, metric_callable, seed=42):
@@ -43,11 +43,51 @@ class FOGASHyperOptimizer:
     # =====================================================
     # Objective (metric-agnostic)
     # =====================================================
+    def _solver_run_capabilities(self):
+        signature = inspect.signature(self.solver.run)
+        accepts_var_kwargs = any(
+            p.kind == inspect.Parameter.VAR_KEYWORD
+            for p in signature.parameters.values()
+        )
+        accepted_params = {
+            name
+            for name, p in signature.parameters.items()
+            if name != "self" and p.kind != inspect.Parameter.VAR_POSITIONAL
+        }
+        return accepts_var_kwargs, accepted_params
+
+    def _filter_solver_params(self, params):
+        accepts_var_kwargs, accepted_params = self._solver_run_capabilities()
+        if accepts_var_kwargs:
+            return dict(params)
+
+        return {
+            key: value for key, value in params.items()
+            if key in accepted_params
+        }
+
+    def _validate_tunable_params(self, param_names):
+        accepts_var_kwargs, accepted_params = self._solver_run_capabilities()
+        if accepts_var_kwargs:
+            return
+
+        unsupported = sorted(
+            key for key in param_names
+            if key not in accepted_params
+        )
+        if unsupported:
+            raise ValueError(
+                "Solver does not accept runtime hyperparameter(s): "
+                f"{unsupported}. Supported run parameters: "
+                f"{sorted(accepted_params)}"
+            )
+
     def _evaluate(self, num_runs=3, **params):
         import torch  # Import here to avoid requiring torch if not using solver with tensors
+        run_params = self._filter_solver_params(params)
         vals = []
         for _ in range(num_runs):
-            self.solver.run(**params)
+            self.solver.run(**run_params)
             metric_val = self.metric()
             # Handle torch tensors if solver returns them
             if isinstance(metric_val, torch.Tensor):
@@ -319,6 +359,7 @@ class FOGASHyperOptimizer:
         for p in order:
             if p not in valid:
                 raise ValueError(f"Unknown parameter '{p}'. Valid: {sorted(valid)}")
+        self._validate_tunable_params(order)
 
         bounds_overrides = bounds_overrides or {}
 
@@ -327,7 +368,6 @@ class FOGASHyperOptimizer:
             "alpha": float(self.solver.alpha),
             "rho":   float(self.solver.rho),
             "eta":   float(self.solver.eta),
-            "gamma": float(self.solver.gamma),
         }
 
         # current best-known params start at theory values
@@ -387,7 +427,7 @@ class FOGASHyperOptimizer:
 
             # update and evaluate exactly at the new triplet
             current[p] = float(p_star)
-            self.solver.run(**current)
+            self.solver.run(**self._filter_solver_params(current))
             key = " + ".join(order[: order.index(p) + 1])
             metrics[key] = float(self.metric())
 

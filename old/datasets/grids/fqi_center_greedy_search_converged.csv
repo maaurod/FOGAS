@@ -1,0 +1,2 @@
+n_centers,state_mode,ridge,sigma_mult,converged
+72,standard,1e-06,0.8,True

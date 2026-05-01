@@ -1,254 +1,110 @@
-# FOGAS: Feature-Occupancy Gradient Ascent
+# RL Methods Research Repository
 
-Implementation of the FOGAS algorithm for offline reinforcement learning in linear MDPs.
+Reordered research codebase for:
 
-## Repository Structure
+- FOGAS
+- generalized FOGAS experiments
+- FQI
+- shared MDP and dataset tooling
+- a reserved `sbeed/` package for future work
 
-```
-fogas/
-├── mdp/                      # Core MDP framework
-│   ├── linear_mdp.py         # LinearMDP: Linear MDP implementation
-│   └── policy_solver.py      # PolicySolver: MDP with policy evaluation
-│
-├── algorithm/                # FOGAS algorithm components
-│   ├── fogas_dataset.py      # FOGASDataset: Load and manage offline datasets
-│   ├── fogas_parameters.py   # FOGASParameters: Theoretical parameter computation
-│   ├── fogas_solver.py       # FOGASSolver: Main FOGAS algorithm
-│   ├── fogas_solver_vectorized.py  # FOGASSolverVectorized: Optimized version
-│   ├── fogas_oraclesolver.py       # FOGASOracleSolver: Oracle variant with true dynamics
-│   ├── fogas_oraclesolver_vectorized.py  # FOGASOracleSolverVectorized: Optimized oracle
-│   ├── fogas_evaluator.py    # FOGASEvaluator: Metrics and evaluation tools
-│   └── fogas_hyperoptimizer.py  # FOGASHyperOptimizer: Hyperparameter optimization
-│
-└── dataset_collection/       # Dataset generation utilities
-    ├── linear_mdp_env.py     # LinearMDPEnv: Gymnasium-compatible environment
-    └── env_data_collector.py # EnvDataCollector: Collect offline datasets
-```
+The previous repository layout is preserved under [`old/`](/home/mauro/Desktop/EMAI/Ljubljana/Thesis/Code/old).
 
-## Class Hierarchy and Usage Order
+## Repository Layout
 
-### 1. **MDP Definition** (Choose one)
-
-#### Option A: Direct MDP Specification
-```python
-from fogas import LinearMDP
-
-mdp = LinearMDP(
-    states=states,
-    actions=actions,
-    phi=phi,           # Feature mapping function
-    omega=omega,       # Reward feature weights
-    gamma=gamma,       # Discount factor
-    x0=initial_state
-)
+```text
+.
+├── src/rl_methods/             # Reusable package code
+│   ├── mdp/                    # Core MDP abstractions and discretization
+│   ├── dataset_collection/     # Data collection, env wrappers, analysis
+│   ├── fogas/                  # Original FOGAS implementation
+│   ├── fogas_generalization/   # Generalized FOGAS implementation
+│   ├── fqi/                    # FQI implementation
+│   ├── q_learning/             # Q-learning utilities
+│   └── sbeed/                  # Placeholder for future SBEED work
+├── experiments/
+│   ├── fogas/
+│   ├── fogas_generalization/
+│   ├── fqi/
+│   ├── media/
+│   └── shared/
+├── data/
+│   ├── datasets/               # Transition datasets
+│   └── results/                # Grid-search and result tables
+├── jobs/                       # Cluster / batch submission scripts
+├── scripts/                    # Local helper scripts
+├── docs/                       # Supporting notes and references
+├── tests/
+└── old/                        # Snapshot of the pre-reorganization repo
 ```
 
-#### Option B: MDP with Policy Evaluation
-```python
-from fogas import PolicySolver
+## Package Imports
 
-mdp = PolicySolver(
-    states=states,
-    actions=actions,
-    phi=phi,
-    omega=omega,
-    gamma=gamma,
-    x0=initial_state,
-    psi=psi            # Transition feature mapping
-)
+Install in editable mode from the repo root:
+
+```bash
+pip install -e .
 ```
 
-#### Option C: Discretized Continuous Problem
-```python
-from fogas_torch import (
-    BoxStateDiscretizer,
-    DiscreteActionDiscretizer,
-    DiscretizedLinearMDP,
-)
-
-state_disc = BoxStateDiscretizer(
-    low=[-1.2, -0.07],
-    high=[0.6, 0.07],
-    bins=[20, 20],
-    terminal_obs_predicate=lambda obs: obs[0] >= 0.5 and obs[1] >= 0.0,
-)
-
-action_disc = DiscreteActionDiscretizer(
-    action_values=[0, 1, 2],
-    action_labels={0: "left", 1: "coast", 2: "right"},
-)
-
-def mountaincar_transition(obs, env_action):
-    # user-defined model step on representative continuous observations
-    next_obs, reward, done = ...
-    return next_obs, reward, done
-
-mdp = DiscretizedLinearMDP(
-    state_discretizer=state_disc,
-    action_discretizer=action_disc,
-    transition_fn=mountaincar_transition,
-    gamma=0.9,
-    initial_obs=[-0.5, 0.0],
-)
-```
-
-### 2. **Dataset Collection** (Optional - if you need to generate data)
+Then import from `rl_methods`:
 
 ```python
-from fogas import LinearMDPEnv, EnvDataCollector
-
-# Create environment
-env = LinearMDPEnv(mdp=mdp)
-
-# Collect dataset
-collector = EnvDataCollector(mdp=mdp, env_name="my_problem")
-collector.collect_dataset(
-    n_steps=1000,
-    save_path="datasets/my_problem.csv",
-    verbose=True
-)
+from rl_methods import PolicySolver, EnvDataCollector
+from rl_methods.fogas import FOGASSolverVectorized, FOGASEvaluator
+from rl_methods.fogas_generalization import FOGASSolverBetaVectorized
+from rl_methods.fqi import FQISolver, FQIEvaluator
 ```
 
-### 3. **FOGAS Solver** (Choose one variant)
+## MDP Layer
 
-#### Standard FOGAS (with offline dataset)
-```python
-from fogas import FOGASSolverVectorized, FOGASDataset
+The MDP layer intentionally stays close to the previous design:
 
-solver = FOGASSolverVectorized(
-    mdp=mdp,
-    csv_path="datasets/my_problem.csv",
-    delta=0.05,        # Confidence level
-    print_params=True
-)
+- `rl_methods.mdp.linear_mdp.LinearMDP`
+- `rl_methods.mdp.policy_solver.PolicySolver`
+- `rl_methods.mdp.abstract_mdp`
 
-# Run the algorithm
-policy = solver.run(T=1000)  # T = number of iterations
-```
+This keeps the current linear-MDP workflow intact while still supporting:
 
-#### Oracle FOGAS (with true dynamics)
-```python
-from fogas import FOGASOracleSolverVectorized
+- tabular finite MDPs
+- discretized continuous problems through `DiscretizedLinearMDP`
+- feature-only abstractions used by the MountainCar workflow
 
-solver = FOGASOracleSolverVectorized(
-    mdp=mdp,
-    delta=0.05,
-    print_params=True
-)
+So the repo is reorganized, but the MDP conceptual model is not replaced.
 
-policy = solver.run(T=1000)
-```
+## Data and Results
 
-### 4. **Evaluation**
+- input datasets live in [`data/datasets/`](/home/mauro/Desktop/EMAI/Ljubljana/Thesis/Code/data/datasets)
+- generated result tables live in [`data/results/`](/home/mauro/Desktop/EMAI/Ljubljana/Thesis/Code/data/results)
 
-```python
-from fogas import FOGASEvaluator
+Notebook and script path helpers were updated to use:
 
-evaluator = FOGASEvaluator(solver)
+- `PROJECT_ROOT / "data" / "datasets"`
+- `PROJECT_ROOT / "data" / "results"`
+- `PROJECT_ROOT / "src"`
 
-# Compare with optimal policy
-evaluator.compare_final_rewards()
+## Experiments
 
-# Analyze value functions
-evaluator.compare_value_functions()
+The notebooks are grouped by algorithm family:
 
-# Get performance metrics
-reward_metric = evaluator.get_metric("reward")
-gap_metric = evaluator.get_metric("expected_gap")
-```
+- [`experiments/fogas/`](/home/mauro/Desktop/EMAI/Ljubljana/Thesis/Code/experiments/fogas)
+- [`experiments/fogas_generalization/`](/home/mauro/Desktop/EMAI/Ljubljana/Thesis/Code/experiments/fogas_generalization)
+- [`experiments/fqi/`](/home/mauro/Desktop/EMAI/Ljubljana/Thesis/Code/experiments/fqi)
 
-### 5. **Hyperparameter Optimization** (Optional)
+The notebook split now matches your classification:
 
-```python
-from fogas import FOGASHyperOptimizer
+- only `fqi_testing.ipynb` is under `experiments/fqi/notebooks/`
+- only the 3 copied generalized notebooks are under `experiments/fogas_generalization/notebooks/`
+- every other notebook is under `experiments/fogas/notebooks/`
 
-optimizer = FOGASHyperOptimizer(
-    solver=solver,
-    metric_callable=evaluator.get_metric("reward"),
-    seed=42
-)
+The older non-vectorized FOGAS notebooks are still kept under `experiments/fogas/notebooks/legacy/`, so no notebook files were dropped.
 
-# Optimize hyperparameters
-results = optimizer.optimize_fogas_hyperparameters(
-    order=("alpha", "rho", "eta"),
-    search_method="bo",  # or "random"
-    num_runs=3,
-    plot=True
-)
+The generalized notebooks that were previously in `testing copy/` now live under `experiments/fogas_generalization/notebooks/`, and the generalized algorithm code that was previously in `algorithm_gen/` now lives in `src/rl_methods/fogas_generalization/`.
 
-print(f"Optimized alpha: {results['alpha']}")
-print(f"Optimized rho: {results['rho']}")
-print(f"Optimized eta: {results['eta']}")
-```
+## Old Snapshot
 
-## Quick Start
+The `old/` folder contains the repository exactly as it existed before the reorganization pass, including the original folder names and paths. It is kept for reference and migration checks.
 
-See example notebooks in `testing_vectorized/`:
-- `2State.ipynb`: Simple 2-state MDP example
-- `3grid.ipynb`: 3x3 gridworld navigation
-- `3grid_wall.ipynb`: 3x3 gridworld with obstacles
+## Notes
 
-## Google Colab Usage
-
-There are **two ways** to use this repository in Google Colab:
-
-### Method 1: Clone and Run Notebooks Directly (Easiest) ⭐
-
-The notebooks are already set up to work in Colab! Just clone and run:
-
-```python
-# 1. Clone the repository
-!git clone https://github.com/maaurod/FOGAS.git
-%cd FOGAS
-
-# 2. Install dependencies
-!pip install -r requirements.txt
-
-# 3. Open any notebook from testing_vectorized/ and run it!
-# The notebooks use PROJECT_ROOT which automatically works in Colab
-```
-
-**Then**: In Colab's file browser, navigate to `testing_vectorized/` and open any notebook (e.g., `2State.ipynb`). All paths will work automatically!
-
-### Method 2: Install as Package (For Custom Scripts)
-
-If you want to write your own code instead of using the notebooks:
-
-```python
-# 1. Install the package directly from GitHub
-!pip install git+https://github.com/maaurod/FOGAS.git
-
-# 2. Now you can import from anywhere
-from fogas import FOGASSolverVectorized, PolicySolver
-
-# 3. Write your own code
-mdp = PolicySolver(...)
-solver = FOGASSolverVectorized(mdp=mdp, csv_path="path/to/data.csv")
-policy = solver.run(T=1000)
-```
-
-**Use Method 1 if**: You want to run the example notebooks  
-**Use Method 2 if**: You want to write custom Python scripts in Colab
-
-**Note**: The example notebooks already use relative paths that work seamlessly in Colab after cloning.
-
-## PyTorch Version
-
-A PyTorch implementation is available in `fogas_torch/` with the same API and class structure.
-
-## Requirements
-
-- Python 3.7+
-- NumPy
-- Pandas
-- Matplotlib
-- scikit-learn
-- scipy
-- tqdm
-- gymnasium (for environment simulation)
-
-See `requirements.txt` for specific versions.
-
-## License
-
-MIT License - see [LICENSE](LICENSE) file for details.
+- `src/rl_methods/sbeed/` is intentionally just a placeholder package for now.
+- Notebook outputs were left intact where possible, so some rendered outputs may still display old absolute paths even though the executable source cells were updated.

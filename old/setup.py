@@ -7,16 +7,15 @@ with open("requirements.txt", "r", encoding="utf-8") as fh:
     requirements = [line.strip() for line in fh if line.strip() and not line.startswith("#")]
 
 setup(
-    name="rl-methods",
+    name="fogas",
     version="0.1.0",
     author="Mauro Díaz Lupone",
     author_email="maurodiazlupone@gmail.com",
-    description="Reorganized RL methods research codebase",
+    description="FOGAS",
     long_description=long_description,
     long_description_content_type="text/markdown",
     url="https://github.com/maaurod/FOGAS",
-    package_dir={"": "src"},
-    packages=find_packages(where="src"),
+    packages=find_packages(),
     classifiers=[
         "Development Status :: 3 - Alpha",
         "Intended Audience :: Science/Research",

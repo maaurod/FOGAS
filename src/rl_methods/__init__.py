@@ -31,6 +31,15 @@ from .dataset_collection.abstract_env_data_collector import (
 )
 from .fqi.fqi_solver import FQISolver
 from .fqi.fqi_evaluator import FQIEvaluator
+from .sbeed import (
+    DiscreteMDP,
+    DiscreteMDPSpec,
+    SBEEDDataset,
+    SBEEDEvaluator,
+    SBEEDSolver,
+    TabularStateActionFeatures,
+    TabularStateFeatures,
+)
 
 __all__ = [
     "LinearMDP",
@@ -62,4 +71,11 @@ __all__ = [
     "FOGASOracleSolverVectorized",
     "FQISolver",
     "FQIEvaluator",
+    "SBEEDSolver",
+    "SBEEDEvaluator",
+    "SBEEDDataset",
+    "DiscreteMDPSpec",
+    "DiscreteMDP",
+    "TabularStateFeatures",
+    "TabularStateActionFeatures",
 ]

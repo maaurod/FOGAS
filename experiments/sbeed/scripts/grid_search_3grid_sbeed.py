@@ -55,18 +55,18 @@ TERMINAL_STATES = {GOAL_GRID, PIT_GRID}
 # enough to catch unstable learning rates and entropy scales, but not so wide
 # that a full search becomes unreasonable.
 DEFAULT_GRID = {
-    "seeds": [42, 123, 2024],
-    "lambda_entropies": [0, 0.001, 0.004, 0.01, 0.04, 0.1],
-    "etas": [0.001, 0.01, 0.05, 0.1, 1.0],
-    "lr_values": [0.001, 0.003, 0.01, 0.05, 0.1, 0.5, 1.0],
-    "lr_policies": [0.001, 0.003, 0.01, 0.05, 0.1, 0.5, 1.0],
-    "taus": [1, 10, 100, 1_000.0, 10_000.0, 100_000.0],
-    "max_buffer_sizes": [1_000, 3_000, 6_000, 12_000],
-    "batch_sizes": [32, 64, 128, 256],
+    "seeds": [42],
+    "lambda_entropies": [0.001, 0.01, 0.1],
+    "etas": [0.001, 0.01, 0.1],
+    "lr_values": [0.001, 0.01, 0.1, 1],
+    "lr_policies": [0.001, 0.01, 0.1, 1],
+    "taus": [1, 10, 100, 1_000.0, 10_000.0],
+    "max_buffer_sizes": [3_000, 6_000, 12_000],
+    "batch_sizes": [64, 128, 256],
     "episodes": [1_000, 2_000, 4000, 8000, 16000],
     "collect_per_episodes": [10, 20, 50, 100, 200, 500],
-    "updates_per_episodes": [5, 10, 20, 50, 100],
-    "epsilons": [0.05, 0.1, 0.2, 0.3],
+    "updates_per_episodes": [10, 20, 50, 100],
+    "epsilons": [0.1, 0.2, 0.3],
 }
 
 

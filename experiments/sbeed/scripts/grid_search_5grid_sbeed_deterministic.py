@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import csv
 import itertools
 import json
+import os
 import random
 import sys
 import time
@@ -311,6 +313,27 @@ def run_trial(params: dict[str, Any], args: argparse.Namespace, device: torch.de
     }
 
 
+def configure_worker(torch_threads: int) -> None:
+    torch.set_num_threads(torch_threads)
+    try:
+        torch.set_num_interop_threads(1)
+    except RuntimeError:
+        pass
+
+
+def run_trial_safe(
+    params: dict[str, Any], args: argparse.Namespace, device_name: str
+) -> dict[str, Any]:
+    try:
+        return run_trial(params, args, torch.device(device_name))
+    except Exception as exc:
+        return {
+            **params,
+            "status": "error",
+            "error": repr(exc),
+        }
+
+
 def write_row(path: Path, row: dict[str, Any], fieldnames: list[str]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     exists = path.exists()
@@ -332,7 +355,7 @@ def parse_args() -> argparse.Namespace:
         default=RESULTS_DIR / "sbeed_5grid_deterministic_grid_search.csv",
         help="CSV path for trial results.",
     )
-    parser.add_argument("--device", default=None, help="Torch device. Defaults to cuda if available, else cpu.")
+    parser.add_argument("--device", default=None, help="Torch device. Defaults to cpu.")
     parser.add_argument("--seeds", type=parse_int_list, default=DEFAULT_GRID["seeds"])
     parser.add_argument("--lambda-entropies", type=parse_float_list, default=DEFAULT_GRID["lambda_entropies"])
     parser.add_argument("--etas", type=parse_float_list, default=DEFAULT_GRID["etas"])
@@ -355,12 +378,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tqdm-inner", action="store_true", help="Show SBEED episode progress bars inside each trial.")
     parser.add_argument("--verbose-solver", action="store_true", help="Print SBEED solver logs inside each trial.")
     parser.add_argument("--log-every", type=int, default=50)
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=os.cpu_count() or 1,
+        help="Number of parallel trial worker processes. Defaults to all available CPUs.",
+    )
+    parser.add_argument(
+        "--torch-threads",
+        type=int,
+        default=1,
+        help="Torch CPU threads per worker process. Keep this low when --workers is high.",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
+    device = torch.device(args.device or "cpu")
     grid = build_grid(args)
 
     if args.resume:
@@ -369,6 +404,7 @@ def main() -> None:
 
     print(f"Using device: {device}")
     print(f"Trials to run: {len(grid)}")
+    print(f"Parallel workers: {args.workers}")
     print(f"Writing results to: {args.output}")
     if args.dry_run:
         return
@@ -402,16 +438,35 @@ def main() -> None:
         "V_star",
     ]
 
-    for params in tqdm(grid, desc="SBEED grid search"):
-        try:
-            row = run_trial(params, args, device)
-        except Exception as exc:
-            row = {
-                **params,
-                "status": "error",
-                "error": repr(exc),
-            }
-        write_row(args.output, row, fieldnames)
+    if args.workers <= 1:
+        configure_worker(args.torch_threads)
+        for params in tqdm(grid, desc="SBEED grid search"):
+            row = run_trial_safe(params, args, str(device))
+            write_row(args.output, row, fieldnames)
+        return
+
+    with concurrent.futures.ProcessPoolExecutor(
+        max_workers=args.workers,
+        initializer=configure_worker,
+        initargs=(args.torch_threads,),
+    ) as executor:
+        grid_iter = iter(grid)
+        pending = {
+            executor.submit(run_trial_safe, params, args, str(device))
+            for params in itertools.islice(grid_iter, args.workers)
+        }
+        with tqdm(total=len(grid), desc="SBEED grid search") as progress:
+            while pending:
+                done, pending = concurrent.futures.wait(
+                    pending,
+                    return_when=concurrent.futures.FIRST_COMPLETED,
+                )
+                for future in done:
+                    write_row(args.output, future.result(), fieldnames)
+                    progress.update(1)
+                    next_params = next(grid_iter, None)
+                    if next_params is not None:
+                        pending.add(executor.submit(run_trial_safe, next_params, args, str(device)))
 
 
 if __name__ == "__main__":

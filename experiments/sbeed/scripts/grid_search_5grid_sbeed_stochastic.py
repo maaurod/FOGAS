@@ -64,12 +64,12 @@ DEFAULT_GRID = {
     "lr_values": [0.001, 0.01, 0.1, 1],
     "lr_policies": [0.001, 0.01, 0.1, 1],
     "taus": [1, 10, 100, 1_000.0, 10_000.0],
-    "max_buffer_sizes": [3_000, 6_000, 12_000],
-    "batch_sizes": [64, 128, 256],
-    "episodes": [1_000, 2_000, 4000, 8000, 16000],
-    "collect_per_episodes": [10, 20, 50, 100, 200, 500],
-    "updates_per_episodes": [10, 20, 50, 100],
-    "epsilons": [0.1, 0.2, 0.3],
+    "max_buffer_sizes": [12_000],
+    "batch_sizes": [128, 256],
+    "episodes": [2_000, 4000, 8000],
+    "collect_per_episodes": [50, 100, 200],
+    "updates_per_episodes": [20, 50, 100],
+    "epsilons": [0.1],
 }
 
 

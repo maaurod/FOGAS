@@ -18,7 +18,7 @@ class SBEEDSolver:
     The solver learns:
         V_theta(s) = theta^T value_features(s)
         rho_beta(s, a) = beta^T rho_features(s, a)
-        pi_W(a | s) = softmax(W value_features(s))[a]
+        pi_W(a | s) = softmax(W policy_features(s))[a]
 
     It does not assume linear rewards, linear transitions, omega, or LinearMDP
     transition features.
@@ -36,6 +36,7 @@ class SBEEDSolver:
         gamma: Optional[float] = None,
         value_features: Optional[Callable[[int], torch.Tensor]] = None,
         rho_features: Optional[Callable[[int, int], torch.Tensor]] = None,
+        policy_features: Optional[Callable[[int], torch.Tensor]] = None,
         spec: Optional[DiscreteMDPSpec] = None,
         lambda_entropy: float = 0.01,
         eta: float = 1.0,
@@ -60,6 +61,7 @@ class SBEEDSolver:
                 gamma=gamma,
                 value_features=value_features,
                 rho_features=rho_features,
+                policy_features=policy_features,
             )
 
         self.spec = spec
@@ -68,8 +70,10 @@ class SBEEDSolver:
         self.gamma = spec.gamma
         self.value_features = spec.value_features
         self.rho_features = spec.rho_features
+        self.policy_features = spec.policy_features
         self.value_dim = spec.value_dim
         self.rho_dim = spec.rho_dim
+        self.policy_dim = spec.policy_dim
 
         self.lambda_entropy = float(lambda_entropy)
         self.eta = float(eta)
@@ -118,7 +122,7 @@ class SBEEDSolver:
 
         self.theta = torch.zeros(self.value_dim, dtype=torch.float64, device=self.device)
         self.beta = torch.zeros(self.rho_dim, dtype=torch.float64, device=self.device)
-        self.W = torch.zeros((self.n_actions, self.value_dim), dtype=torch.float64, device=self.device)
+        self.W = torch.zeros((self.n_actions, self.policy_dim), dtype=torch.float64, device=self.device)
 
         self.theta_history = []
         self.beta_history = []
@@ -146,10 +150,12 @@ class SBEEDSolver:
         """
         Build feature design tensors once.
 
-        PHI_S[s]        = phi(s), the value/policy feature.
+        PHI_S[s]        = phi(s), the value feature.
+        POLICY_PHI_S[s] = chi(s), the policy feature.
         RHO_SA[s, a]    = zeta(s, a), the dual residual feature.
         Phi[i]          = phi(s_i)
         Phi_next[i]     = phi(s'_i)
+        PolicyPhi[i]    = chi(s_i)
         Rho[i]          = zeta(s_i, a_i)
 
         I use `rho_features` / `zeta` language here instead of the paper's
@@ -157,6 +163,10 @@ class SBEEDSolver:
         """
         value_all = [
             self._feature_to_device(self.value_features(s))
+            for s in range(self.n_states)
+        ]
+        policy_all = [
+            self._feature_to_device(self.policy_features(s))
             for s in range(self.n_states)
         ]
         rho_all = [
@@ -168,13 +178,17 @@ class SBEEDSolver:
         ]
 
         value_dims = {feat.numel() for feat in value_all}
+        policy_dims = {feat.numel() for feat in policy_all}
         rho_dims = {feat.numel() for row in rho_all for feat in row}
         if value_dims != {self.value_dim}:
             raise ValueError("value_features must return a fixed feature dimension")
+        if policy_dims != {self.policy_dim}:
+            raise ValueError("policy_features must return a fixed feature dimension")
         if rho_dims != {self.rho_dim}:
             raise ValueError("rho_features must return a fixed feature dimension")
 
         self.PHI_S = torch.stack(value_all, dim=0)
+        self.POLICY_PHI_S = torch.stack(policy_all, dim=0)
         self.RHO_SA = torch.stack([torch.stack(row, dim=0) for row in rho_all], dim=0)
 
         self._refresh_dataset_features()
@@ -184,13 +198,14 @@ class SBEEDSolver:
         Refresh row-wise feature tensors after D grows.
 
         Online SBEED appends new transitions to D. The state feature table
-        PHI_S and state-action feature table RHO_SA are fixed, but Phi,
-        Phi_next, and Rho depend on the current contents of D.
+        PHI_S, POLICY_PHI_S, and RHO_SA are fixed, but Phi, Phi_next,
+        PolicyPhi, and Rho depend on the current contents of D.
         """
         self.n = self.dataset.n
         if self.n == 0:
             self.Phi = torch.empty((0, self.value_dim), dtype=torch.float64, device=self.device)
             self.Phi_next = torch.empty((0, self.value_dim), dtype=torch.float64, device=self.device)
+            self.PolicyPhi = torch.empty((0, self.policy_dim), dtype=torch.float64, device=self.device)
             self.Rho = torch.empty((0, self.rho_dim), dtype=torch.float64, device=self.device)
             return
 
@@ -199,6 +214,7 @@ class SBEEDSolver:
         X_next = self.dataset.X_next.long()
         self.Phi = self.PHI_S[X]
         self.Phi_next = self.PHI_S[X_next]
+        self.PolicyPhi = self.POLICY_PHI_S[X]
         self.Rho = self.RHO_SA[X, A]
 
     @staticmethod
@@ -208,10 +224,10 @@ class SBEEDSolver:
         return exp_z / exp_z.sum(dim=1, keepdim=True)
 
     def _policy_matrix(self, W: Optional[torch.Tensor] = None) -> torch.Tensor:
-        # pi_W(. | s) = softmax(W phi(s)).
-        # PHI_S has shape (N, d_v), W has shape (A, d_v), so logits is (N, A).
+        # pi_W(. | s) = softmax(W chi(s)).
+        # POLICY_PHI_S has shape (N, d_pi), W has shape (A, d_pi).
         W = self.W if W is None else W
-        logits = self.PHI_S @ W.T
+        logits = self.POLICY_PHI_S @ W.T
         return self._row_softmax(logits)
 
     def _batch_indices(self) -> torch.Tensor:
@@ -294,6 +310,7 @@ class SBEEDSolver:
         indices = self._batch_indices()
         Phi = self.Phi[indices]
         Phi_next = self.Phi_next[indices]
+        PolicyPhi = self.PolicyPhi[indices]
         Rho = self.Rho[indices]
         A = self.dataset.A[indices].long()
 
@@ -321,11 +338,11 @@ class SBEEDSolver:
 
         # 4. Softmax-linear policy gradient.
         #
-        # For logits_l = W_l^T phi(s):
-        #   grad_W log pi(a|s) = (one_hot(a) - pi(.|s)) outer phi(s).
+        # For logits_l = W_l^T chi(s):
+        #   grad_W log pi(a|s) = (one_hot(a) - pi(.|s)) outer chi(s).
         action_probs = self._policy_matrix(self.W)[self.dataset.X[indices].long()]
-        grad_log_pi = -action_probs[:, :, None] * Phi[:, None, :]
-        grad_log_pi[torch.arange(indices.numel(), device=self.device), A] += Phi
+        grad_log_pi = -action_probs[:, :, None] * PolicyPhi[:, None, :]
+        grad_log_pi[torch.arange(indices.numel(), device=self.device), A] += PolicyPhi
 
         # Theorem 4 policy signal:
         #   A_sbeed = (1 - eta) delta + eta rho(s,a) - V(s)

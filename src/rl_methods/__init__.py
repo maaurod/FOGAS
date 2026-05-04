@@ -37,6 +37,8 @@ from .sbeed import (
     SBEEDDataset,
     SBEEDEvaluator,
     SBEEDSolver,
+    RBFStateActionFeatures,
+    RBFStateFeatures,
     TabularStateActionFeatures,
     TabularStateFeatures,
 )
@@ -76,6 +78,8 @@ __all__ = [
     "SBEEDDataset",
     "DiscreteMDPSpec",
     "DiscreteMDP",
+    "RBFStateFeatures",
+    "RBFStateActionFeatures",
     "TabularStateFeatures",
     "TabularStateActionFeatures",
 ]

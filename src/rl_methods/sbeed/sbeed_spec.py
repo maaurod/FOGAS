@@ -22,11 +22,14 @@ class DiscreteMDPSpec:
     value_features: Callable[[int], torch.Tensor]
     rho_features: Callable[[int, int], torch.Tensor]
     x0: Optional[int] = None
+    policy_features: Optional[Callable[[int], torch.Tensor]] = None
 
     def __post_init__(self) -> None:
         self.n_states = int(self.n_states)
         self.n_actions = int(self.n_actions)
         self.gamma = float(self.gamma)
+        if self.policy_features is None:
+            self.policy_features = self.value_features
         if self.n_states <= 0:
             raise ValueError("n_states must be positive")
         if self.n_actions <= 0:
@@ -40,8 +43,10 @@ class DiscreteMDPSpec:
 
         value_dim = len(self.value_features(0))
         rho_dim = len(self.rho_features(0, 0))
+        policy_dim = len(self.policy_features(0))
         self.value_dim = int(value_dim)
         self.rho_dim = int(rho_dim)
+        self.policy_dim = int(policy_dim)
 
 
 DiscreteMDP = DiscreteMDPSpec

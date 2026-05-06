@@ -16,24 +16,30 @@ class SBEEDDataset:
     The buffer is populated incrementally by the solver's online collection
     loop.
 
-    Expected transition fields are state, action, reward, and next_state. There
-    is no dependency on FOGAS or LinearMDP internals.
+    Expected transition fields are state, action, reward, next_state, and a
+    terminal done flag. The done flag defaults to False for older four-field
+    callers.
     """
 
     X: torch.Tensor
     A: torch.Tensor
     R: torch.Tensor
     X_next: torch.Tensor
+    D: Optional[torch.Tensor] = None
 
     def __post_init__(self) -> None:
         self.X = torch.as_tensor(self.X, dtype=torch.int64).reshape(-1)
         self.A = torch.as_tensor(self.A, dtype=torch.int64).reshape(-1)
         self.R = torch.as_tensor(self.R, dtype=torch.float64).reshape(-1)
         self.X_next = torch.as_tensor(self.X_next, dtype=torch.int64).reshape(-1)
+        if self.D is None:
+            self.D = torch.zeros_like(self.X, dtype=torch.bool)
+        else:
+            self.D = torch.as_tensor(self.D, dtype=torch.bool, device=self.X.device).reshape(-1)
 
-        lengths = {self.X.numel(), self.A.numel(), self.R.numel(), self.X_next.numel()}
+        lengths = {self.X.numel(), self.A.numel(), self.R.numel(), self.X_next.numel(), self.D.numel()}
         if len(lengths) != 1:
-            raise ValueError("state, action, reward, and next_state must have the same length")
+            raise ValueError("state, action, reward, next_state, and done must have the same length")
         self.n = int(self.X.numel())
 
     @classmethod
@@ -44,14 +50,23 @@ class SBEEDDataset:
             A=torch.empty(0, dtype=torch.int64, device=device),
             R=torch.empty(0, dtype=torch.float64, device=device),
             X_next=torch.empty(0, dtype=torch.int64, device=device),
+            D=torch.empty(0, dtype=torch.bool, device=device),
         )
 
-    def append(self, state: int, action: int, reward: float, next_state: int) -> None:
+    def append(
+        self,
+        state: int,
+        action: int,
+        reward: float,
+        next_state: int,
+        done: bool = False,
+    ) -> None:
         device = self.X.device
         self.X = torch.cat([self.X, torch.tensor([state], dtype=torch.int64, device=device)])
         self.A = torch.cat([self.A, torch.tensor([action], dtype=torch.int64, device=device)])
         self.R = torch.cat([self.R, torch.tensor([reward], dtype=torch.float64, device=device)])
         self.X_next = torch.cat([self.X_next, torch.tensor([next_state], dtype=torch.int64, device=device)])
+        self.D = torch.cat([self.D, torch.tensor([done], dtype=torch.bool, device=device)])
         self.n = int(self.X.numel())
 
     def append_fifo(
@@ -61,17 +76,19 @@ class SBEEDDataset:
         reward: float,
         next_state: int,
         capacity: int,
+        done: bool = False,
     ) -> None:
         capacity = int(capacity)
         if capacity <= 0:
             raise ValueError("capacity must be positive")
 
-        self.append(state, action, reward, next_state)
+        self.append(state, action, reward, next_state, done=done)
         if self.n > capacity:
             self.X = self.X[-capacity:]
             self.A = self.A[-capacity:]
             self.R = self.R[-capacity:]
             self.X_next = self.X_next[-capacity:]
+            self.D = self.D[-capacity:]
             self.n = int(self.X.numel())
 
     def extend(self, other: "SBEEDDataset") -> None:
@@ -80,6 +97,7 @@ class SBEEDDataset:
         self.A = torch.cat([self.A, other.A])
         self.R = torch.cat([self.R, other.R])
         self.X_next = torch.cat([self.X_next, other.X_next])
+        self.D = torch.cat([self.D, other.D])
         self.n = int(self.X.numel())
 
     def to(self, device: Union[torch.device, str]) -> "SBEEDDataset":
@@ -89,6 +107,7 @@ class SBEEDDataset:
             A=self.A.to(device),
             R=self.R.to(device),
             X_next=self.X_next.to(device),
+            D=self.D.to(device),
         )
 
     def validate(self, n_states: int, n_actions: int) -> None:
@@ -106,10 +125,16 @@ class SBEEDDataset:
                 "unique_states": torch.empty(0, dtype=torch.int64, device=self.X.device),
                 "unique_actions": torch.empty(0, dtype=torch.int64, device=self.A.device),
                 "reward_mean": None,
+                "done_count": 0,
             }
         return {
             "n": self.n,
             "unique_states": torch.unique(self.X),
             "unique_actions": torch.unique(self.A),
             "reward_mean": float(self.R.mean().item()),
+            "done_count": int(self.D.sum().item()),
         }
+
+    @property
+    def done(self) -> torch.Tensor:
+        return self.D

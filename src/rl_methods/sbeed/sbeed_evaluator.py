@@ -6,6 +6,7 @@ from typing import Any, Callable, Dict, Optional, Sequence, Tuple, Union
 import numpy as np
 import torch
 
+from .sbeed_base import SBEEDSolverProtocol
 
 ArrayLike = Union[np.ndarray, torch.Tensor]
 
@@ -54,7 +55,7 @@ class SBEEDEvaluator:
 
     def __init__(
         self,
-        solver,
+        solver: SBEEDSolverProtocol,
         P: Optional[ArrayLike] = None,
         R: Optional[ArrayLike] = None,
         mdp: Optional[Any] = None,

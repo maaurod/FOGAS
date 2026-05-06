@@ -56,3 +56,27 @@ pi = solver.run(
     log_every=10,
 )
 ```
+
+Multi-step optimizer variant:
+
+```python
+from rl_methods.sbeed import MultiLinearSBEED
+
+solver = MultiLinearSBEED(
+    spec=mdp_spec,
+    rollout_length=5,
+    batch_size=64,
+    value_optimizer="adam",
+    rho_optimizer="adam",
+    policy_optimizer="npg_exact",
+)
+
+pi = solver.run(
+    transition_fn=next_state,
+    reward_fn=reward_fn,
+    episodes=100,
+    collect_per_episode=20,
+    updates_per_episode=10,
+    terminal_states={goal_grid},
+)
+```

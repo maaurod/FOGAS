@@ -11,9 +11,9 @@ from .sbeed_dataset import SBEEDDataset
 from .sbeed_spec import DiscreteMDPSpec
 
 
-class SBEEDSolver:
+class SBEEDSolverSGDRho:
     """
-    Linear SBEED prototype for finite discrete online RL problems.
+    Linear SBEED variant with SGD updates for the rho/beta model.
 
     The solver learns:
         V_theta(s) = theta^T value_features(s)
@@ -23,10 +23,10 @@ class SBEEDSolver:
     It does not assume linear rewards, linear transitions, omega, or LinearMDP
     transition features.
 
-    The solver starts with an empty replay buffer D. Each `run` call resets D
-    and grows a fresh buffer by interacting with a user-provided discrete
-    transition function. Parameter updates use a shared tau-controlled decay,
-    where j is the per-run update index.
+    This class intentionally does not inherit from SBEEDSolver. It implements
+    the same external API while changing two algorithmic details:
+        1. replay rows include done flags for episodic collection,
+        2. beta/rho is updated by SGD instead of an exact least-squares solve.
     """
 
     def __init__(
@@ -42,6 +42,7 @@ class SBEEDSolver:
         eta: float = 1.0,
         ridge: float = 1e-6,
         lr_value: float = 1e-2,
+        lr_rho: float = 1e-2,
         lr_policy: float = 1e-2,
         tau: float = 1.0,
         buffer_mode: str = "growing",
@@ -79,6 +80,7 @@ class SBEEDSolver:
         self.eta = float(eta)
         self.ridge = float(ridge)
         self.lr_value = float(lr_value)
+        self.lr_rho = float(lr_rho)
         self.lr_policy = float(lr_policy)
         self.tau = float(tau)
         self.buffer_mode = str(buffer_mode)
@@ -93,8 +95,8 @@ class SBEEDSolver:
             raise ValueError("eta must be in [0, 1]")
         if self.ridge < 0.0:
             raise ValueError("ridge must be non-negative")
-        if self.lr_value <= 0.0 or self.lr_policy <= 0.0:
-            raise ValueError("lr_value and lr_policy must be positive")
+        if self.lr_value <= 0.0 or self.lr_rho <= 0.0 or self.lr_policy <= 0.0:
+            raise ValueError("lr_value, lr_rho, and lr_policy must be positive")
         if self.tau <= 0.0:
             raise ValueError("tau must be positive")
         if self.buffer_mode not in {"growing", "fifo"}:
@@ -111,7 +113,7 @@ class SBEEDSolver:
 
         self._seed_all(seed)
 
-        # D = {(s_i, a_i, r_i, s'_i)}. SBEED optimizes empirical expectations
+        # D = {(s_i, a_i, r_i, s'_i, done_i)}. SBEED optimizes empirical expectations
         # over this replay buffer; full-batch means every expectation is an
         # average over all rows, mini-batch means a stochastic estimate.
         self.dataset = SBEEDDataset.empty(device=self.device)
@@ -246,7 +248,7 @@ class SBEEDSolver:
         """
         Compute the one-step smoothed Bellman target sample:
 
-            delta_i = r_i + gamma V_theta(s'_i)
+            delta_i = r_i + gamma (1 - done_i) V_theta(s'_i)
                       - lambda_entropy log pi_W(a_i | s_i).
 
         At the SBEED optimum, temporal consistency says V(s) should match this
@@ -255,32 +257,14 @@ class SBEEDSolver:
         X = self.dataset.X[indices].long()
         A = self.dataset.A[indices].long()
         R = self.dataset.R[indices]
+        D = self.dataset.D[indices].to(dtype=torch.float64)
         Phi_next = self.Phi_next[indices]
 
         pi_mat = self._policy_matrix(W)
         pi_sa = pi_mat[X, A].clamp_min(1e-12)
         log_pi = torch.log(pi_sa)
-        delta = R + self.gamma * (Phi_next @ theta) - self.lambda_entropy * log_pi
+        delta = R + self.gamma * (1.0 - D) * (Phi_next @ theta) - self.lambda_entropy * log_pi
         return delta, pi_mat, log_pi
-
-    def _fit_dual(self, delta: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
-        """
-        Inner dual update.
-
-        For fixed theta and W, SBEED fits the dual/residual model rho_beta to
-        delta by least squares:
-
-            beta = argmin_b sum_i (delta_i - b^T zeta(s_i, a_i))^2
-
-        The ridge term makes the solve stable when the batch does not cover all
-        state-action features.
-        """
-        Rho = self.Rho[indices]
-        gram = Rho.T @ Rho + self.ridge * torch.eye(
-            self.rho_dim, dtype=torch.float64, device=self.device
-        )
-        rhs = Rho.T @ delta.detach()
-        return torch.linalg.solve(gram, rhs)
 
     def objective(self) -> Dict[str, float]:
         if self.n == 0:
@@ -294,8 +278,8 @@ class SBEEDSolver:
             # Empirical SBEED objective:
             #   E[(delta - V(s))^2] - eta E[(delta - rho(s,a))^2].
             # The second term is the variance-cancellation dual term from the
-            # paper. Since beta is fitted by least squares, the solver reports
-            # the primal and dual MSEs separately for debugging.
+            # paper. This variant updates beta by SGD, so the reported dual MSE
+            # is a direct diagnostic of the current rho fit.
             primal = torch.mean((delta - V) ** 2)
             dual = torch.mean((delta - rho) ** 2)
             return {
@@ -313,27 +297,32 @@ class SBEEDSolver:
         PolicyPhi = self.PolicyPhi[indices]
         Rho = self.Rho[indices]
         A = self.dataset.A[indices].long()
+        D = self.dataset.D[indices].to(dtype=torch.float64)
+        bootstrap_phi = self.gamma * (1.0 - D)[:, None] * Phi_next
 
         # 1. Build delta with the current value and policy.
         delta, _, _ = self._compute_delta(self.theta, self.W, indices)
-
-        # 2. Solve the inner dual problem exactly for this batch.
-        self.beta = self._fit_dual(delta, indices)
 
         V = Phi @ self.theta
         rho = Rho @ self.beta
         residual_v = delta - V
         residual_rho = delta - rho
 
+        # 2. SGD rho/beta gradient from the variant:
+        #    G_beta = -E[(delta - rho_beta(s,a)) zeta(s,a)].
+        # Delta is detached so the rho update treats the current target as
+        # fixed, matching the original exact-fit inner update role.
+        grad_beta = -((residual_rho.detach())[:, None] * Rho).mean(dim=0)
+
         # 3. Value gradient from Theorem 4, specialized to
         #    V_theta(s) = theta^T phi(s):
         #
         # grad_theta =
-        #   2 E[(delta - V(s)) (gamma phi(s') - phi(s))]
-        #   - 2 eta gamma E[(delta - rho(s,a)) phi(s')].
+        #   2 E[(delta - V(s)) (gamma (1-done) phi(s') - phi(s))]
+        #   - 2 eta gamma E[(delta - rho(s,a)) (1-done) phi(s')].
         grad_theta = (
-            2.0 * (residual_v[:, None] * (self.gamma * Phi_next - Phi)).mean(dim=0)
-            - 2.0 * self.eta * self.gamma * (residual_rho[:, None] * Phi_next).mean(dim=0)
+            2.0 * (residual_v[:, None] * (bootstrap_phi - Phi)).mean(dim=0)
+            - 2.0 * self.eta * (residual_rho[:, None] * bootstrap_phi).mean(dim=0)
         )
 
         # 4. Softmax-linear policy gradient.
@@ -353,12 +342,14 @@ class SBEEDSolver:
         ).mean(dim=0)
 
         # 5. Euclidean mirror descent = ordinary gradient descent with a
-        # shared tau-controlled step-size decay across value and policy
+        # shared tau-controlled step-size decay across value, rho, and policy
         # updates: zeta_j = zeta_0 / (1 + j / tau).
         self.update_index += 1
         decay = 1.0 / (1.0 + float(self.update_index) / self.tau)
         value_step_size = self.lr_value * decay
+        rho_step_size = self.lr_rho * decay
         policy_step_size = self.lr_policy * decay
+        self.beta = self.beta - rho_step_size * grad_beta
         self.theta = self.theta - value_step_size * grad_theta
         self.W = self.W - policy_step_size * grad_W
 
@@ -366,8 +357,10 @@ class SBEEDSolver:
         stats.update(
             {
                 "theta_grad_norm": float(torch.linalg.norm(grad_theta).item()),
+                "beta_grad_norm": float(torch.linalg.norm(grad_beta).item()),
                 "policy_grad_norm": float(torch.linalg.norm(grad_W).item()),
                 "value_step_size": float(value_step_size),
+                "rho_step_size": float(rho_step_size),
                 "policy_step_size": float(policy_step_size),
                 "update_index": int(self.update_index),
             }
@@ -529,8 +522,8 @@ class SBEEDSolver:
         Reproducibility is controlled by the solver seed. The initial policy is
         uniform because W is initialized to zeros. The update counter j resets
         to 0 at the start of each run, so the effective learning rates at
-        update j >= 1 are lr_value / (1 + j / tau) and
-        lr_policy / (1 + j / tau).
+        update j >= 1 are lr_value / (1 + j / tau),
+        lr_rho / (1 + j / tau), and lr_policy / (1 + j / tau).
         """
         episodes = int(episodes)
         collect_per_episode = int(collect_per_episode)

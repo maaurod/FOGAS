@@ -9,7 +9,7 @@ import random
 import sys
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -24,446 +24,23 @@ os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
 from rl_methods.sbeed import (  # noqa: E402
     DiscreteMDPSpec,
     MultiLinearSBEED,
-    TabularStateActionFeatures,
-    TabularStateFeatures,
+    RBFStateActionFeatures,
+    RBFStateFeatures,
 )
 
 
-# ============================================================
-# DEFAULT SEARCH SETTINGS
-# ============================================================
-
-DEFAULT_SEARCH_DIR = REPO_ROOT / "sbeed_grid_search_results"
-
-N_RUNS = 40
-
-EPISODES = 500
-COLLECT_PER_EPISODE = 20
-UPDATES_PER_EPISODE = 10
-INITIAL_COLLECT_STEPS = 1024
-
-MAX_BUFFER_SIZE = 12000
-
-EVAL_EVERY_EPISODES = 100
-N_EVAL_EPISODES_DURING = 80
-N_EVAL_EPISODES_FINAL = 300
-MAX_STEPS_PER_EVAL_EPISODE = 100
-
-EARLY_STOP_AFTER_EPISODES = 250
-EARLY_STOP_MARGIN = 0.20
-
-BASE_SEED = 777
-CONFIG_SEED = 123
-
-
-# ============================================================
-# STOCHASTIC 5x5 GRID PROBLEM
-# ============================================================
-
-states = torch.arange(25, dtype=torch.long)
-actions = torch.arange(4, dtype=torch.long)
-
-N = len(states)
-A = len(actions)
-gamma = 0.9
-
-grid_size = 5
-
-x_0 = 0
-
-goal_grid = 24
-pit_grid = 18
-
-wall_states = {6, 7, 12}
-terminal_states = {goal_grid, pit_grid}
-
-
-def state_to_pos(s: int) -> Tuple[int, int]:
-    return divmod(int(s), grid_size)
-
-
-def pos_to_state(row: int, col: int) -> int:
-    return int(row) * grid_size + int(col)
-
-
-def move_deterministic(s: int, a: int) -> int:
-    s = int(s)
-    a = int(a)
-
-    if s in terminal_states:
-        return s
-
-    row, col = state_to_pos(s)
-
-    if a == 0:
-        new_row, new_col = row - 1, col
-    elif a == 1:
-        new_row, new_col = row + 1, col
-    elif a == 2:
-        new_row, new_col = row, col - 1
-    elif a == 3:
-        new_row, new_col = row, col + 1
-    else:
-        raise ValueError("action must be in {0,1,2,3}")
-
-    if not (0 <= new_row < grid_size and 0 <= new_col < grid_size):
-        return s
-
-    sp = pos_to_state(new_row, new_col)
-    if sp in wall_states:
-        return s
-
-    return sp
-
-
-def transition_probs(s: int, a: int) -> List[Tuple[int, float]]:
-    """
-    Stochastic transition:
-        80% intended action
-        20% random action uniformly over all actions.
-    """
-    s = int(s)
-    a = int(a)
-
-    probs_by_state: Dict[int, float] = {}
-    for candidate_a in range(A):
-        prob = 0.8 + 0.2 / A if candidate_a == a else 0.2 / A
-        sp = move_deterministic(s, candidate_a)
-        probs_by_state[sp] = probs_by_state.get(sp, 0.0) + prob
-
-    return list(probs_by_state.items())
-
-
-def next_state(s: int, a: int) -> int:
-    probs = transition_probs(s, a)
-    next_states = [sp for sp, _ in probs]
-    probabilities = torch.tensor([p for _, p in probs], dtype=torch.float64)
-    idx = torch.multinomial(probabilities, num_samples=1).item()
-    return int(next_states[idx])
-
-
-def reward_fn(s: int, a: int, sp: int) -> float:
-    sp = int(sp)
-    if sp == goal_grid:
-        return 1.0
-    if sp == pit_grid:
-        return -1.0
-    return -0.1
-
-
-value_features = TabularStateFeatures(n_states=N)
-rho_features = TabularStateActionFeatures(n_states=N, n_actions=A)
-
-mdp_spec = DiscreteMDPSpec(
-    n_states=N,
-    n_actions=A,
-    gamma=gamma,
-    value_features=value_features,
-    rho_features=rho_features,
-    x0=x_0,
-)
-
-
-# ============================================================
-# POLICY / EVALUATION HELPERS
-# ============================================================
-
-@torch.no_grad()
-def greedy_action_from_policy(pi: torch.Tensor, s: int) -> int:
-    return int(torch.argmax(pi[int(s)]).item())
-
-
-@torch.no_grad()
-def sample_policy_action(pi: torch.Tensor, s: int, rng: np.random.Generator) -> int:
-    probs = pi[int(s)].detach().cpu().numpy()
-    probs = probs / probs.sum()
-    return int(rng.choice(len(probs), p=probs))
-
-
-def evaluate_policy(
-    solver: Any,
-    transition_fn: Any,
-    reward_fn: Any,
-    *,
-    start_state: int,
-    terminal_states: set[int],
-    reset_state_fn: Any = None,
-    n_eval_episodes: int = 200,
-    max_steps_per_episode: int = 100,
-    gamma: Optional[float] = None,
-    stochastic_policy: bool = False,
-    seed: int = 0,
-    goal_state: Optional[int] = None,
-) -> Dict[str, float]:
-    rng = np.random.default_rng(seed)
-    gamma = solver.gamma if gamma is None else gamma
-    pi = solver.get_policy_matrix()
-
-    returns = []
-    lengths = []
-    dones = []
-    successes = []
-
-    torch_state = torch.random.get_rng_state()
-    torch.manual_seed(seed)
-    try:
-        for _ in range(n_eval_episodes):
-            s = int(reset_state_fn()) if reset_state_fn is not None else int(start_state)
-
-            g = 0.0
-            discount = 1.0
-            done = False
-            success = False
-
-            for t in range(max_steps_per_episode):
-                if s in terminal_states:
-                    done = True
-                    success = goal_state is not None and s == goal_state
-                    break
-
-                if stochastic_policy:
-                    a = sample_policy_action(pi, s, rng)
-                else:
-                    a = greedy_action_from_policy(pi, s)
-
-                sp = int(transition_fn(s, a))
-                r = float(reward_fn(s, a, sp))
-
-                g += discount * r
-                discount *= gamma
-                s = sp
-
-                if s in terminal_states:
-                    done = True
-                    success = goal_state is not None and s == goal_state
-                    break
-
-            returns.append(g)
-            lengths.append(t + 1)
-            dones.append(float(done))
-            successes.append(float(success))
-    finally:
-        torch.random.set_rng_state(torch_state)
-
-    returns_arr = np.asarray(returns, dtype=np.float64)
-    lengths_arr = np.asarray(lengths, dtype=np.float64)
-    dones_arr = np.asarray(dones, dtype=np.float64)
-    successes_arr = np.asarray(successes, dtype=np.float64)
-
-    out = {
-        "eval_return_mean": float(returns_arr.mean()),
-        "eval_return_std": float(returns_arr.std(ddof=1)) if len(returns_arr) > 1 else 0.0,
-        "eval_return_median": float(np.median(returns_arr)),
-        "eval_return_min": float(returns_arr.min()),
-        "eval_return_max": float(returns_arr.max()),
-        "eval_length_mean": float(lengths_arr.mean()),
-        "eval_done_rate": float(dones_arr.mean()),
-    }
-
-    if goal_state is not None:
-        out["eval_success_rate"] = float(successes_arr.mean())
-
-    return out
-
-
-@torch.no_grad()
-def extract_policy_summary(solver: Any) -> Dict[str, Any]:
-    pi = solver.get_policy_matrix().detach().cpu()
-
-    best_actions = torch.argmax(pi, dim=1).numpy().astype(int).tolist()
-    best_probs = torch.max(pi, dim=1).values.numpy().astype(float).tolist()
-    entropy = -(pi.clamp_min(1e-12) * pi.clamp_min(1e-12).log()).sum(dim=1)
-
-    return {
-        "pi": pi,
-        "best_actions": best_actions,
-        "best_probs": best_probs,
-        "mean_best_prob": float(np.mean(best_probs)),
-        "min_best_prob": float(np.min(best_probs)),
-        "mean_entropy": float(entropy.mean().item()),
-    }
-
-
-def print_policy(pi: torch.Tensor, *, decimals: int = 3) -> None:
-    pi = pi.detach().cpu()
-    n_states, n_actions = pi.shape
-
-    print("\n========== SBEED POLICY ==========\n")
-    for s in range(n_states):
-        parts = [f"pi({a}|{s})={float(pi[s, a]):.{decimals}f}" for a in range(n_actions)]
-        best_a = int(torch.argmax(pi[s]).item())
-        print(f"State {s}: " + "  ".join(parts) + f"  --> best action: {best_a}")
-    print("\n==================================\n")
-
-
-def tail_values(history: List[Dict[str, Any]], key: str, tail: int = 100) -> List[float]:
-    vals = []
-    for h in history[-tail:]:
-        if key in h:
-            v = h[key]
-            if isinstance(v, (float, int)) and math.isfinite(v):
-                vals.append(float(v))
-    return vals
-
-
-def tail_mean(history: List[Dict[str, Any]], key: str, tail: int = 100) -> float:
-    vals = tail_values(history, key, tail)
-    return float(np.mean(vals)) if vals else float("nan")
-
-
-def tail_std(history: List[Dict[str, Any]], key: str, tail: int = 100) -> float:
-    vals = tail_values(history, key, tail)
-    return float(np.std(vals, ddof=1)) if len(vals) > 1 else float("nan")
-
-
-# ============================================================
-# CONFIG GENERATION
-# ============================================================
-
-def make_budgeted_sbeed_configs(*, n_runs: int = 40, seed: int = 123) -> List[Dict[str, Any]]:
-    rng = random.Random(seed)
-    configs = []
-
-    def sample_one(k: int) -> Dict[str, Any]:
-        if k == 1:
-            return {
-                "rollout_length": 1,
-                "lambda_entropy": rng.choice([0.01, 0.02, 0.05, 0.08]),
-                "eta": rng.choice([0.0, 0.05, 0.1, 0.2]),
-                "lr_value": rng.choice([3e-3, 1e-2, 3e-2]),
-                "lr_rho": rng.choice([3e-3, 1e-2, 3e-2]),
-                "lr_policy": rng.choice([3e-3, 1e-2, 3e-2]),
-                "fisher_damping": rng.choice([1e-4, 1e-3, 1e-2]),
-                "batch_size": rng.choice([128, 256, 512]),
-                "epsilon": rng.choice([0.15, 0.25, 0.30, 0.40]),
-            }
-
-        if k == 2:
-            return {
-                "rollout_length": 2,
-                "lambda_entropy": rng.choice([0.02, 0.05, 0.08, 0.10]),
-                "eta": rng.choice([0.0, 0.05, 0.1, 0.2]),
-                "lr_value": rng.choice([3e-3, 1e-2, 3e-2]),
-                "lr_rho": rng.choice([3e-3, 1e-2]),
-                "lr_policy": rng.choice([1e-3, 3e-3, 1e-2]),
-                "fisher_damping": rng.choice([1e-3, 1e-2]),
-                "batch_size": rng.choice([256, 512, 1024]),
-                "epsilon": rng.choice([0.20, 0.30, 0.40]),
-            }
-
-        if k == 3:
-            return {
-                "rollout_length": 3,
-                "lambda_entropy": rng.choice([0.02, 0.05, 0.08]),
-                "eta": rng.choice([0.05, 0.1, 0.2]),
-                "lr_value": rng.choice([3e-3, 1e-2]),
-                "lr_rho": rng.choice([3e-3, 1e-2]),
-                "lr_policy": rng.choice([1e-3, 3e-3, 1e-2]),
-                "fisher_damping": rng.choice([1e-3, 1e-2]),
-                "batch_size": rng.choice([512, 1024, None]),
-                "epsilon": rng.choice([0.20, 0.30, 0.40]),
-            }
-
-        raise ValueError(f"Unsupported k={k}")
-
-    handpicked = [
-        {
-            "rollout_length": 1,
-            "lambda_entropy": 0.05,
-            "eta": 0.1,
-            "lr_value": 1e-2,
-            "lr_rho": 1e-2,
-            "lr_policy": 1e-2,
-            "fisher_damping": 1e-3,
-            "batch_size": 256,
-            "epsilon": 0.30,
-        },
-        {
-            "rollout_length": 2,
-            "lambda_entropy": 0.05,
-            "eta": 0.1,
-            "lr_value": 1e-2,
-            "lr_rho": 1e-2,
-            "lr_policy": 3e-3,
-            "fisher_damping": 1e-3,
-            "batch_size": 512,
-            "epsilon": 0.30,
-        },
-        {
-            "rollout_length": 2,
-            "lambda_entropy": 0.02,
-            "eta": 0.1,
-            "lr_value": 1e-2,
-            "lr_rho": 3e-3,
-            "lr_policy": 3e-3,
-            "fisher_damping": 1e-2,
-            "batch_size": 512,
-            "epsilon": 0.30,
-        },
-        {
-            "rollout_length": 3,
-            "lambda_entropy": 0.05,
-            "eta": 0.1,
-            "lr_value": 1e-2,
-            "lr_rho": 1e-2,
-            "lr_policy": 3e-3,
-            "fisher_damping": 1e-3,
-            "batch_size": 512,
-            "epsilon": 0.30,
-        },
-        {
-            "rollout_length": 3,
-            "lambda_entropy": 0.05,
-            "eta": 0.05,
-            "lr_value": 1e-2,
-            "lr_rho": 3e-3,
-            "lr_policy": 3e-3,
-            "fisher_damping": 1e-2,
-            "batch_size": 1024,
-            "epsilon": 0.30,
-        },
-        {
-            "rollout_length": 3,
-            "lambda_entropy": 0.02,
-            "eta": 0.1,
-            "lr_value": 3e-3,
-            "lr_rho": 3e-3,
-            "lr_policy": 1e-3,
-            "fisher_damping": 1e-2,
-            "batch_size": 1024,
-            "epsilon": 0.40,
-        },
-    ]
-
-    configs.extend(handpicked)
-
-    target_k_counts = {1: 12, 2: 16, 3: 12}
-    current_k_counts = {1: 0, 2: 0, 3: 0}
-    for cfg in configs:
-        current_k_counts[cfg["rollout_length"]] += 1
-
-    for k, target in target_k_counts.items():
-        while current_k_counts[k] < target:
-            cfg = sample_one(k)
-            if cfg["rollout_length"] >= 2 and cfg["lr_policy"] == 3e-2:
-                continue
-            if cfg["rollout_length"] == 3 and cfg["batch_size"] in [128, 256]:
-                continue
-            if cfg["rollout_length"] == 3 and cfg["fisher_damping"] == 1e-4:
-                continue
-            if cfg["eta"] >= 0.2 and cfg["lr_rho"] == 3e-2:
-                continue
-
-            configs.append(cfg)
-            current_k_counts[k] += 1
-
-    rng.shuffle(configs)
-    return configs[:n_runs]
-
-
-# ============================================================
-# SCORING AND SAVING
-# ============================================================
+STATES = torch.arange(25, dtype=torch.long)
+ACTIONS = torch.arange(4, dtype=torch.long)
+N = len(STATES)
+A = len(ACTIONS)
+GAMMA = 0.9
+
+GRID_SIZE = 5
+X0 = 0
+GOAL_GRID = 24
+PIT_GRID = 18
+WALL_STATES = {6, 7, 12}
+TERMINAL_STATES = {GOAL_GRID, PIT_GRID}
 
 CSV_FIELDS = [
     "ok",
@@ -517,17 +94,271 @@ CSV_FIELDS = [
 ]
 
 
+def state_to_pos(s: int) -> Tuple[int, int]:
+    return divmod(int(s), GRID_SIZE)
+
+
+def pos_to_state(row: int, col: int) -> int:
+    return int(row) * GRID_SIZE + int(col)
+
+
+def move_deterministic(s: int, a: int) -> int:
+    s = int(s)
+    a = int(a)
+
+    if s in TERMINAL_STATES:
+        return s
+
+    row, col = state_to_pos(s)
+    if a == 0:
+        new_row, new_col = row - 1, col
+    elif a == 1:
+        new_row, new_col = row + 1, col
+    elif a == 2:
+        new_row, new_col = row, col - 1
+    elif a == 3:
+        new_row, new_col = row, col + 1
+    else:
+        raise ValueError("action must be in {0,1,2,3}")
+
+    if not (0 <= new_row < GRID_SIZE and 0 <= new_col < GRID_SIZE):
+        return s
+
+    sp = pos_to_state(new_row, new_col)
+    if sp in WALL_STATES:
+        return s
+    return sp
+
+
+def deterministic_transition_probs(s: int, a: int) -> List[Tuple[int, float]]:
+    return [(move_deterministic(s, a), 1.0)]
+
+
+def stochastic_transition_probs(s: int, a: int) -> List[Tuple[int, float]]:
+    s = int(s)
+    a = int(a)
+    probs_by_state: Dict[int, float] = {}
+
+    for candidate_a in range(A):
+        prob = 0.8 + 0.2 / A if candidate_a == a else 0.2 / A
+        sp = move_deterministic(s, candidate_a)
+        probs_by_state[sp] = probs_by_state.get(sp, 0.0) + prob
+
+    return list(probs_by_state.items())
+
+
+def make_transition_fn(stochastic: bool) -> Callable[[int, int], int]:
+    probs_fn = stochastic_transition_probs if stochastic else deterministic_transition_probs
+
+    def next_state(s: int, a: int) -> int:
+        probs = probs_fn(s, a)
+        if len(probs) == 1:
+            return int(probs[0][0])
+        next_states = [sp for sp, _ in probs]
+        probabilities = torch.tensor([p for _, p in probs], dtype=torch.float64)
+        idx = torch.multinomial(probabilities, num_samples=1).item()
+        return int(next_states[idx])
+
+    return next_state
+
+
+def reward_fn(s: int, a: int, sp: int) -> float:
+    sp = int(sp)
+    if sp == GOAL_GRID:
+        return 1.0
+    if sp == PIT_GRID:
+        return -1.0
+    return -0.1
+
+
+def build_rbf_mdp_spec(
+    *,
+    value_bandwidth_scale: float = 0.25,
+    policy_bandwidth_scale: float = 0.55,
+) -> DiscreteMDPSpec:
+    center_lin = torch.linspace(0.0, 1.0, 4, dtype=torch.float64)
+    centers = torch.tensor([[r, c] for r in center_lin for c in center_lin], dtype=torch.float64)
+    state_coords = torch.tensor(
+        [[r / 4.0, c / 4.0] for r in range(5) for c in range(5)],
+        dtype=torch.float64,
+    )
+
+    value_features = RBFStateFeatures(
+        n_states=N,
+        centers=centers,
+        state_coords=state_coords,
+        bandwidth="nearest",
+        bandwidth_scale=value_bandwidth_scale,
+        include_bias=True,
+    )
+    rho_features = RBFStateActionFeatures(
+        state_features=value_features,
+        n_actions=A,
+    )
+    policy_features = RBFStateFeatures(
+        n_states=N,
+        centers=centers,
+        state_coords=state_coords,
+        bandwidth="nearest",
+        bandwidth_scale=policy_bandwidth_scale,
+        include_bias=True,
+    )
+
+    return DiscreteMDPSpec(
+        n_states=N,
+        n_actions=A,
+        gamma=GAMMA,
+        value_features=value_features,
+        rho_features=rho_features,
+        policy_features=policy_features,
+        x0=X0,
+    )
+
+
+@torch.no_grad()
+def greedy_action_from_policy(pi: torch.Tensor, s: int) -> int:
+    return int(torch.argmax(pi[int(s)]).item())
+
+
+@torch.no_grad()
+def sample_policy_action(pi: torch.Tensor, s: int, rng: np.random.Generator) -> int:
+    probs = pi[int(s)].detach().cpu().numpy()
+    probs = probs / probs.sum()
+    return int(rng.choice(len(probs), p=probs))
+
+
+def evaluate_policy(
+    solver: Any,
+    transition_fn: Callable[[int, int], int],
+    *,
+    n_eval_episodes: int,
+    max_steps_per_episode: int,
+    stochastic_policy: bool = False,
+    seed: int = 0,
+) -> Dict[str, float]:
+    rng = np.random.default_rng(seed)
+    pi = solver.get_policy_matrix()
+
+    returns = []
+    lengths = []
+    dones = []
+    successes = []
+
+    torch_state = torch.random.get_rng_state()
+    torch.manual_seed(seed)
+    try:
+        for _ in range(n_eval_episodes):
+            s = X0
+            g = 0.0
+            discount = 1.0
+            done = False
+            success = False
+
+            for t in range(max_steps_per_episode):
+                if s in TERMINAL_STATES:
+                    done = True
+                    success = s == GOAL_GRID
+                    break
+
+                a = (
+                    sample_policy_action(pi, s, rng)
+                    if stochastic_policy
+                    else greedy_action_from_policy(pi, s)
+                )
+                sp = int(transition_fn(s, a))
+                r = float(reward_fn(s, a, sp))
+
+                g += discount * r
+                discount *= solver.gamma
+                s = sp
+
+                if s in TERMINAL_STATES:
+                    done = True
+                    success = s == GOAL_GRID
+                    break
+
+            returns.append(g)
+            lengths.append(t + 1)
+            dones.append(float(done))
+            successes.append(float(success))
+    finally:
+        torch.random.set_rng_state(torch_state)
+
+    returns_arr = np.asarray(returns, dtype=np.float64)
+    lengths_arr = np.asarray(lengths, dtype=np.float64)
+    dones_arr = np.asarray(dones, dtype=np.float64)
+    successes_arr = np.asarray(successes, dtype=np.float64)
+
+    return {
+        "eval_return_mean": float(returns_arr.mean()),
+        "eval_return_std": float(returns_arr.std(ddof=1)) if len(returns_arr) > 1 else 0.0,
+        "eval_return_median": float(np.median(returns_arr)),
+        "eval_return_min": float(returns_arr.min()),
+        "eval_return_max": float(returns_arr.max()),
+        "eval_length_mean": float(lengths_arr.mean()),
+        "eval_done_rate": float(dones_arr.mean()),
+        "eval_success_rate": float(successes_arr.mean()),
+    }
+
+
+@torch.no_grad()
+def extract_policy_summary(solver: Any) -> Dict[str, Any]:
+    pi = solver.get_policy_matrix().detach().cpu()
+    best_actions = torch.argmax(pi, dim=1).numpy().astype(int).tolist()
+    best_probs = torch.max(pi, dim=1).values.numpy().astype(float).tolist()
+    entropy = -(pi.clamp_min(1e-12) * pi.clamp_min(1e-12).log()).sum(dim=1)
+
+    return {
+        "pi": pi,
+        "best_actions": best_actions,
+        "best_probs": best_probs,
+        "mean_best_prob": float(np.mean(best_probs)),
+        "min_best_prob": float(np.min(best_probs)),
+        "mean_entropy": float(entropy.mean().item()),
+    }
+
+
+def print_policy(pi: torch.Tensor, *, decimals: int = 3) -> None:
+    pi = pi.detach().cpu()
+    n_states, n_actions = pi.shape
+    print("\n========== SBEED POLICY ==========\n")
+    for s in range(n_states):
+        parts = [f"pi({a}|{s})={float(pi[s, a]):.{decimals}f}" for a in range(n_actions)]
+        best_a = int(torch.argmax(pi[s]).item())
+        print(f"State {s}: " + "  ".join(parts) + f"  --> best action: {best_a}")
+    print("\n==================================\n")
+
+
+def tail_values(history: List[Dict[str, Any]], key: str, tail: int = 100) -> List[float]:
+    vals = []
+    for h in history[-tail:]:
+        v = h.get(key)
+        if isinstance(v, (float, int)) and math.isfinite(v):
+            vals.append(float(v))
+    return vals
+
+
+def tail_mean(history: List[Dict[str, Any]], key: str, tail: int = 100) -> float:
+    vals = tail_values(history, key, tail)
+    return float(np.mean(vals)) if vals else float("nan")
+
+
+def tail_std(history: List[Dict[str, Any]], key: str, tail: int = 100) -> float:
+    vals = tail_values(history, key, tail)
+    return float(np.std(vals, ddof=1)) if len(vals) > 1 else float("nan")
+
+
+def finite_or_zero(value: Any) -> float:
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    return value if math.isfinite(value) else 0.0
+
+
 def score_result(r: Dict[str, Any]) -> float:
     if not r.get("ok", False):
         return -float("inf")
-
-    def finite_or_zero(value: Any) -> float:
-        try:
-            value = float(value)
-        except (TypeError, ValueError):
-            return 0.0
-        return value if math.isfinite(value) else 0.0
-
     return (
         float(r["eval_return_mean"])
         - 0.25 * finite_or_zero(r.get("eval_return_std", 0.0))
@@ -537,17 +368,14 @@ def score_result(r: Dict[str, Any]) -> float:
 
 
 def result_for_csv(r: Dict[str, Any]) -> Dict[str, Any]:
-    skip = {"solver", "pi"}
     out = {}
-
     for k, v in r.items():
-        if k in skip or isinstance(v, torch.Tensor):
+        if k in {"solver", "pi"} or isinstance(v, torch.Tensor):
             continue
         if isinstance(v, (list, tuple, dict)):
             out[k] = json.dumps(v)
         else:
             out[k] = v
-
     out["score"] = score_result(r)
     return out
 
@@ -555,7 +383,6 @@ def result_for_csv(r: Dict[str, Any]) -> Dict[str, Any]:
 def append_result_csv(path: Path, r: Dict[str, Any]) -> None:
     row = result_for_csv(r)
     file_exists = path.exists()
-
     with path.open("a", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=CSV_FIELDS, extrasaction="ignore")
         if not file_exists:
@@ -563,12 +390,11 @@ def append_result_csv(path: Path, r: Dict[str, Any]) -> None:
         writer.writerow(row)
 
 
-def save_best_artifacts(best: Dict[str, Any], search_dir: Path) -> None:
+def save_best_artifacts(best: Dict[str, Any], output_dir: Path) -> None:
     if not best.get("ok", False):
         return
 
-    torch.save(best["pi"], search_dir / "best_pi.pt")
-
+    torch.save(best["pi"], output_dir / "best_pi.pt")
     if best.get("solver") is not None:
         torch.save(
             {
@@ -577,41 +403,35 @@ def save_best_artifacts(best: Dict[str, Any], search_dir: Path) -> None:
                 "W": best["solver"].W.detach().cpu(),
                 "config": {k: v for k, v in best.items() if k not in {"solver", "pi"}},
             },
-            search_dir / "best_solver_params.pt",
+            output_dir / "best_solver_params.pt",
         )
 
-    with (search_dir / "best_summary.json").open("w") as f:
+    with (output_dir / "best_summary.json").open("w") as f:
         json.dump(result_for_csv(best), f, indent=2)
 
 
-# ============================================================
-# ONE TRAINING RUN, CHUNKED
-# ============================================================
-
-def train_one_config_chunked(
+def train_one_config(
     cfg: Dict[str, Any],
     *,
     run_id: int,
     seed: int,
-    current_global_best_score: float,
+    mdp_spec: DiscreteMDPSpec,
+    transition_fn: Callable[[int, int], int],
     device: torch.device,
-    episodes: int,
-    collect_per_episode: int,
-    updates_per_episode: int,
-    initial_collect_steps: int,
-    max_buffer_size: int,
+    training_kwargs: Dict[str, Any],
     eval_every_episodes: int,
     n_eval_episodes_during: int,
     n_eval_episodes_final: int,
     max_steps_per_eval_episode: int,
+    current_global_best_score: float,
     early_stop_after_episodes: int,
     early_stop_margin: Optional[float],
 ) -> Dict[str, Any]:
     torch.manual_seed(seed)
     np.random.seed(seed)
     random.seed(seed)
-
     start_time = time.time()
+    episode = 0
 
     solver = MultiLinearSBEED(
         spec=mdp_spec,
@@ -619,11 +439,11 @@ def train_one_config_chunked(
         eta=cfg["eta"],
         ridge=1e-6,
         lr_value=cfg["lr_value"],
-        lr_policy=cfg["lr_policy"],
         lr_rho=cfg["lr_rho"],
-        tau=100000.0,
+        lr_policy=cfg["lr_policy"],
+        tau=training_kwargs["tau"],
         buffer_mode="fifo",
-        max_buffer_size=max_buffer_size,
+        max_buffer_size=training_kwargs["max_buffer_size"],
         batch_size=cfg["batch_size"],
         rollout_length=cfg["rollout_length"],
         value_optimizer="adam",
@@ -639,49 +459,44 @@ def train_one_config_chunked(
     eval_history = []
     stopped_early = False
     stop_reason = ""
-    episode = 0
 
     try:
+        initial_collect_steps = int(training_kwargs["initial_collect_steps"])
         if initial_collect_steps > 0:
             solver.collect_steps(
-                transition_fn=next_state,
+                transition_fn=transition_fn,
                 n_steps=initial_collect_steps,
-                start_state=x_0,
+                start_state=X0,
                 reward_fn=reward_fn,
                 behavior="uniform",
                 epsilon=0.0,
-                terminal_states=terminal_states,
+                terminal_states=TERMINAL_STATES,
             )
 
+        episodes = int(training_kwargs["episodes"])
         for episode in range(1, episodes + 1):
             solver.collect_steps(
-                transition_fn=next_state,
-                n_steps=collect_per_episode,
-                start_state=x_0,
+                transition_fn=transition_fn,
+                n_steps=training_kwargs["collect_per_episode"],
+                start_state=X0,
                 reward_fn=reward_fn,
                 behavior="policy",
                 epsilon=cfg["epsilon"],
-                terminal_states=terminal_states,
+                terminal_states=TERMINAL_STATES,
             )
 
-            for _ in range(updates_per_episode):
+            for _ in range(training_kwargs["updates_per_episode"]):
                 stats = solver.step()
                 solver.loss_history.append(stats)
 
             if episode % eval_every_episodes == 0 or episode == episodes:
                 eval_stats = evaluate_policy(
                     solver,
-                    transition_fn=next_state,
-                    reward_fn=reward_fn,
-                    start_state=x_0,
-                    terminal_states=terminal_states,
+                    transition_fn,
                     n_eval_episodes=n_eval_episodes_during,
                     max_steps_per_episode=max_steps_per_eval_episode,
-                    stochastic_policy=False,
                     seed=seed + 10_000 + episode,
-                    goal_state=goal_grid,
                 )
-
                 eval_stats["episode"] = episode
                 eval_history.append(eval_stats)
 
@@ -692,12 +507,11 @@ def train_one_config_chunked(
                     "tail_theta_grad_std": tail_std(solver.loss_history, "theta_grad_norm"),
                 }
                 temp_score = score_result(temp_result)
-
                 print(
                     f"    eval ep={episode:04d} | "
                     f"return={eval_stats['eval_return_mean']:.5f} "
                     f"std={eval_stats['eval_return_std']:.5f} "
-                    f"success={eval_stats.get('eval_success_rate', float('nan')):.3f} "
+                    f"success={eval_stats['eval_success_rate']:.3f} "
                     f"score={temp_score:.5f}",
                     flush=True,
                 )
@@ -718,19 +532,13 @@ def train_one_config_chunked(
 
         final_eval_stats = evaluate_policy(
             solver,
-            transition_fn=next_state,
-            reward_fn=reward_fn,
-            start_state=x_0,
-            terminal_states=terminal_states,
+            transition_fn,
             n_eval_episodes=n_eval_episodes_final,
             max_steps_per_episode=max_steps_per_eval_episode,
-            stochastic_policy=False,
             seed=seed + 999_999,
-            goal_state=goal_grid,
         )
-
         policy_summary = extract_policy_summary(solver)
-        last_loss = solver.loss_history[-1] if len(solver.loss_history) > 0 else {}
+        last_loss = solver.loss_history[-1] if solver.loss_history else {}
 
         result = {
             "ok": True,
@@ -768,11 +576,11 @@ def train_one_config_chunked(
             "eval_history": eval_history,
             "solver": solver,
         }
-
         result["score"] = score_result(result)
+        return result
 
-    except Exception as e:
-        result = {
+    except Exception as exc:
+        return {
             "ok": False,
             "run_id": run_id,
             "seed": seed,
@@ -781,7 +589,7 @@ def train_one_config_chunked(
             "stopped_early": True,
             "stop_reason": "exception",
             **cfg,
-            "error": repr(e),
+            "error": repr(exc),
             "eval_return_mean": -float("inf"),
             "eval_return_std": float("inf"),
             "score": -float("inf"),
@@ -789,25 +597,17 @@ def train_one_config_chunked(
             "pi": None,
         }
 
-    return result
 
-
-# ============================================================
-# MAIN GRID SEARCH
-# ============================================================
-
-def run_budgeted_sbeed_grid_search(
+def run_fixed_rbf_grid_search(
     *,
+    name: str,
+    configs: List[Dict[str, Any]],
+    stochastic: bool,
+    training_kwargs: Dict[str, Any],
+    output_dir: Path,
     device: torch.device,
-    n_runs: int,
     base_seed: int,
-    config_seed: int,
-    search_dir: Path,
-    episodes: int,
-    collect_per_episode: int,
-    updates_per_episode: int,
-    initial_collect_steps: int,
-    max_buffer_size: int,
+    n_runs: Optional[int],
     eval_every_episodes: int,
     n_eval_episodes_during: int,
     n_eval_episodes_final: int,
@@ -815,30 +615,31 @@ def run_budgeted_sbeed_grid_search(
     early_stop_after_episodes: int,
     early_stop_margin: Optional[float],
 ) -> Tuple[List[Dict[str, Any]], Optional[Dict[str, Any]]]:
-    search_dir.mkdir(parents=True, exist_ok=True)
-    csv_path = search_dir / "results.csv"
-
-    configs = make_budgeted_sbeed_configs(n_runs=n_runs, seed=config_seed)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    csv_path = output_dir / "results.csv"
+    mdp_spec = build_rbf_mdp_spec()
+    transition_fn = make_transition_fn(stochastic)
+    selected_configs = configs if n_runs is None else configs[:n_runs]
 
     results = []
     best = None
     best_score = -float("inf")
-
-    print("\n========== SBEED BUDGETED GRID SEARCH ==========")
-    print(f"Problem: stochastic 5x5 grid, start={x_0}, goal={goal_grid}, pit={pit_grid}")
-    print(f"Runs: {len(configs)}")
-    print(f"Episodes per full run: {episodes}")
-    print(f"Device: {device}")
-    print(f"Results dir: {search_dir}")
-    print("================================================\n", flush=True)
-
     global_start = time.time()
 
-    for i, cfg in enumerate(configs):
-        seed = base_seed + i
+    print("\n========== SBEED RBF FIXED GRID SEARCH ==========")
+    print(f"Name: {name}")
+    print(f"Problem: {'stochastic' if stochastic else 'deterministic'} 5x5 RBF grid")
+    print(f"Runs: {len(selected_configs)}")
+    print(f"Episodes per full run: {training_kwargs['episodes']}")
+    print(f"Tau: {training_kwargs['tau']}")
+    print(f"Device: {device}")
+    print(f"Results dir: {output_dir}")
+    print("=================================================\n", flush=True)
 
+    for i, cfg in enumerate(selected_configs):
+        seed = base_seed + i
         print(
-            f"\n[{i + 1:03d}/{len(configs):03d}] "
+            f"\n[{i + 1:03d}/{len(selected_configs):03d}] "
             f"seed={seed} | "
             f"k={cfg['rollout_length']} | "
             f"bs={cfg['batch_size']} | "
@@ -852,21 +653,19 @@ def run_budgeted_sbeed_grid_search(
             flush=True,
         )
 
-        result = train_one_config_chunked(
+        result = train_one_config(
             cfg,
             run_id=i,
             seed=seed,
-            current_global_best_score=best_score,
+            mdp_spec=mdp_spec,
+            transition_fn=transition_fn,
             device=device,
-            episodes=episodes,
-            collect_per_episode=collect_per_episode,
-            updates_per_episode=updates_per_episode,
-            initial_collect_steps=initial_collect_steps,
-            max_buffer_size=max_buffer_size,
+            training_kwargs=training_kwargs,
             eval_every_episodes=eval_every_episodes,
             n_eval_episodes_during=n_eval_episodes_during,
             n_eval_episodes_final=n_eval_episodes_final,
             max_steps_per_eval_episode=max_steps_per_eval_episode,
+            current_global_best_score=best_score,
             early_stop_after_episodes=early_stop_after_episodes,
             early_stop_margin=early_stop_margin,
         )
@@ -879,7 +678,7 @@ def run_budgeted_sbeed_grid_search(
                 f"  FINAL | "
                 f"return={result['eval_return_mean']:.5f} "
                 f"std={result['eval_return_std']:.5f} "
-                f"success={result.get('eval_success_rate', float('nan')):.3f} "
+                f"success={result['eval_success_rate']:.3f} "
                 f"score={result['score']:.5f} | "
                 f"completed={result['episodes_completed']} | "
                 f"stopped={result['stopped_early']} | "
@@ -892,13 +691,12 @@ def run_budgeted_sbeed_grid_search(
         if result["score"] > best_score:
             best = result
             best_score = result["score"]
-            save_best_artifacts(best, search_dir)
-
+            save_best_artifacts(best, output_dir)
             print("\n  >>> NEW BEST <<<")
             print(
                 f"  best_score={best_score:.5f} | "
                 f"return={best['eval_return_mean']:.5f} | "
-                f"success={best.get('eval_success_rate', float('nan')):.3f} | "
+                f"success={best['eval_success_rate']:.3f} | "
                 f"k={best['rollout_length']} | "
                 f"bs={best['batch_size']} | "
                 f"lambda={best['lambda_entropy']} | "
@@ -908,9 +706,8 @@ def run_budgeted_sbeed_grid_search(
 
         elapsed_hours = (time.time() - global_start) / 3600.0
         avg_minutes = (time.time() - global_start) / 60.0 / len(results)
-        remaining = len(configs) - len(results)
+        remaining = len(selected_configs) - len(results)
         eta_hours = remaining * avg_minutes / 60.0
-
         print(
             f"  progress: elapsed={elapsed_hours:.2f}h | "
             f"avg_run={avg_minutes:.1f}min | "
@@ -921,18 +718,12 @@ def run_budgeted_sbeed_grid_search(
     print("\n========== SEARCH DONE ==========")
     print(f"Total time: {(time.time() - global_start) / 3600.0:.2f} hours")
     print(f"CSV saved to: {csv_path}", flush=True)
-
     return results, best
 
-
-# ============================================================
-# REPORTING
-# ============================================================
 
 def summarize_top_results(results: List[Dict[str, Any]], top_k: int = 10) -> None:
     valid = [r for r in results if r.get("ok", False)]
     valid = sorted(valid, key=score_result, reverse=True)
-
     print(f"\n========== TOP {min(top_k, len(valid))} CONFIGS ==========\n")
 
     for rank, r in enumerate(valid[:top_k], start=1):
@@ -941,7 +732,7 @@ def summarize_top_results(results: List[Dict[str, Any]], top_k: int = 10) -> Non
             f"run={r['run_id']:03d} | "
             f"score={r['score']:.5f} | "
             f"return={r['eval_return_mean']:.5f} +/- {r['eval_return_std']:.5f} | "
-            f"success={r.get('eval_success_rate', float('nan')):.3f} | "
+            f"success={r['eval_success_rate']:.3f} | "
             f"k={r['rollout_length']} | "
             f"bs={r['batch_size']} | "
             f"lambda={r['lambda_entropy']} | "
@@ -951,9 +742,6 @@ def summarize_top_results(results: List[Dict[str, Any]], top_k: int = 10) -> Non
             f"lrPi={r['lr_policy']} | "
             f"damp={r['fisher_damping']} | "
             f"eps={r['epsilon']} | "
-            f"obj={r['last_objective']:.6f} | "
-            f"primal={r['last_primal_mse']:.6f} | "
-            f"dual={r['last_dual_mse']:.6f} | "
             f"stopped={r['stopped_early']}"
         )
 
@@ -964,14 +752,12 @@ def print_best_result(best: Optional[Dict[str, Any]]) -> None:
         return
 
     print("\n========== BEST RESULT ==========\n")
-
-    keys = [
+    for key in [
         "run_id",
         "seed",
         "score",
         "eval_return_mean",
         "eval_return_std",
-        "eval_return_median",
         "eval_done_rate",
         "eval_success_rate",
         "eval_length_mean",
@@ -990,52 +776,55 @@ def print_best_result(best: Optional[Dict[str, Any]]) -> None:
         "last_objective",
         "last_primal_mse",
         "last_dual_mse",
-        "last_theta_grad_norm",
-        "last_beta_grad_norm",
-        "last_policy_grad_norm",
-        "tail_policy_grad_mean",
-        "tail_policy_grad_std",
-        "tail_theta_grad_mean",
-        "tail_theta_grad_std",
         "mean_best_prob",
         "min_best_prob",
         "mean_entropy",
         "seconds",
-    ]
-
-    for k in keys:
-        if k in best:
-            print(f"{k}: {best[k]}")
+    ]:
+        if key in best:
+            print(f"{key}: {best[key]}")
 
     print("\nBest actions:")
     print(best["best_actions"])
-
     print("\nBest action probabilities:")
     print([round(x, 4) for x in best["best_probs"]])
-
     print_policy(best["pi"])
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Run a budgeted MultiLinearSBEED grid search on the stochastic 5x5 gridworld."
+def add_common_args(
+    parser: argparse.ArgumentParser,
+    *,
+    default_output_dir: Path,
+    default_training_kwargs: Dict[str, Any],
+) -> None:
+    parser.add_argument("--output-dir", type=Path, default=default_output_dir)
+    parser.add_argument("--n-runs", type=int, default=None)
+    parser.add_argument("--episodes", type=int, default=default_training_kwargs["episodes"])
+    parser.add_argument(
+        "--collect-per-episode",
+        type=int,
+        default=default_training_kwargs["collect_per_episode"],
     )
-    parser.add_argument("--output-dir", type=Path, default=DEFAULT_SEARCH_DIR)
-    parser.add_argument("--n-runs", type=int, default=N_RUNS)
-    parser.add_argument("--episodes", type=int, default=EPISODES)
-    parser.add_argument("--collect-per-episode", type=int, default=COLLECT_PER_EPISODE)
-    parser.add_argument("--updates-per-episode", type=int, default=UPDATES_PER_EPISODE)
-    parser.add_argument("--initial-collect-steps", type=int, default=INITIAL_COLLECT_STEPS)
-    parser.add_argument("--max-buffer-size", type=int, default=MAX_BUFFER_SIZE)
-    parser.add_argument("--eval-every-episodes", type=int, default=EVAL_EVERY_EPISODES)
-    parser.add_argument("--n-eval-episodes-during", type=int, default=N_EVAL_EPISODES_DURING)
-    parser.add_argument("--n-eval-episodes-final", type=int, default=N_EVAL_EPISODES_FINAL)
-    parser.add_argument("--max-steps-per-eval-episode", type=int, default=MAX_STEPS_PER_EVAL_EPISODE)
-    parser.add_argument("--early-stop-after-episodes", type=int, default=EARLY_STOP_AFTER_EPISODES)
-    parser.add_argument("--early-stop-margin", type=float, default=EARLY_STOP_MARGIN)
+    parser.add_argument(
+        "--updates-per-episode",
+        type=int,
+        default=default_training_kwargs["updates_per_episode"],
+    )
+    parser.add_argument(
+        "--initial-collect-steps",
+        type=int,
+        default=default_training_kwargs["initial_collect_steps"],
+    )
+    parser.add_argument("--max-buffer-size", type=int, default=default_training_kwargs["max_buffer_size"])
+    parser.add_argument("--tau", type=float, default=default_training_kwargs["tau"])
+    parser.add_argument("--eval-every-episodes", type=int, default=100)
+    parser.add_argument("--n-eval-episodes-during", type=int, default=80)
+    parser.add_argument("--n-eval-episodes-final", type=int, default=300)
+    parser.add_argument("--max-steps-per-eval-episode", type=int, default=100)
+    parser.add_argument("--early-stop-after-episodes", type=int, default=250)
+    parser.add_argument("--early-stop-margin", type=float, default=0.20)
     parser.add_argument("--disable-early-stop", action="store_true")
-    parser.add_argument("--base-seed", type=int, default=BASE_SEED)
-    parser.add_argument("--config-seed", type=int, default=CONFIG_SEED)
+    parser.add_argument("--base-seed", type=int, default=777)
     parser.add_argument(
         "--device",
         type=str,
@@ -1047,44 +836,23 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Delete previous result artifacts in output-dir before starting.",
     )
-    return parser.parse_args()
 
 
-def main() -> None:
-    args = parse_args()
-    output_dir = args.output_dir.resolve()
-
-    if args.overwrite and output_dir.exists():
-        for name in ["results.csv", "best_pi.pt", "best_solver_params.pt", "best_summary.json"]:
-            path = output_dir / name
-            if path.exists():
-                path.unlink()
-
-    device = torch.device(args.device)
-    early_stop_margin = None if args.disable_early_stop else args.early_stop_margin
-
-    results, best = run_budgeted_sbeed_grid_search(
-        device=device,
-        n_runs=args.n_runs,
-        base_seed=args.base_seed,
-        config_seed=args.config_seed,
-        search_dir=output_dir,
-        episodes=args.episodes,
-        collect_per_episode=args.collect_per_episode,
-        updates_per_episode=args.updates_per_episode,
-        initial_collect_steps=args.initial_collect_steps,
-        max_buffer_size=args.max_buffer_size,
-        eval_every_episodes=args.eval_every_episodes,
-        n_eval_episodes_during=args.n_eval_episodes_during,
-        n_eval_episodes_final=args.n_eval_episodes_final,
-        max_steps_per_eval_episode=args.max_steps_per_eval_episode,
-        early_stop_after_episodes=args.early_stop_after_episodes,
-        early_stop_margin=early_stop_margin,
-    )
-
-    summarize_top_results(results, top_k=10)
-    print_best_result(best)
+def training_kwargs_from_args(args: argparse.Namespace) -> Dict[str, Any]:
+    return {
+        "episodes": args.episodes,
+        "collect_per_episode": args.collect_per_episode,
+        "updates_per_episode": args.updates_per_episode,
+        "initial_collect_steps": args.initial_collect_steps,
+        "max_buffer_size": args.max_buffer_size,
+        "tau": args.tau,
+    }
 
 
-if __name__ == "__main__":
-    main()
+def clear_outputs(output_dir: Path) -> None:
+    if not output_dir.exists():
+        return
+    for name in ["results.csv", "best_pi.pt", "best_solver_params.pt", "best_summary.json"]:
+        path = output_dir / name
+        if path.exists():
+            path.unlink()

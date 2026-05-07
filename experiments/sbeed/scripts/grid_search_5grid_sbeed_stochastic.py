@@ -8,6 +8,7 @@ import os
 import random
 import sys
 import time
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -796,6 +797,48 @@ def train_one_config_chunked(
 # MAIN GRID SEARCH
 # ============================================================
 
+def run_wrapper_stochastic(
+    i: int,
+    cfg: Dict[str, Any],
+    base_seed: int,
+    completed_seeds: set[int],
+    device: torch.device,
+    episodes: int,
+    collect_per_episode: int,
+    updates_per_episode: int,
+    initial_collect_steps: int,
+    max_buffer_size: int,
+    eval_every_episodes: int,
+    n_eval_episodes_during: int,
+    n_eval_episodes_final: int,
+    max_steps_per_eval_episode: int,
+    early_stop_after_episodes: int,
+    early_stop_margin: Optional[float],
+):
+    seed = base_seed + i
+    if seed in completed_seeds:
+        return None
+
+    return train_one_config_chunked(
+        cfg,
+        run_id=i,
+        seed=seed,
+        current_global_best_score=-float("inf"),
+        device=device,
+        episodes=episodes,
+        collect_per_episode=collect_per_episode,
+        updates_per_episode=updates_per_episode,
+        initial_collect_steps=initial_collect_steps,
+        max_buffer_size=max_buffer_size,
+        eval_every_episodes=eval_every_episodes,
+        n_eval_episodes_during=n_eval_episodes_during,
+        n_eval_episodes_final=n_eval_episodes_final,
+        max_steps_per_eval_episode=max_steps_per_eval_episode,
+        early_stop_after_episodes=early_stop_after_episodes,
+        early_stop_margin=early_stop_margin,
+    )
+
+
 def run_budgeted_sbeed_grid_search(
     *,
     device: torch.device,
@@ -814,11 +857,25 @@ def run_budgeted_sbeed_grid_search(
     max_steps_per_eval_episode: int,
     early_stop_after_episodes: int,
     early_stop_margin: Optional[float],
+    workers: int = 1,
+    resume: bool = False,
 ) -> Tuple[List[Dict[str, Any]], Optional[Dict[str, Any]]]:
     search_dir.mkdir(parents=True, exist_ok=True)
     csv_path = search_dir / "results.csv"
 
     configs = make_budgeted_sbeed_configs(n_runs=n_runs, seed=config_seed)
+
+    # Resume logic
+    completed_seeds = set()
+    if resume and csv_path.exists():
+        try:
+            with csv_path.open("r", newline="") as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    if row.get("ok") == "True":
+                        completed_seeds.add(int(row["seed"]))
+        except Exception as e:
+            print(f"Warning: Could not read {csv_path} for resume: {e}")
 
     results = []
     best = None
@@ -827,96 +884,111 @@ def run_budgeted_sbeed_grid_search(
     print("\n========== SBEED BUDGETED GRID SEARCH ==========")
     print(f"Problem: stochastic 5x5 grid, start={x_0}, goal={goal_grid}, pit={pit_grid}")
     print(f"Runs: {len(configs)}")
+    print(f"Workers: {workers}")
     print(f"Episodes per full run: {episodes}")
     print(f"Device: {device}")
     print(f"Results dir: {search_dir}")
+    if resume:
+        print(f"Resume enabled. Found {len(completed_seeds)} completed runs.")
     print("================================================\n", flush=True)
 
     global_start = time.time()
 
-    for i, cfg in enumerate(configs):
-        seed = base_seed + i
+    if workers > 1:
+        with ProcessPoolExecutor(max_workers=workers) as executor:
+            future_to_idx = {
+                executor.submit(
+                    run_wrapper_stochastic,
+                    i,
+                    cfg,
+                    base_seed,
+                    completed_seeds,
+                    device,
+                    episodes,
+                    collect_per_episode,
+                    updates_per_episode,
+                    initial_collect_steps,
+                    max_buffer_size,
+                    eval_every_episodes,
+                    n_eval_episodes_during,
+                    n_eval_episodes_final,
+                    max_steps_per_eval_episode,
+                    early_stop_after_episodes,
+                    early_stop_margin,
+                ): i
+                for i, cfg in enumerate(configs)
+            }
+            
+            for future in as_completed(future_to_idx):
+                result = future.result()
+                if result is None:
+                    continue
+                
+                results.append(result)
+                append_result_csv(csv_path, result)
+                
+                if result["ok"] and result["score"] > best_score:
+                    best = result
+                    best_score = result["score"]
+                    save_best_artifacts(best, search_dir)
+                    print(f"\n  >>> NEW BEST (Run {result['run_id']}) | score={best_score:.5f} <<<", flush=True)
 
-        print(
-            f"\n[{i + 1:03d}/{len(configs):03d}] "
-            f"seed={seed} | "
-            f"k={cfg['rollout_length']} | "
-            f"bs={cfg['batch_size']} | "
-            f"lambda={cfg['lambda_entropy']} | "
-            f"eta={cfg['eta']} | "
-            f"lrV={cfg['lr_value']} | "
-            f"lrRho={cfg['lr_rho']} | "
-            f"lrPi={cfg['lr_policy']} | "
-            f"damp={cfg['fisher_damping']} | "
-            f"eps={cfg['epsilon']}",
-            flush=True,
-        )
+                elapsed_hours = (time.time() - global_start) / 3600.0
+                avg_minutes = (time.time() - global_start) / 60.0 / len(results)
+                remaining = len(configs) - len(completed_seeds) - len(results)
+                eta_hours = (remaining * avg_minutes / 60.0) / workers if remaining > 0 else 0
+                
+                print(
+                    f"Progress: {len(results)+len(completed_seeds)}/{len(configs)} | "
+                    f"Elapsed: {elapsed_hours:.2f}h | "
+                    f"ETA: {eta_hours:.2f}h | "
+                    f"Last return: {result['eval_return_mean']:.3f}",
+                    flush=True,
+                )
+    else:
+        for i, cfg in enumerate(configs):
+            result = run_wrapper_stochastic(
+                i,
+                cfg,
+                base_seed,
+                completed_seeds,
+                device,
+                episodes,
+                collect_per_episode,
+                updates_per_episode,
+                initial_collect_steps,
+                max_buffer_size,
+                eval_every_episodes,
+                n_eval_episodes_during,
+                n_eval_episodes_final,
+                max_steps_per_eval_episode,
+                early_stop_after_episodes,
+                early_stop_margin,
+            )
+            if result is None:
+                print(f"Skipping seed {base_seed + i}")
+                continue
 
-        result = train_one_config_chunked(
-            cfg,
-            run_id=i,
-            seed=seed,
-            current_global_best_score=best_score,
-            device=device,
-            episodes=episodes,
-            collect_per_episode=collect_per_episode,
-            updates_per_episode=updates_per_episode,
-            initial_collect_steps=initial_collect_steps,
-            max_buffer_size=max_buffer_size,
-            eval_every_episodes=eval_every_episodes,
-            n_eval_episodes_during=n_eval_episodes_during,
-            n_eval_episodes_final=n_eval_episodes_final,
-            max_steps_per_eval_episode=max_steps_per_eval_episode,
-            early_stop_after_episodes=early_stop_after_episodes,
-            early_stop_margin=early_stop_margin,
-        )
+            results.append(result)
+            append_result_csv(csv_path, result)
 
-        results.append(result)
-        append_result_csv(csv_path, result)
+            if result["ok"] and result["score"] > best_score:
+                best = result
+                best_score = result["score"]
+                save_best_artifacts(best, search_dir)
+                print(f"\n  >>> NEW BEST (Run {result['run_id']}) | score={best_score:.5f} <<<", flush=True)
 
-        if result["ok"]:
+            elapsed_hours = (time.time() - global_start) / 3600.0
+            avg_minutes = (time.time() - global_start) / 60.0 / len(results)
+            remaining = len(configs) - len(completed_seeds) - len(results)
+            eta_hours = remaining * avg_minutes / 60.0
             print(
-                f"  FINAL | "
-                f"return={result['eval_return_mean']:.5f} "
-                f"std={result['eval_return_std']:.5f} "
-                f"success={result.get('eval_success_rate', float('nan')):.3f} "
-                f"score={result['score']:.5f} | "
-                f"completed={result['episodes_completed']} | "
-                f"stopped={result['stopped_early']} | "
-                f"time={result['seconds'] / 60.0:.1f} min",
+                f"Progress: {len(results)+len(completed_seeds)}/{len(configs)} | "
+                f"Elapsed: {elapsed_hours:.2f}h | "
+                f"ETA: {eta_hours:.2f}h | "
+                f"Last return: {result['eval_return_mean']:.3f}",
                 flush=True,
             )
-        else:
-            print(f"  FAILED | error={result.get('error')}", flush=True)
-
-        if result["score"] > best_score:
-            best = result
-            best_score = result["score"]
-            save_best_artifacts(best, search_dir)
-
-            print("\n  >>> NEW BEST <<<")
-            print(
-                f"  best_score={best_score:.5f} | "
-                f"return={best['eval_return_mean']:.5f} | "
-                f"success={best.get('eval_success_rate', float('nan')):.3f} | "
-                f"k={best['rollout_length']} | "
-                f"bs={best['batch_size']} | "
-                f"lambda={best['lambda_entropy']} | "
-                f"eta={best['eta']}",
-                flush=True,
-            )
-
-        elapsed_hours = (time.time() - global_start) / 3600.0
-        avg_minutes = (time.time() - global_start) / 60.0 / len(results)
-        remaining = len(configs) - len(results)
-        eta_hours = remaining * avg_minutes / 60.0
-
-        print(
-            f"  progress: elapsed={elapsed_hours:.2f}h | "
-            f"avg_run={avg_minutes:.1f}min | "
-            f"estimated_remaining={eta_hours:.2f}h",
-            flush=True,
-        )
 
     print("\n========== SEARCH DONE ==========")
     print(f"Total time: {(time.time() - global_start) / 3600.0:.2f} hours")
@@ -1036,6 +1108,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--disable-early-stop", action="store_true")
     parser.add_argument("--base-seed", type=int, default=BASE_SEED)
     parser.add_argument("--config-seed", type=int, default=CONFIG_SEED)
+    parser.add_argument("--workers", type=int, default=1, help="Number of parallel workers.")
+    parser.add_argument("--torch-threads", type=int, default=1, help="Threads per worker.")
+    parser.add_argument("--resume", action="store_true", help="Skip already completed seeds.")
     parser.add_argument(
         "--device",
         type=str,
@@ -1060,6 +1135,7 @@ def main() -> None:
             if path.exists():
                 path.unlink()
 
+    torch.set_num_threads(args.torch_threads)
     device = torch.device(args.device)
     early_stop_margin = None if args.disable_early_stop else args.early_stop_margin
 
@@ -1080,6 +1156,8 @@ def main() -> None:
         max_steps_per_eval_episode=args.max_steps_per_eval_episode,
         early_stop_after_episodes=args.early_stop_after_episodes,
         early_stop_margin=early_stop_margin,
+        workers=args.workers,
+        resume=args.resume,
     )
 
     summarize_top_results(results, top_k=10)

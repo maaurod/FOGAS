@@ -77,6 +77,7 @@ def main() -> None:
     if args.overwrite:
         clear_outputs(output_dir)
 
+    torch.set_num_threads(args.torch_threads)
     results, best = run_fixed_rbf_grid_search(
         name="deterministic_rbf",
         configs=DETERMINISTIC_RBF_30_RUNS,
@@ -92,6 +93,8 @@ def main() -> None:
         max_steps_per_eval_episode=args.max_steps_per_eval_episode,
         early_stop_after_episodes=args.early_stop_after_episodes,
         early_stop_margin=None if args.disable_early_stop else args.early_stop_margin,
+        workers=args.workers,
+        resume=args.resume,
     )
     summarize_top_results(results, top_k=10)
     print_best_result(best)

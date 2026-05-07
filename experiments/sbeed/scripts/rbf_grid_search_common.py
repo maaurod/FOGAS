@@ -51,6 +51,12 @@ CSV_FIELDS = [
     "episodes_completed",
     "stopped_early",
     "stop_reason",
+    "episodes",
+    "collect_per_episode",
+    "updates_per_episode",
+    "initial_collect_steps",
+    "max_buffer_size",
+    "tau",
     "rollout_length",
     "lambda_entropy",
     "eta",
@@ -390,23 +396,7 @@ def append_result_csv(path: Path, r: Dict[str, Any]) -> None:
 
 
 def save_best_artifacts(best: Dict[str, Any], output_dir: Path) -> None:
-    if not best.get("ok", False):
-        return
-
-    torch.save(best["pi"], output_dir / "best_pi.pt")
-    if best.get("solver") is not None:
-        torch.save(
-            {
-                "theta": best["solver"].theta.detach().cpu(),
-                "beta": best["solver"].beta.detach().cpu(),
-                "W": best["solver"].W.detach().cpu(),
-                "config": {k: v for k, v in best.items() if k not in {"solver", "pi"}},
-            },
-            output_dir / "best_solver_params.pt",
-        )
-
-    with (output_dir / "best_summary.json").open("w") as f:
-        json.dump(result_for_csv(best), f, indent=2)
+    return
 
 
 def train_one_config(
@@ -431,6 +421,10 @@ def train_one_config(
     random.seed(seed)
     start_time = time.time()
     episode = 0
+    run_training_kwargs = {
+        **training_kwargs,
+        **{k: cfg[k] for k in training_kwargs.keys() if k in cfg},
+    }
 
     solver = MultiLinearSBEED(
         spec=mdp_spec,
@@ -440,9 +434,9 @@ def train_one_config(
         lr_value=cfg["lr_value"],
         lr_rho=cfg["lr_rho"],
         lr_policy=cfg["lr_policy"],
-        tau=training_kwargs["tau"],
+        tau=run_training_kwargs["tau"],
         buffer_mode="fifo",
-        max_buffer_size=training_kwargs["max_buffer_size"],
+        max_buffer_size=run_training_kwargs["max_buffer_size"],
         batch_size=cfg["batch_size"],
         rollout_length=cfg["rollout_length"],
         value_optimizer="adam",
@@ -460,7 +454,7 @@ def train_one_config(
     stop_reason = ""
 
     try:
-        initial_collect_steps = int(training_kwargs["initial_collect_steps"])
+        initial_collect_steps = int(run_training_kwargs["initial_collect_steps"])
         if initial_collect_steps > 0:
             solver.collect_steps(
                 transition_fn=transition_fn,
@@ -472,11 +466,11 @@ def train_one_config(
                 terminal_states=TERMINAL_STATES,
             )
 
-        episodes = int(training_kwargs["episodes"])
+        episodes = int(run_training_kwargs["episodes"])
         for episode in range(1, episodes + 1):
             solver.collect_steps(
                 transition_fn=transition_fn,
-                n_steps=training_kwargs["collect_per_episode"],
+                n_steps=run_training_kwargs["collect_per_episode"],
                 start_state=X0,
                 reward_fn=reward_fn,
                 behavior="policy",
@@ -484,7 +478,7 @@ def train_one_config(
                 terminal_states=TERMINAL_STATES,
             )
 
-            for _ in range(training_kwargs["updates_per_episode"]):
+            for _ in range(run_training_kwargs["updates_per_episode"]):
                 stats = solver.step()
                 solver.loss_history.append(stats)
 
@@ -548,6 +542,7 @@ def train_one_config(
             "stopped_early": stopped_early,
             "stop_reason": stop_reason,
             **cfg,
+            **run_training_kwargs,
             **final_eval_stats,
             "score": None,
             "mean_best_prob": policy_summary["mean_best_prob"],
@@ -588,6 +583,7 @@ def train_one_config(
             "stopped_early": True,
             "stop_reason": "exception",
             **cfg,
+            **run_training_kwargs,
             "error": repr(exc),
             "eval_return_mean": -float("inf"),
             "eval_return_std": float("inf"),
@@ -655,7 +651,11 @@ def run_fixed_rbf_grid_search(
     resume: bool = False,
 ) -> Tuple[List[Dict[str, Any]], Optional[Dict[str, Any]]]:
     output_dir.mkdir(parents=True, exist_ok=True)
-    csv_path = output_dir / "results.csv"
+    csv_names = {
+        "deterministic_rbf": "sbeed_rbf_deterministic_grid_search.csv",
+        "stochastic_rbf": "sbeed_rbf_stochastic_grid_search.csv",
+    }
+    csv_path = output_dir / csv_names.get(name, "results.csv")
     mdp_spec = build_rbf_mdp_spec()
     transition_fn = next_state_stochastic if stochastic else next_state_deterministic
     selected_configs = configs if n_runs is None else configs[:n_runs]
@@ -884,7 +884,7 @@ def add_common_args(
     parser.add_argument("--early-stop-after-episodes", type=int, default=250)
     parser.add_argument("--early-stop-margin", type=float, default=0.20)
     parser.add_argument("--disable-early-stop", action="store_true")
-    parser.add_argument("--base-seed", type=int, default=777)
+    parser.add_argument("--base-seed", type=int, default=42)
     parser.add_argument("--workers", type=int, default=1, help="Number of parallel workers.")
     parser.add_argument("--torch-threads", type=int, default=1, help="Threads per worker.")
     parser.add_argument("--resume", action="store_true", help="Skip already completed seeds.")
@@ -915,7 +915,11 @@ def training_kwargs_from_args(args: argparse.Namespace) -> Dict[str, Any]:
 def clear_outputs(output_dir: Path) -> None:
     if not output_dir.exists():
         return
-    for name in ["results.csv", "best_pi.pt", "best_solver_params.pt", "best_summary.json"]:
+    for name in [
+        "results.csv",
+        "sbeed_rbf_deterministic_grid_search.csv",
+        "sbeed_rbf_stochastic_grid_search.csv",
+    ]:
         path = output_dir / name
         if path.exists():
             path.unlink()

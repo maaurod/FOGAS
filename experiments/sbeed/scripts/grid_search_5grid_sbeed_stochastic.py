@@ -34,9 +34,10 @@ from rl_methods.sbeed import (  # noqa: E402
 # DEFAULT SEARCH SETTINGS
 # ============================================================
 
-DEFAULT_SEARCH_DIR = REPO_ROOT / "sbeed_grid_search_results"
+DEFAULT_SEARCH_DIR = REPO_ROOT / "data/results/sbeed"
+RESULTS_CSV_NAME = "sbeed_tabular_stochastic_grid_search.csv"
 
-N_RUNS = 40
+N_RUNS = 46
 
 EPISODES = 500
 COLLECT_PER_EPISODE = 20
@@ -53,7 +54,7 @@ MAX_STEPS_PER_EVAL_EPISODE = 100
 EARLY_STOP_AFTER_EPISODES = 250
 EARLY_STOP_MARGIN = 0.20
 
-BASE_SEED = 777
+BASE_SEED = 42
 CONFIG_SEED = 123
 
 
@@ -458,6 +459,83 @@ def make_budgeted_sbeed_configs(*, n_runs: int = 40, seed: int = 123) -> List[Di
             configs.append(cfg)
             current_k_counts[k] += 1
 
+    longer_budget_configs = [
+        {
+            "rollout_length": 2,
+            "lambda_entropy": 0.05,
+            "eta": 0.2,
+            "lr_value": 3e-3,
+            "lr_rho": 3e-3,
+            "lr_policy": 3e-3,
+            "fisher_damping": 1e-3,
+            "batch_size": 1024,
+            "epsilon": 0.20,
+        },
+        {
+            "rollout_length": 2,
+            "lambda_entropy": 0.05,
+            "eta": 0.1,
+            "lr_value": 1e-2,
+            "lr_rho": 1e-2,
+            "lr_policy": 3e-3,
+            "fisher_damping": 1e-3,
+            "batch_size": 512,
+            "epsilon": 0.30,
+        },
+        {
+            "rollout_length": 1,
+            "lambda_entropy": 0.01,
+            "eta": 0.1,
+            "lr_value": 3e-3,
+            "lr_rho": 1e-2,
+            "lr_policy": 1e-2,
+            "fisher_damping": 1e-4,
+            "batch_size": 128,
+            "epsilon": 0.40,
+        },
+        {
+            "rollout_length": 3,
+            "lambda_entropy": 0.05,
+            "eta": 0.05,
+            "lr_value": 1e-2,
+            "lr_rho": 3e-3,
+            "lr_policy": 3e-3,
+            "fisher_damping": 1e-2,
+            "batch_size": 1024,
+            "epsilon": 0.30,
+        },
+        {
+            "rollout_length": 2,
+            "lambda_entropy": 0.02,
+            "eta": 0.2,
+            "lr_value": 3e-3,
+            "lr_rho": 1e-2,
+            "lr_policy": 1e-3,
+            "fisher_damping": 1e-2,
+            "batch_size": 1024,
+            "epsilon": 0.30,
+        },
+        {
+            "rollout_length": 3,
+            "lambda_entropy": 0.02,
+            "eta": 0.1,
+            "lr_value": 3e-3,
+            "lr_rho": 3e-3,
+            "lr_policy": 1e-3,
+            "fisher_damping": 1e-2,
+            "batch_size": 1024,
+            "epsilon": 0.40,
+        },
+    ]
+    for cfg in longer_budget_configs:
+        cfg.update(
+            episodes=800,
+            collect_per_episode=25,
+            updates_per_episode=15,
+            initial_collect_steps=2000,
+        )
+    configs.extend(longer_budget_configs)
+
     rng.shuffle(configs)
     return configs[:n_runs]
 
@@ -474,6 +552,11 @@ CSV_FIELDS = [
     "episodes_completed",
     "stopped_early",
     "stop_reason",
+    "episodes",
+    "collect_per_episode",
+    "updates_per_episode",
+    "initial_collect_steps",
+    "max_buffer_size",
     "rollout_length",
     "lambda_entropy",
     "eta",
@@ -565,24 +648,7 @@ def append_result_csv(path: Path, r: Dict[str, Any]) -> None:
 
 
 def save_best_artifacts(best: Dict[str, Any], search_dir: Path) -> None:
-    if not best.get("ok", False):
-        return
-
-    torch.save(best["pi"], search_dir / "best_pi.pt")
-
-    if best.get("solver") is not None:
-        torch.save(
-            {
-                "theta": best["solver"].theta.detach().cpu(),
-                "beta": best["solver"].beta.detach().cpu(),
-                "W": best["solver"].W.detach().cpu(),
-                "config": {k: v for k, v in best.items() if k not in {"solver", "pi"}},
-            },
-            search_dir / "best_solver_params.pt",
-        )
-
-    with (search_dir / "best_summary.json").open("w") as f:
-        json.dump(result_for_csv(best), f, indent=2)
+    return
 
 
 # ============================================================
@@ -613,6 +679,11 @@ def train_one_config_chunked(
     random.seed(seed)
 
     start_time = time.time()
+    run_episodes = int(cfg.get("episodes", episodes))
+    run_collect_per_episode = int(cfg.get("collect_per_episode", collect_per_episode))
+    run_updates_per_episode = int(cfg.get("updates_per_episode", updates_per_episode))
+    run_initial_collect_steps = int(cfg.get("initial_collect_steps", initial_collect_steps))
+    run_max_buffer_size = int(cfg.get("max_buffer_size", max_buffer_size))
 
     solver = MultiLinearSBEED(
         spec=mdp_spec,
@@ -624,7 +695,7 @@ def train_one_config_chunked(
         lr_rho=cfg["lr_rho"],
         tau=100000.0,
         buffer_mode="fifo",
-        max_buffer_size=max_buffer_size,
+        max_buffer_size=run_max_buffer_size,
         batch_size=cfg["batch_size"],
         rollout_length=cfg["rollout_length"],
         value_optimizer="adam",
@@ -643,10 +714,10 @@ def train_one_config_chunked(
     episode = 0
 
     try:
-        if initial_collect_steps > 0:
+        if run_initial_collect_steps > 0:
             solver.collect_steps(
                 transition_fn=next_state,
-                n_steps=initial_collect_steps,
+                n_steps=run_initial_collect_steps,
                 start_state=x_0,
                 reward_fn=reward_fn,
                 behavior="uniform",
@@ -654,10 +725,10 @@ def train_one_config_chunked(
                 terminal_states=terminal_states,
             )
 
-        for episode in range(1, episodes + 1):
+        for episode in range(1, run_episodes + 1):
             solver.collect_steps(
                 transition_fn=next_state,
-                n_steps=collect_per_episode,
+                n_steps=run_collect_per_episode,
                 start_state=x_0,
                 reward_fn=reward_fn,
                 behavior="policy",
@@ -665,11 +736,11 @@ def train_one_config_chunked(
                 terminal_states=terminal_states,
             )
 
-            for _ in range(updates_per_episode):
+            for _ in range(run_updates_per_episode):
                 stats = solver.step()
                 solver.loss_history.append(stats)
 
-            if episode % eval_every_episodes == 0 or episode == episodes:
+            if episode % eval_every_episodes == 0 or episode == run_episodes:
                 eval_stats = evaluate_policy(
                     solver,
                     transition_fn=next_state,
@@ -742,6 +813,11 @@ def train_one_config_chunked(
             "stopped_early": stopped_early,
             "stop_reason": stop_reason,
             **cfg,
+            "episodes": run_episodes,
+            "collect_per_episode": run_collect_per_episode,
+            "updates_per_episode": run_updates_per_episode,
+            "initial_collect_steps": run_initial_collect_steps,
+            "max_buffer_size": run_max_buffer_size,
             **final_eval_stats,
             "score": None,
             "mean_best_prob": policy_summary["mean_best_prob"],
@@ -782,6 +858,11 @@ def train_one_config_chunked(
             "stopped_early": True,
             "stop_reason": "exception",
             **cfg,
+            "episodes": run_episodes,
+            "collect_per_episode": run_collect_per_episode,
+            "updates_per_episode": run_updates_per_episode,
+            "initial_collect_steps": run_initial_collect_steps,
+            "max_buffer_size": run_max_buffer_size,
             "error": repr(e),
             "eval_return_mean": -float("inf"),
             "eval_return_std": float("inf"),
@@ -861,7 +942,7 @@ def run_budgeted_sbeed_grid_search(
     resume: bool = False,
 ) -> Tuple[List[Dict[str, Any]], Optional[Dict[str, Any]]]:
     search_dir.mkdir(parents=True, exist_ok=True)
-    csv_path = search_dir / "results.csv"
+    csv_path = search_dir / RESULTS_CSV_NAME
 
     configs = make_budgeted_sbeed_configs(n_runs=n_runs, seed=config_seed)
 
@@ -1130,7 +1211,7 @@ def main() -> None:
     output_dir = args.output_dir.resolve()
 
     if args.overwrite and output_dir.exists():
-        for name in ["results.csv", "best_pi.pt", "best_solver_params.pt", "best_summary.json"]:
+        for name in [RESULTS_CSV_NAME]:
             path = output_dir / name
             if path.exists():
                 path.unlink()

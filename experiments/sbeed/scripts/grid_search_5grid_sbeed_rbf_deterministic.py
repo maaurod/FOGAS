@@ -47,6 +47,9 @@ DETERMINISTIC_RBF_30_RUNS = [
     dict(lambda_entropy=0.01, eta=0.10, rollout_length=2, lr_value=3e-3, lr_rho=1e-3, lr_policy=3e-3, batch_size=512, fisher_damping=1e-2, epsilon=0.30),
     dict(lambda_entropy=0.05, eta=0.10, rollout_length=3, lr_value=1e-3, lr_rho=3e-4, lr_policy=1e-3, batch_size=512, fisher_damping=1e-2, epsilon=0.40),
     dict(lambda_entropy=0.02, eta=0.03, rollout_length=1, lr_value=3e-3, lr_rho=1e-3, lr_policy=3e-3, batch_size=256, fisher_damping=1e-3, epsilon=0.25),
+    dict(lambda_entropy=0.05, eta=0.0, rollout_length=2, lr_value=1e-3, lr_rho=1e-3, lr_policy=1e-3, batch_size=512, fisher_damping=1e-3, epsilon=0.30, episodes=1800, collect_per_episode=25, updates_per_episode=15, initial_collect_steps=2000),
+    dict(lambda_entropy=0.05, eta=0.01, rollout_length=2, lr_value=1e-3, lr_rho=1e-3, lr_policy=1e-3, batch_size=512, fisher_damping=1e-3, epsilon=0.25, episodes=1800, collect_per_episode=25, updates_per_episode=15, initial_collect_steps=2000),
+    dict(lambda_entropy=0.05, eta=0.05, rollout_length=3, lr_value=1e-3, lr_rho=1e-3, lr_policy=1e-3, batch_size=512, fisher_damping=1e-2, epsilon=0.30, episodes=1800, collect_per_episode=25, updates_per_episode=15, initial_collect_steps=2000),
 ]
 
 DETERMINISTIC_RBF_TRAINING_KWARGS = dict(
@@ -61,11 +64,11 @@ DETERMINISTIC_RBF_TRAINING_KWARGS = dict(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run 30 fixed MultiLinearSBEED RBF configs on the deterministic 5x5 gridworld."
+        description="Run fixed MultiLinearSBEED RBF configs on the deterministic 5x5 gridworld."
     )
     add_common_args(
         parser,
-        default_output_dir=REPO_ROOT / "sbeed_rbf_deterministic_grid_search_results",
+        default_output_dir=REPO_ROOT / "data/results/sbeed",
         default_training_kwargs=DETERMINISTIC_RBF_TRAINING_KWARGS,
     )
     return parser.parse_args()

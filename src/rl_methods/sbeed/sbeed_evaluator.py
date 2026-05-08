@@ -96,11 +96,11 @@ class SBEEDEvaluator:
                 Optional labels used by pretty printers.
         """
         self.solver = solver
-        self.spec = solver.spec
+        self.spec = getattr(solver, "spec", None)
         self.n_states = int(solver.n_states)
         self.n_actions = int(solver.n_actions)
         self.gamma = float(solver.gamma)
-        self.x0 = self.spec.x0
+        self.x0 = getattr(self.spec, "x0", None)
         self.terminal_states = set() if terminal_states is None else {int(s) for s in terminal_states}
 
         self.P = None
@@ -324,7 +324,13 @@ class SBEEDEvaluator:
         current theta, usually zeros.
         """
         with torch.no_grad():
-            value = self.solver.PHI_S @ self.solver.theta
+            if hasattr(self.solver, "PHI_S") and hasattr(self.solver, "theta"):
+                value = self.solver.PHI_S @ self.solver.theta
+            else:
+                value = torch.stack([
+                    torch.as_tensor(self.solver.value(s)).reshape(())
+                    for s in range(self.n_states)
+                ])
         return value.detach().cpu().numpy()
 
     def learned_policy(self) -> np.ndarray:
@@ -521,7 +527,7 @@ class SBEEDEvaluator:
                 Policy matrix. If omitted, uses the learned SBEED policy.
             start_distribution:
                 Optional initial state distribution with shape [S]. If omitted,
-                uses solver.spec.x0, mdp.x0, or state 0.
+                uses solver.spec.x0 when available, mdp.x0, or state 0.
             normalized:
                 If False, returns E[V(s0)]. If True, returns
                 (1 - gamma) * E[V(s0)], matching discounted occupancy scaling.

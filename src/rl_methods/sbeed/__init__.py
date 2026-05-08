@@ -1,11 +1,25 @@
 """SBEED algorithm exports."""
 
 from .features import (
+    LinearRhoParam,
+    LinearValueParam,
+    IdentityHead,
+    NeuralPolicyParam,
+    NeuralRhoParam,
+    NeuralValueParam,
+    PolicyParam,
     RBFStateActionFeatures,
     RBFStateFeatures,
+    RhoParam,
+    SoftmaxLinearPolicyParam,
+    StateActionMLPModule,
+    StateMLPPolicyModule,
+    StateMLPValueModule,
     TabularStateActionFeatures,
     TabularStateFeatures,
+    ValueParam,
 )
+from .general_sbeed import SBEED
 from .sbeed_dataset import SBEEDDataset
 from .sbeed_evaluator import SBEEDEvaluator
 from .sbeed_base import SBEEDSolverProtocol
@@ -17,6 +31,7 @@ from .sbeed_solver_sgd_rho import SBEEDSolverSGDRho
 from .sbeed_spec import DiscreteMDP, DiscreteMDPSpec
 
 __all__ = [
+    "SBEED",
     "SBEEDSolver",
     "SBEEDSolverSGDRho",
     "SBEEDOptimizers",
@@ -27,6 +42,19 @@ __all__ = [
     "SBEEDDataset",
     "DiscreteMDPSpec",
     "DiscreteMDP",
+    "ValueParam",
+    "RhoParam",
+    "PolicyParam",
+    "LinearValueParam",
+    "LinearRhoParam",
+    "SoftmaxLinearPolicyParam",
+    "IdentityHead",
+    "StateMLPValueModule",
+    "StateActionMLPModule",
+    "StateMLPPolicyModule",
+    "NeuralValueParam",
+    "NeuralRhoParam",
+    "NeuralPolicyParam",
     "RBFStateFeatures",
     "RBFStateActionFeatures",
     "TabularStateFeatures",

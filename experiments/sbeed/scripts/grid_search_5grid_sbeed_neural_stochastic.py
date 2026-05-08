@@ -25,7 +25,7 @@ from rbf_grid_search_common import (
     X0,
     evaluate_policy,
     extract_policy_summary,
-    next_state_deterministic,
+    next_state_stochastic,
     print_best_result,
     result_for_csv,
     reward_fn,
@@ -47,20 +47,20 @@ from rl_methods.sbeed.features import (  # noqa: E402
 from rl_methods.sbeed.solvers import DiscreteSBEED  # noqa: E402
 
 
-def make_grid_150() -> List[Dict[str, Any]]:
-    grid_150 = []
-    for episodes in [400, 800]:
-        for batch_size in [512, 1024]:
-            for tau in [1000.0, 10000.0, 100000.0]:
-                for lambda_entropy in [0.005, 0.01, 0.02, 0.05, 0.1]:
+def make_grid_150_stochastic() -> List[Dict[str, Any]]:
+    grid_150_stochastic = []
+    for episodes in [800, 1200]:
+        for batch_size in [512, 1024, 2048]:
+            for tau in [10000.0, 100000.0]:
+                for lambda_entropy in [0.01, 0.02, 0.05, 0.1, 0.2]:
                     for lr_policy, fisher_damping in [
+                        (3e-4, 1e-1),
                         (1e-3, 1e-1),
                         (1e-3, 3e-1),
-                        (3e-3, 1e-1),
                         (3e-3, 3e-1),
-                        (1e-2, 3e-1),
+                        (1e-2, 1.0),
                     ]:
-                        grid_150.append(
+                        grid_150_stochastic.append(
                             dict(
                                 episodes=episodes,
                                 batch_size=batch_size,
@@ -72,11 +72,19 @@ def make_grid_150() -> List[Dict[str, Any]]:
                                 fisher_damping=fisher_damping,
                             )
                         )
-    assert len(grid_150) == 150
-    return grid_150
+
+    assert len(grid_150_stochastic) == 300
+    grid_150_stochastic = [
+        cfg
+        for cfg in grid_150_stochastic
+        if not (cfg["episodes"] == 800 and cfg["batch_size"] == 512)
+    ]
+    grid_150_stochastic = grid_150_stochastic[:150]
+    assert len(grid_150_stochastic) == 150
+    return grid_150_stochastic
 
 
-CONFIGS_TO_TRY = make_grid_150()
+CONFIGS_TO_TRY = make_grid_150_stochastic()
 SEED = 42
 REQUESTED_DEVICE = "auto"
 
@@ -287,7 +295,7 @@ def greedy_rollout(
 def notebook_replay_code(result: Dict[str, Any], *, transition_fn_name: str) -> str:
     device = result["device"]
     seed = int(result["seed"])
-    return f'''# Replays the best config produced by grid_search_5grid_sbeed_neural_deterministic.py.
+    return f'''# Replays the best config produced by grid_search_5grid_sbeed_neural_stochastic.py.
 # Run this in a fresh notebook kernel after defining the 5x5 grid, `next_state`,
 # `reward_fn`, and importing the SBEED neural classes.
 import random
@@ -436,7 +444,7 @@ def train_one_neural_config(
         initial_collect_steps = int(full_cfg["initial_collect_steps"])
         if initial_collect_steps > 0:
             solver.collect_steps(
-                transition_fn=next_state_deterministic,
+                transition_fn=next_state_stochastic,
                 n_steps=initial_collect_steps,
                 start_state=X0,
                 reward_fn=reward_fn,
@@ -451,7 +459,7 @@ def train_one_neural_config(
 
         for episode in range(1, episodes + 1):
             solver.collect_steps(
-                transition_fn=next_state_deterministic,
+                transition_fn=next_state_stochastic,
                 n_steps=full_cfg["collect_per_episode"],
                 start_state=X0,
                 reward_fn=reward_fn,
@@ -466,7 +474,7 @@ def train_one_neural_config(
             if episode % eval_every_episodes == 0 or episode == episodes:
                 eval_stats = evaluate_policy(
                     solver,
-                    next_state_deterministic,
+                    next_state_stochastic,
                     n_eval_episodes=n_eval_episodes_during,
                     max_steps_per_episode=max_steps_per_eval_episode,
                     seed=seed + 10_000 + episode,
@@ -493,7 +501,7 @@ def train_one_neural_config(
 
         final_eval_stats = evaluate_policy(
             solver,
-            next_state_deterministic,
+            next_state_stochastic,
             n_eval_episodes=n_eval_episodes_final,
             max_steps_per_episode=max_steps_per_eval_episode,
             seed=seed + 999_999,
@@ -501,7 +509,7 @@ def train_one_neural_config(
         policy_summary = extract_policy_summary(solver)
         greedy_stats = greedy_rollout(
             solver,
-            next_state_deterministic,
+            next_state_stochastic,
             max_steps=max_steps_per_eval_episode,
             seed=seed + 888_888,
         )
@@ -521,7 +529,7 @@ def train_one_neural_config(
             "device": str(device),
             "requested_device": requested_device,
             "torch_threads": torch_threads,
-            "transition_name": "deterministic",
+            "transition_name": "stochastic",
             "network_init_seed": seed,
             "seconds": time.time() - start_time,
             "episodes_completed": episode,
@@ -570,7 +578,7 @@ def train_one_neural_config(
             "device": str(device),
             "requested_device": requested_device,
             "torch_threads": torch_threads,
-            "transition_name": "deterministic",
+            "transition_name": "stochastic",
             "network_init_seed": seed,
             "seconds": time.time() - start_time,
             "episodes_completed": episode,
@@ -630,7 +638,7 @@ def run_neural_grid_search(
     resume: bool,
 ) -> Tuple[List[Dict[str, Any]], Optional[Dict[str, Any]]]:
     output_dir.mkdir(parents=True, exist_ok=True)
-    csv_path = output_dir / "sbeed_neural_deterministic_grid_search.csv"
+    csv_path = output_dir / "sbeed_neural_stochastic_grid_search.csv"
     jobs = make_jobs(configs)
     completed_config_ids = completed_config_ids_from_csv(csv_path) if resume else set()
     jobs = [job for job in jobs if job[1] not in completed_config_ids]
@@ -644,8 +652,8 @@ def run_neural_grid_search(
     global_start = time.time()
 
     print("\n========== SBEED NEURAL FIXED GRID SEARCH ==========")
-    print("Name: deterministic_neural")
-    print("Problem: deterministic 5x5 grid")
+    print("Name: stochastic_neural")
+    print("Problem: stochastic 5x5 grid")
     print(f"Configs: {len(configs)}")
     print(f"Seed: {SEED}")
     print(f"Submitted jobs: {len(jobs)}")
@@ -696,7 +704,7 @@ def run_neural_grid_search(
                     replay_path = save_best_notebook_replay(
                         best,
                         output_dir,
-                        experiment_name="sbeed_neural_deterministic",
+                        experiment_name="sbeed_neural_stochastic",
                         transition_fn_name="next_state",
                     )
                     print(f"\n  >>> NEW BEST (Run {result['run_id']}) | score={best_score:.5f} <<<", flush=True)
@@ -739,7 +747,7 @@ def run_neural_grid_search(
                 replay_path = save_best_notebook_replay(
                     best,
                     output_dir,
-                    experiment_name="sbeed_neural_deterministic",
+                    experiment_name="sbeed_neural_stochastic",
                     transition_fn_name="next_state",
                 )
                 print(f"\n  >>> NEW BEST (Run {result['run_id']}) | score={best_score:.5f} <<<", flush=True)
@@ -763,7 +771,7 @@ def run_neural_grid_search(
     replay_path = save_best_notebook_replay(
         best,
         output_dir,
-        experiment_name="sbeed_neural_deterministic",
+        experiment_name="sbeed_neural_stochastic",
         transition_fn_name="next_state",
     )
     if replay_path is not None:
@@ -772,14 +780,14 @@ def run_neural_grid_search(
 
 
 def clear_neural_outputs(output_dir: Path) -> None:
-    path = output_dir / "sbeed_neural_deterministic_grid_search.csv"
+    path = output_dir / "sbeed_neural_stochastic_grid_search.csv"
     if path.exists():
         path.unlink()
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run fixed SBEED neural configs on the deterministic 5x5 gridworld."
+        description="Run fixed SBEED neural configs on the stochastic 5x5 gridworld."
     )
     parser.add_argument("--output-dir", type=Path, default=REPO_ROOT / "data/results/sbeed")
     parser.add_argument("--episodes", type=int, default=NEURAL_TRAINING_KWARGS["episodes"])

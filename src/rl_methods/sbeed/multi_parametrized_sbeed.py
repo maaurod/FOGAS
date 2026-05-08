@@ -259,6 +259,12 @@ class MultiParametrizedSBEED:
         logits = self.POLICY_PHI_S @ W.T
         return self._row_softmax(logits)
 
+    def _policy_probs_for_state(self, state: int) -> torch.Tensor:
+        logits = self.POLICY_PHI_S[int(state)] @ self.W.T
+        z = logits - logits.max()
+        exp_z = torch.exp(z)
+        return exp_z / exp_z.sum()
+
     def _batch_indices(self) -> torch.Tensor:
         if self.n == 0:
             raise ValueError("Replay buffer D is empty. Collect data before calling step().")
@@ -695,7 +701,12 @@ class MultiParametrizedSBEED:
         if self.rng.random() < epsilon:
             return int(self.rng.integers(self.n_actions))
 
-        probs = self.get_policy_matrix()[state].detach().cpu().numpy()
+        with torch.no_grad():
+            probs = self._policy_probs_for_state(state)
+        if self.device.type == "cuda":
+            return int(torch.multinomial(probs, num_samples=1).item())
+
+        probs = probs.detach().cpu().numpy()
         return int(self.rng.choice(self.n_actions, p=probs))
 
     @staticmethod
@@ -755,6 +766,12 @@ class MultiParametrizedSBEED:
         else:
             state = int(start_state)
 
+        states = []
+        actions = []
+        rewards = []
+        next_states = []
+        dones = []
+
         for _ in range(n_steps):
             if state in terminal_states:
                 state = int(reset_state_fn()) if reset_state_fn is not None else (
@@ -769,14 +786,11 @@ class MultiParametrizedSBEED:
                 reward = float(reward_fn(state, action, next_state))
             done = bool(done or next_state in terminal_states)
 
-            self.dataset.append_fifo(
-                state,
-                action,
-                reward,
-                next_state,
-                capacity=self.max_buffer_size,
-                done=done,
-            )
+            states.append(state)
+            actions.append(action)
+            rewards.append(reward)
+            next_states.append(next_state)
+            dones.append(done)
 
             if done:
                 state = int(reset_state_fn()) if reset_state_fn is not None else (
@@ -785,6 +799,14 @@ class MultiParametrizedSBEED:
             else:
                 state = int(next_state)
 
+        self.dataset.append_many(
+            states,
+            actions,
+            rewards,
+            next_states,
+            dones,
+            capacity=self.max_buffer_size,
+        )
         self.dataset.validate(self.n_states, self.n_actions)
         self._refresh_dataset_features()
         return self.dataset.n

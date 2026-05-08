@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Union
+from typing import Any, Dict, Optional, Sequence, Union
 
 import torch
 
@@ -61,13 +61,13 @@ class SBEEDDataset:
         next_state: int,
         done: bool = False,
     ) -> None:
-        device = self.X.device
-        self.X = torch.cat([self.X, torch.tensor([state], dtype=torch.int64, device=device)])
-        self.A = torch.cat([self.A, torch.tensor([action], dtype=torch.int64, device=device)])
-        self.R = torch.cat([self.R, torch.tensor([reward], dtype=torch.float64, device=device)])
-        self.X_next = torch.cat([self.X_next, torch.tensor([next_state], dtype=torch.int64, device=device)])
-        self.D = torch.cat([self.D, torch.tensor([done], dtype=torch.bool, device=device)])
-        self.n = int(self.X.numel())
+        self.append_many(
+            [state],
+            [action],
+            [reward],
+            [next_state],
+            [done],
+        )
 
     def append_fifo(
         self,
@@ -82,14 +82,54 @@ class SBEEDDataset:
         if capacity <= 0:
             raise ValueError("capacity must be positive")
 
-        self.append(state, action, reward, next_state, done=done)
-        if self.n > capacity:
+        self.append_many(
+            [state],
+            [action],
+            [reward],
+            [next_state],
+            [done],
+            capacity=capacity,
+        )
+
+    def append_many(
+        self,
+        states: Sequence[int],
+        actions: Sequence[int],
+        rewards: Sequence[float],
+        next_states: Sequence[int],
+        dones: Optional[Sequence[bool]] = None,
+        capacity: Optional[int] = None,
+    ) -> None:
+        batch_n = len(states)
+        if dones is None:
+            dones = [False] * batch_n
+        lengths = {batch_n, len(actions), len(rewards), len(next_states), len(dones)}
+        if len(lengths) != 1:
+            raise ValueError("states, actions, rewards, next_states, and dones must have the same length")
+        if batch_n == 0:
+            return
+        if capacity is not None:
+            capacity = int(capacity)
+            if capacity <= 0:
+                raise ValueError("capacity must be positive")
+
+        device = self.X.device
+        self.X = torch.cat([self.X, torch.as_tensor(states, dtype=torch.int64, device=device).reshape(-1)])
+        self.A = torch.cat([self.A, torch.as_tensor(actions, dtype=torch.int64, device=device).reshape(-1)])
+        self.R = torch.cat([self.R, torch.as_tensor(rewards, dtype=torch.float64, device=device).reshape(-1)])
+        self.X_next = torch.cat([
+            self.X_next,
+            torch.as_tensor(next_states, dtype=torch.int64, device=device).reshape(-1),
+        ])
+        self.D = torch.cat([self.D, torch.as_tensor(dones, dtype=torch.bool, device=device).reshape(-1)])
+
+        if capacity is not None and self.X.numel() > capacity:
             self.X = self.X[-capacity:]
             self.A = self.A[-capacity:]
             self.R = self.R[-capacity:]
             self.X_next = self.X_next[-capacity:]
             self.D = self.D[-capacity:]
-            self.n = int(self.X.numel())
+        self.n = int(self.X.numel())
 
     def extend(self, other: "SBEEDDataset") -> None:
         other = other.to(self.X.device)

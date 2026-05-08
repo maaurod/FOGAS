@@ -1,6 +1,13 @@
 """SBEED algorithm exports."""
 
 from .features import (
+    ContinuousGaussianPolicyParam,
+    ContinuousNeuralRhoParam,
+    ContinuousNeuralValueParam,
+    ContinuousRhoParam,
+    ContinuousStateActionMLPModule,
+    ContinuousStateMLPValueModule,
+    ContinuousValueParam,
     LinearRhoParam,
     LinearValueParam,
     IdentityHead,
@@ -18,20 +25,27 @@ from .features import (
     TabularStateActionFeatures,
     TabularStateFeatures,
     ValueParam,
+    RFFGaussianPolicyParam,
 )
-from .general_sbeed import SBEED
-from .sbeed_dataset import SBEEDDataset
+from .datasets import ContinuousSBEEDDataset, DiscreteSBEEDDataset, SBEEDDataset
 from .sbeed_evaluator import SBEEDEvaluator
 from .sbeed_base import SBEEDSolverProtocol
-from .multi_linear_sbeed import MultiLinearSBEED
-from .multi_parametrized_sbeed import MultiParametrizedSBEED
-from .sbeed_optimizers import SBEEDOptimizers
-from .sbeed_solver import SBEEDSolver
-from .sbeed_solver_sgd_rho import SBEEDSolverSGDRho
+from .building_versions import (
+    MultiLinearSBEED,
+    MultiParametrizedSBEED,
+    SBEEDOptimizers,
+    SBEEDSolver,
+    SBEEDSolverSGDRho,
+)
 from .sbeed_spec import DiscreteMDP, DiscreteMDPSpec
+from .solvers import ContinuousSBEED, DiscreteSBEED, SBEED
 
 __all__ = [
     "SBEED",
+    "DiscreteSBEED",
+    "DiscreteSBEEDDataset",
+    "ContinuousSBEED",
+    "ContinuousSBEEDDataset",
     "SBEEDSolver",
     "SBEEDSolverSGDRho",
     "SBEEDOptimizers",
@@ -45,16 +59,24 @@ __all__ = [
     "ValueParam",
     "RhoParam",
     "PolicyParam",
+    "ContinuousValueParam",
+    "ContinuousRhoParam",
+    "ContinuousGaussianPolicyParam",
     "LinearValueParam",
     "LinearRhoParam",
     "SoftmaxLinearPolicyParam",
+    "RFFGaussianPolicyParam",
     "IdentityHead",
     "StateMLPValueModule",
     "StateActionMLPModule",
     "StateMLPPolicyModule",
+    "ContinuousStateMLPValueModule",
+    "ContinuousStateActionMLPModule",
     "NeuralValueParam",
     "NeuralRhoParam",
     "NeuralPolicyParam",
+    "ContinuousNeuralValueParam",
+    "ContinuousNeuralRhoParam",
     "RBFStateFeatures",
     "RBFStateActionFeatures",
     "TabularStateFeatures",

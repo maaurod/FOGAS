@@ -7,8 +7,8 @@ import numpy as np
 import torch
 from tqdm import trange
 
-from .sbeed_dataset import SBEEDDataset
-from .sbeed_spec import DiscreteMDPSpec
+from ..datasets.discrete_sbeed_dataset import DiscreteSBEEDDataset as SBEEDDataset
+from ..sbeed_spec import DiscreteMDPSpec
 
 
 class SBEEDSolver:
@@ -482,10 +482,9 @@ class SBEEDSolver:
                     reward,
                     next_state,
                     capacity=self.max_buffer_size,
-                    done=done,
                 )
             else:
-                self.dataset.append(state, action, reward, next_state, done=done)
+                self.dataset.append(state, action, reward, next_state)
 
             if done:
                 state = int(reset_state_fn()) if reset_state_fn is not None else (

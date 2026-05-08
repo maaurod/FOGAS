@@ -22,12 +22,12 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
 
-from rl_methods.sbeed import (  # noqa: E402
-    DiscreteMDPSpec,
-    MultiLinearSBEED,
+from rl_methods.sbeed.building_versions import MultiLinearSBEED  # noqa: E402
+from rl_methods.sbeed.features import (  # noqa: E402
     TabularStateActionFeatures,
     TabularStateFeatures,
 )
+from rl_methods.sbeed.sbeed_spec import DiscreteMDPSpec  # noqa: E402
 
 
 # ============================================================

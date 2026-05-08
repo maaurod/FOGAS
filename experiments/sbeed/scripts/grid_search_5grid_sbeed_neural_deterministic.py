@@ -34,16 +34,16 @@ from rbf_grid_search_common import (
     tail_std,
 )
 
-from rl_methods.sbeed import (  # noqa: E402
+from rl_methods.sbeed.features import (  # noqa: E402
     IdentityHead,
     NeuralPolicyParam,
     NeuralRhoParam,
     NeuralValueParam,
-    SBEED,
     StateActionMLPModule,
     StateMLPPolicyModule,
     StateMLPValueModule,
 )
+from rl_methods.sbeed.solvers import DiscreteSBEED  # noqa: E402
 
 
 GRID_POLICY_DAMPING = [
@@ -163,7 +163,7 @@ NEURAL_CSV_FIELDS = [
 ]
 
 
-def build_neural_solver(cfg: Dict[str, Any], *, seed: int, device: torch.device) -> SBEED:
+def build_neural_solver(cfg: Dict[str, Any], *, seed: int, device: torch.device) -> DiscreteSBEED:
     value_param = NeuralValueParam(
         module=StateMLPValueModule(
             n_states=N,
@@ -190,7 +190,7 @@ def build_neural_solver(cfg: Dict[str, Any], *, seed: int, device: torch.device)
         ),
     )
 
-    solver = SBEED(
+    solver = DiscreteSBEED(
         n_states=N,
         n_actions=A,
         gamma=GAMMA,

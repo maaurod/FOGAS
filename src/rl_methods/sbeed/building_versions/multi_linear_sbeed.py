@@ -7,27 +7,23 @@ import numpy as np
 import torch
 from tqdm import trange
 
-from .sbeed_dataset import SBEEDDataset
-from .sbeed_spec import DiscreteMDPSpec
+from ..datasets.discrete_sbeed_dataset import DiscreteSBEEDDataset as SBEEDDataset
+from ..sbeed_spec import DiscreteMDPSpec
 
 
-class SBEEDOptimizers:
+class MultiLinearSBEED:
     """
-    Linear SBEED variant with selectable optimizers for value, rho, and policy.
+    Multi-step linear SBEED with selectable optimizers for value, rho, and policy.
 
     The solver learns:
         V_theta(s) = theta^T value_features(s)
-        rho_beta(s, a) = beta^T rho_features(s, a)
+        rho_beta(s_0, a_0:h-1) = beta^T sum_l gamma^l rho_features(s_l, a_l)
         pi_W(a | s) = softmax(W policy_features(s))[a]
 
-    It does not assume linear rewards, linear transitions, omega, or LinearMDP
-    transition features.
-
-    This class intentionally does not inherit from SBEEDSolver. It implements
-    the same external API as SBEEDSolverSGDRho while changing optimizer choices:
-        1. replay rows include done flags for episodic collection,
-        2. value and rho can use SGD or Adam,
-        3. policy can use SGD, exact-Fisher NPG, or conjugate-gradient NPG.
+    This class intentionally does not inherit from SBEEDOptimizers, but it keeps
+    the same optimizer and collection API. Replay rows include done flags, and
+    optimization samples valid k-step fragments that never cross episode
+    boundaries.
 
     Optimizer names:
         value_optimizer: "sgd" or "adam"
@@ -55,6 +51,7 @@ class SBEEDOptimizers:
         buffer_mode: str = "growing",
         max_buffer_size: Optional[int] = None,
         batch_size: Optional[int] = None,
+        rollout_length: int = 1,
         value_optimizer: str = "adam",
         rho_optimizer: str = "adam",
         policy_optimizer: str = "sgd",
@@ -102,6 +99,7 @@ class SBEEDOptimizers:
         self.buffer_mode = str(buffer_mode)
         self.max_buffer_size = None if max_buffer_size is None else int(max_buffer_size)
         self.batch_size = batch_size
+        self.rollout_length = int(rollout_length)
         self.value_optimizer = self._canonical_optimizer(value_optimizer, {"sgd", "adam"}, "value_optimizer")
         self.rho_optimizer = self._canonical_optimizer(rho_optimizer, {"sgd", "adam"}, "rho_optimizer")
         self.policy_optimizer = self._canonical_policy_optimizer(policy_optimizer)
@@ -133,6 +131,8 @@ class SBEEDOptimizers:
             raise ValueError("max_buffer_size must be positive")
         if self.buffer_mode == "fifo" and self.max_buffer_size is None:
             raise ValueError("max_buffer_size is required when buffer_mode='fifo'")
+        if self.rollout_length <= 0:
+            raise ValueError("rollout_length must be positive")
         if self.fisher_damping < 0.0:
             raise ValueError("fisher_damping must be non-negative")
         if self.cg_iters <= 0:
@@ -312,6 +312,12 @@ class SBEEDOptimizers:
         logits = self.POLICY_PHI_S @ W.T
         return self._row_softmax(logits)
 
+    def _policy_probs_for_state(self, state: int) -> torch.Tensor:
+        logits = self.POLICY_PHI_S[int(state)] @ self.W.T
+        z = logits - logits.max()
+        exp_z = torch.exp(z)
+        return exp_z / exp_z.sum()
+
     def _batch_indices(self) -> torch.Tensor:
         if self.n == 0:
             raise ValueError("Replay buffer D is empty. Collect data before calling step().")
@@ -319,44 +325,197 @@ class SBEEDOptimizers:
             return torch.arange(self.n, device=self.device)
         return torch.randint(self.n, (int(self.batch_size),), device=self.device)
 
-    def _compute_delta(
+    def _valid_fragment_starts(self) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Return valid k-step fragment starts, realized lengths, and terminal flags.
+
+        A start is valid when either a complete rollout_length fragment exists
+        before the current buffer tail, or a terminal transition truncates the
+        fragment earlier. Incomplete non-terminal tails are excluded.
+        """
+        if self.n == 0:
+            raise ValueError("Replay buffer D is empty. Collect data before sampling fragments.")
+
+        if self.rollout_length == 1:
+            starts = torch.arange(self.n, dtype=torch.int64, device=self.device)
+            lengths = torch.ones(self.n, dtype=torch.int64, device=self.device)
+            terminals = self.dataset.D.to(device=self.device, dtype=torch.bool)
+            return starts, lengths, terminals
+
+        all_starts = torch.arange(self.n, dtype=torch.int64, device=self.device)
+        offsets = torch.arange(self.rollout_length, dtype=torch.int64, device=self.device)
+        window_indices = all_starts[:, None] + offsets[None, :]
+        in_buffer = window_indices < self.n
+        safe_indices = window_indices.clamp_max(max(self.n - 1, 0))
+        done_windows = self.dataset.D[safe_indices].to(dtype=torch.bool) & in_buffer
+
+        has_terminal = done_windows.any(dim=1)
+        first_terminal_offsets = done_windows.to(dtype=torch.int64).argmax(dim=1)
+        full_fragment_available = all_starts + self.rollout_length <= self.n
+        valid = has_terminal | full_fragment_available
+
+        if not bool(valid.any().item()):
+            raise ValueError(
+                "Replay buffer D has no valid multi-step fragments. "
+                "Collect at least rollout_length transitions or a terminal fragment."
+            )
+
+        starts = all_starts[valid]
+        terminals = has_terminal[valid]
+        lengths = torch.where(
+            terminals,
+            first_terminal_offsets[valid] + 1,
+            torch.full_like(starts, self.rollout_length),
+        )
+
+        return (
+            starts,
+            lengths,
+            terminals,
+        )
+
+    def _batch_fragment_starts(self) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        starts, lengths, terminals = self._valid_fragment_starts()
+        valid_n = int(starts.numel())
+        if self.batch_size is None or self.batch_size >= valid_n:
+            return starts, lengths, terminals
+
+        sample_positions = torch.randint(valid_n, (int(self.batch_size),), device=self.device)
+        return starts[sample_positions], lengths[sample_positions], terminals[sample_positions]
+
+    def _compute_multistep_batch(
+        self,
+        theta: torch.Tensor,
+        W: torch.Tensor,
+        starts: torch.Tensor,
+        lengths: torch.Tensor,
+        terminals: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Compute fragment-level quantities for the k-step SBEED objective:
+
+            delta = sum_l gamma^l [r_l - lambda log pi(a_l | s_l)]
+                    + I[nonterminal] gamma^h V_theta(s_h).
+        """
+        if self.rollout_length == 1:
+            return self._compute_one_step_batch(theta, W, starts)
+
+        pi_mat = self._policy_matrix(W)
+        batch_n = int(starts.numel())
+        offsets = torch.arange(self.rollout_length, dtype=torch.int64, device=self.device)
+        fragment_indices = starts[:, None] + offsets[None, :]
+        safe_indices = fragment_indices.clamp_max(max(self.n - 1, 0))
+        mask = offsets[None, :] < lengths[:, None]
+        discounts = torch.pow(
+            torch.tensor(self.gamma, dtype=torch.float64, device=self.device),
+            offsets.to(dtype=torch.float64),
+        )
+        weights = mask.to(dtype=torch.float64) * discounts[None, :]
+
+        X_steps = self.dataset.X[safe_indices].long()
+        A_steps = self.dataset.A[safe_indices].long()
+        R_steps = self.dataset.R[safe_indices]
+
+        Phi = self.PHI_S[self.dataset.X[starts].long()]
+        discounted_rewards = (weights * R_steps).sum(dim=1)
+
+        action_probs = pi_mat[X_steps]
+        selected_probs = torch.gather(
+            action_probs,
+            dim=2,
+            index=A_steps[:, :, None],
+        ).squeeze(dim=2).clamp_min(1e-12)
+        discounted_log_pi = (weights * torch.log(selected_probs)).sum(dim=1)
+
+        Rho_steps = self.RHO_SA[X_steps, A_steps]
+        Rho = (weights[:, :, None] * Rho_steps).sum(dim=1)
+
+        PolicyPhi_steps = self.POLICY_PHI_S[X_steps]
+        action_one_hot = torch.nn.functional.one_hot(
+            A_steps,
+            num_classes=self.n_actions,
+        ).to(dtype=torch.float64, device=self.device)
+        grad_log_pi_steps = (
+            (action_one_hot - action_probs)[:, :, :, None]
+            * PolicyPhi_steps[:, :, None, :]
+        )
+        grad_log_pi_sum = (weights[:, :, None, None] * grad_log_pi_steps).sum(dim=1)
+
+        bootstrap_indices = starts + lengths - 1
+        bootstrap_states = self.dataset.X_next[bootstrap_indices].long()
+        bootstrap_discounts = torch.pow(
+            torch.tensor(self.gamma, dtype=torch.float64, device=self.device),
+            lengths.to(dtype=torch.float64),
+        )
+        nonterminal = (~terminals).to(dtype=torch.float64)
+        bootstrap_phi = (
+            (nonterminal * bootstrap_discounts)[:, None]
+            * self.PHI_S[bootstrap_states]
+        )
+
+        delta = discounted_rewards - self.lambda_entropy * discounted_log_pi + bootstrap_phi @ theta
+        return {
+            "starts": starts,
+            "lengths": lengths,
+            "terminals": terminals,
+            "Phi": Phi,
+            "Rho": Rho,
+            "PolicyPhi": self.POLICY_PHI_S[self.dataset.X[starts].long()],
+            "bootstrap_phi": bootstrap_phi,
+            "bootstrap_states": bootstrap_states,
+            "delta": delta,
+            "grad_log_pi_sum": grad_log_pi_sum,
+        }
+
+    def _compute_one_step_batch(
         self,
         theta: torch.Tensor,
         W: torch.Tensor,
         indices: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Compute the one-step smoothed Bellman target sample:
-
-            delta_i = r_i + gamma (1 - done_i) V_theta(s'_i)
-                      - lambda_entropy log pi_W(a_i | s_i).
-
-        At the SBEED optimum, temporal consistency says V(s) should match this
-        quantity for every observed (s, a, s').
-        """
+    ) -> Dict[str, torch.Tensor]:
         X = self.dataset.X[indices].long()
         A = self.dataset.A[indices].long()
-        R = self.dataset.R[indices]
         D = self.dataset.D[indices].to(dtype=torch.float64)
-        Phi_next = self.Phi_next[indices]
+        Phi = self.PHI_S[X]
+        Phi_next = self.PHI_S[self.dataset.X_next[indices].long()]
+        PolicyPhi = self.POLICY_PHI_S[X]
+        Rho = self.RHO_SA[X, A]
+        bootstrap_phi = self.gamma * (1.0 - D)[:, None] * Phi_next
 
         pi_mat = self._policy_matrix(W)
-        pi_sa = pi_mat[X, A].clamp_min(1e-12)
-        log_pi = torch.log(pi_sa)
-        delta = R + self.gamma * (1.0 - D) * (Phi_next @ theta) - self.lambda_entropy * log_pi
-        return delta, pi_mat, log_pi
+        action_probs = pi_mat[X]
+        log_pi = torch.log(action_probs[torch.arange(indices.numel(), device=self.device), A].clamp_min(1e-12))
+        delta = self.dataset.R[indices] - self.lambda_entropy * log_pi + bootstrap_phi @ theta
+
+        grad_log_pi_sum = -action_probs[:, :, None] * PolicyPhi[:, None, :]
+        grad_log_pi_sum[torch.arange(indices.numel(), device=self.device), A] += PolicyPhi
+
+        return {
+            "starts": indices,
+            "lengths": torch.ones(indices.numel(), dtype=torch.int64, device=self.device),
+            "terminals": self.dataset.D[indices].to(dtype=torch.bool),
+            "Phi": Phi,
+            "Rho": Rho,
+            "PolicyPhi": PolicyPhi,
+            "bootstrap_phi": bootstrap_phi,
+            "bootstrap_states": self.dataset.X_next[indices].long(),
+            "delta": delta,
+            "grad_log_pi_sum": grad_log_pi_sum,
+        }
 
     def objective(self) -> Dict[str, float]:
         if self.n == 0:
             raise ValueError("Replay buffer D is empty. Cannot compute objective.")
         with torch.no_grad():
-            indices = torch.arange(self.n, device=self.device)
-            delta, _, _ = self._compute_delta(self.theta, self.W, indices)
-            V = self.Phi @ self.theta
-            rho = self.Rho @ self.beta
+            starts, lengths, terminals = self._valid_fragment_starts()
+            batch = self._compute_multistep_batch(self.theta, self.W, starts, lengths, terminals)
+            delta = batch["delta"]
+            V = batch["Phi"] @ self.theta
+            rho = batch["Rho"] @ self.beta
 
             # Empirical SBEED objective:
-            #   E[(delta - V(s))^2] - eta E[(delta - rho(s,a))^2].
+            #   E[(delta_h - V(s_0))^2]
+            #   - eta E[(delta_h - rho(s_0,a_0:h-1))^2].
             # The second term is the variance-cancellation dual term from the
             # paper. This variant updates beta by SGD, so the reported dual MSE
             # is a direct diagnostic of the current rho fit.
@@ -583,17 +742,15 @@ class SBEEDOptimizers:
     def step(self) -> Dict[str, float]:
         if self.n == 0:
             raise ValueError("Replay buffer D is empty. Collect data before calling step().")
-        indices = self._batch_indices()
-        Phi = self.Phi[indices]
-        Phi_next = self.Phi_next[indices]
-        PolicyPhi = self.PolicyPhi[indices]
-        Rho = self.Rho[indices]
-        A = self.dataset.A[indices].long()
-        D = self.dataset.D[indices].to(dtype=torch.float64)
-        bootstrap_phi = self.gamma * (1.0 - D)[:, None] * Phi_next
+        starts, lengths, terminals = self._batch_fragment_starts()
+        batch = self._compute_multistep_batch(self.theta, self.W, starts, lengths, terminals)
+        Phi = batch["Phi"]
+        PolicyPhi = batch["PolicyPhi"]
+        Rho = batch["Rho"]
+        bootstrap_phi = batch["bootstrap_phi"]
 
-        # 1. Build delta with the current value and policy.
-        delta, _, _ = self._compute_delta(self.theta, self.W, indices)
+        # 1. Build the multi-step delta with the current value and policy.
+        delta = batch["delta"]
 
         V = Phi @ self.theta
         rho = Rho @ self.beta
@@ -606,31 +763,22 @@ class SBEEDOptimizers:
         # fixed, matching the original exact-fit inner update role.
         grad_beta = -((residual_rho.detach())[:, None] * Rho).mean(dim=0)
 
-        # 3. Value gradient from Theorem 4, specialized to
+        # 3. Multi-step value gradient, specialized to
         #    V_theta(s) = theta^T phi(s):
         #
         # grad_theta =
-        #   2 E[(delta - V(s)) (gamma (1-done) phi(s') - phi(s))]
-        #   - 2 eta gamma E[(delta - rho(s,a)) (1-done) phi(s')].
+        #   2 E[(delta_h - V(s_0)) (I[nonterminal] gamma^h phi(s_h) - phi(s_0))]
+        #   - 2 eta E[(delta_h - rho(s_0,a_0:h-1)) I[nonterminal] gamma^h phi(s_h)].
         grad_theta = (
             2.0 * (residual_v[:, None] * (bootstrap_phi - Phi)).mean(dim=0)
             - 2.0 * self.eta * (residual_rho[:, None] * bootstrap_phi).mean(dim=0)
         )
 
-        # 4. Softmax-linear policy gradient.
-        #
-        # For logits_l = W_l^T chi(s):
-        #   grad_W log pi(a|s) = (one_hot(a) - pi(.|s)) outer chi(s).
-        action_probs = self._policy_matrix(self.W)[self.dataset.X[indices].long()]
-        grad_log_pi = -action_probs[:, :, None] * PolicyPhi[:, None, :]
-        grad_log_pi[torch.arange(indices.numel(), device=self.device), A] += PolicyPhi
-
-        # Theorem 4 policy signal:
-        #   A_sbeed = (1 - eta) delta + eta rho(s,a) - V(s)
-        #   grad_W = -2 E[A_sbeed grad_W log pi(a|s)].
+        # 4. Softmax-linear policy gradient over each fragment:
+        #   sum_l gamma^l grad_W log pi(a_l|s_l).
         advantage = (1.0 - self.eta) * delta + self.eta * rho - V
         grad_W = -2.0 * (
-            advantage[:, None, None] * grad_log_pi
+            advantage[:, None, None] * batch["grad_log_pi_sum"]
         ).mean(dim=0)
 
         # 5. Euclidean mirror descent = ordinary gradient descent with a
@@ -649,7 +797,7 @@ class SBEEDOptimizers:
         policy_direction, policy_direction_kind, policy_diagnostics = self._apply_policy_update(
             grad_W=grad_W,
             PolicyPhi=PolicyPhi,
-            state_indices=self.dataset.X[indices].long(),
+            state_indices=self.dataset.X[starts].long(),
             step_size=policy_step_size,
         )
 
@@ -667,6 +815,9 @@ class SBEEDOptimizers:
                 "rho_optimizer": self.rho_optimizer,
                 "policy_optimizer": self.policy_optimizer,
                 "policy_direction": policy_direction_kind,
+                "rollout_length": int(self.rollout_length),
+                "mean_fragment_length": float(lengths.to(dtype=torch.float64).mean().item()),
+                "terminal_fragment_fraction": float(terminals.to(dtype=torch.float64).mean().item()),
                 "update_index": int(self.update_index),
             }
         )
@@ -699,7 +850,12 @@ class SBEEDOptimizers:
         if behavior == "uniform" or self.rng.random() < epsilon:
             return int(self.rng.integers(self.n_actions))
 
-        probs = self.get_policy_matrix()[state].detach().cpu().numpy()
+        with torch.no_grad():
+            probs = self._policy_probs_for_state(state)
+        if self.device.type == "cuda":
+            return int(torch.multinomial(probs, num_samples=1).item())
+
+        probs = probs.detach().cpu().numpy()
         return int(self.rng.choice(self.n_actions, p=probs))
 
     @staticmethod
@@ -760,6 +916,12 @@ class SBEEDOptimizers:
         else:
             state = int(start_state)
 
+        states = []
+        actions = []
+        rewards = []
+        next_states = []
+        dones = []
+
         for _ in range(n_steps):
             if state in terminal_states:
                 state = int(reset_state_fn()) if reset_state_fn is not None else (
@@ -774,17 +936,11 @@ class SBEEDOptimizers:
                 reward = float(reward_fn(state, action, next_state))
             done = bool(done or next_state in terminal_states)
 
-            if self.buffer_mode == "fifo":
-                self.dataset.append_fifo(
-                    state,
-                    action,
-                    reward,
-                    next_state,
-                    capacity=self.max_buffer_size,
-                    done=done,
-                )
-            else:
-                self.dataset.append(state, action, reward, next_state, done=done)
+            states.append(state)
+            actions.append(action)
+            rewards.append(reward)
+            next_states.append(next_state)
+            dones.append(done)
 
             if done:
                 state = int(reset_state_fn()) if reset_state_fn is not None else (
@@ -793,6 +949,14 @@ class SBEEDOptimizers:
             else:
                 state = int(next_state)
 
+        self.dataset.append_many(
+            states,
+            actions,
+            rewards,
+            next_states,
+            dones,
+            capacity=self.max_buffer_size if self.buffer_mode == "fifo" else None,
+        )
         self.dataset.validate(self.n_states, self.n_actions)
         self._refresh_dataset_features()
         return self.dataset.n

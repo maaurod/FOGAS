@@ -7,7 +7,7 @@ import torch
 
 
 @dataclass
-class SBEEDDataset:
+class DiscreteSBEEDDataset:
     """
     Transition buffer D for discrete SBEED experiments.
 
@@ -43,7 +43,7 @@ class SBEEDDataset:
         self.n = int(self.X.numel())
 
     @classmethod
-    def empty(cls, device: Optional[Union[torch.device, str]] = None) -> "SBEEDDataset":
+    def empty(cls, device: Optional[Union[torch.device, str]] = None) -> "DiscreteSBEEDDataset":
         device = torch.device("cpu" if device is None else device)
         return cls(
             X=torch.empty(0, dtype=torch.int64, device=device),
@@ -131,7 +131,7 @@ class SBEEDDataset:
             self.D = self.D[-capacity:]
         self.n = int(self.X.numel())
 
-    def extend(self, other: "SBEEDDataset") -> None:
+    def extend(self, other: "DiscreteSBEEDDataset") -> None:
         other = other.to(self.X.device)
         self.X = torch.cat([self.X, other.X])
         self.A = torch.cat([self.A, other.A])
@@ -140,9 +140,9 @@ class SBEEDDataset:
         self.D = torch.cat([self.D, other.D])
         self.n = int(self.X.numel())
 
-    def to(self, device: Union[torch.device, str]) -> "SBEEDDataset":
+    def to(self, device: Union[torch.device, str]) -> "DiscreteSBEEDDataset":
         device = torch.device(device)
-        return SBEEDDataset(
+        return DiscreteSBEEDDataset(
             X=self.X.to(device),
             A=self.A.to(device),
             R=self.R.to(device),

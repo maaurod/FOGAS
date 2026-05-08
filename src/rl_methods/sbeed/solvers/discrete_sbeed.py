@@ -6,7 +6,7 @@ from typing import Any, Callable, Dict, Iterable, Optional, Tuple, Union
 import numpy as np
 import torch
 
-from .features import (
+from ..features.discrete_features import (
     LinearRhoParam,
     LinearValueParam,
     PolicyParam,
@@ -14,10 +14,10 @@ from .features import (
     SoftmaxLinearPolicyParam,
     ValueParam,
 )
-from .sbeed_dataset import SBEEDDataset
+from ..datasets.discrete_sbeed_dataset import DiscreteSBEEDDataset
 
 
-class SBEED:
+class DiscreteSBEED:
     """
     Generalized multi-step SBEED over explicit PyTorch parametrizations.
 
@@ -117,7 +117,7 @@ class SBEED:
         self.rho_param.to(self.device)
         self.policy_param.to(self.device)
 
-        self.dataset = SBEEDDataset.empty(device=self.device)
+        self.dataset = DiscreteSBEEDDataset.empty(device=self.device)
         self.dataset.validate(self.n_states, self.n_actions)
         self.n = self.dataset.n
         self.pi: Optional[torch.Tensor] = None
@@ -749,7 +749,7 @@ class SBEED:
         if log_every <= 0:
             raise ValueError("log_every must be positive")
 
-        self.dataset = SBEEDDataset.empty(device=self.device)
+        self.dataset = DiscreteSBEEDDataset.empty(device=self.device)
         self.n = self.dataset.n
         self.update_index = 0
         self._reset_optimizer_state()

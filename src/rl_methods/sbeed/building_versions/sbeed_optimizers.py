@@ -5,27 +5,35 @@ from typing import Any, Callable, Dict, Optional, Tuple, Union
 
 import numpy as np
 import torch
+from tqdm import trange
 
-from .sbeed_dataset import SBEEDDataset
-from .sbeed_spec import DiscreteMDPSpec
+from ..datasets.discrete_sbeed_dataset import DiscreteSBEEDDataset as SBEEDDataset
+from ..sbeed_spec import DiscreteMDPSpec
 
 
-class MultiParametrizedSBEED:
+class SBEEDOptimizers:
     """
-    Clean multi-step SBEED scaffold for the parametrized solver.
-
-    This first version keeps the current linear feature parametrization:
+    Linear SBEED variant with selectable optimizers for value, rho, and policy.
 
     The solver learns:
         V_theta(s) = theta^T value_features(s)
-        rho_beta(s_0, a_0:h-1) = beta^T sum_l gamma^l rho_features(s_l, a_l)
+        rho_beta(s, a) = beta^T rho_features(s, a)
         pi_W(a | s) = softmax(W policy_features(s))[a]
 
-    It removes the legacy optimizer branches from MultiLinearSBEED:
-        - value and rho always use Adam,
-        - policy always uses the implicit/CG Fisher update,
-        - replay is always FIFO,
-        - data collection always follows the current policy.
+    It does not assume linear rewards, linear transitions, omega, or LinearMDP
+    transition features.
+
+    This class intentionally does not inherit from SBEEDSolver. It implements
+    the same external API as SBEEDSolverSGDRho while changing optimizer choices:
+        1. replay rows include done flags for episodic collection,
+        2. value and rho can use SGD or Adam,
+        3. policy can use SGD, exact-Fisher NPG, or conjugate-gradient NPG.
+
+    Optimizer names:
+        value_optimizer: "sgd" or "adam"
+        rho_optimizer: "sgd" or "adam"
+        policy_optimizer: "sgd", "npg_exact"/"exact_fisher", or
+            "npg_cg"/"cg_fisher"
     """
 
     def __init__(
@@ -39,16 +47,21 @@ class MultiParametrizedSBEED:
         spec: Optional[DiscreteMDPSpec] = None,
         lambda_entropy: float = 0.01,
         eta: float = 1.0,
+        ridge: float = 1e-6,
         lr_value: float = 1e-2,
         lr_rho: float = 1e-2,
         lr_policy: float = 1e-2,
         tau: float = 1.0,
-        max_buffer_size: int = 12000,
+        buffer_mode: str = "growing",
+        max_buffer_size: Optional[int] = None,
         batch_size: Optional[int] = None,
-        rollout_length: int = 1,
+        value_optimizer: str = "adam",
+        rho_optimizer: str = "adam",
+        policy_optimizer: str = "sgd",
         fisher_damping: float = 1e-3,
         cg_iters: int = 10,
         cg_tol: float = 1e-10,
+        cg_diagnostics: bool = False,
         adam_betas: Tuple[float, float] = (0.9, 0.999),
         adam_eps: float = 1e-8,
         seed: Optional[int] = 42,
@@ -81,16 +94,21 @@ class MultiParametrizedSBEED:
 
         self.lambda_entropy = float(lambda_entropy)
         self.eta = float(eta)
+        self.ridge = float(ridge)
         self.lr_value = float(lr_value)
         self.lr_rho = float(lr_rho)
         self.lr_policy = float(lr_policy)
         self.tau = float(tau)
-        self.max_buffer_size = int(max_buffer_size)
+        self.buffer_mode = str(buffer_mode)
+        self.max_buffer_size = None if max_buffer_size is None else int(max_buffer_size)
         self.batch_size = batch_size
-        self.rollout_length = int(rollout_length)
+        self.value_optimizer = self._canonical_optimizer(value_optimizer, {"sgd", "adam"}, "value_optimizer")
+        self.rho_optimizer = self._canonical_optimizer(rho_optimizer, {"sgd", "adam"}, "rho_optimizer")
+        self.policy_optimizer = self._canonical_policy_optimizer(policy_optimizer)
         self.fisher_damping = float(fisher_damping)
         self.cg_iters = int(cg_iters)
         self.cg_tol = float(cg_tol)
+        self.cg_diagnostics = bool(cg_diagnostics)
         if len(adam_betas) != 2:
             raise ValueError("adam_betas must contain exactly two entries")
         self.adam_beta1 = float(adam_betas[0])
@@ -103,14 +121,18 @@ class MultiParametrizedSBEED:
             raise ValueError("lambda_entropy must be non-negative")
         if not (0.0 <= self.eta <= 1.0):
             raise ValueError("eta must be in [0, 1]")
+        if self.ridge < 0.0:
+            raise ValueError("ridge must be non-negative")
         if self.lr_value <= 0.0 or self.lr_rho <= 0.0 or self.lr_policy <= 0.0:
             raise ValueError("lr_value, lr_rho, and lr_policy must be positive")
         if self.tau <= 0.0:
             raise ValueError("tau must be positive")
-        if self.max_buffer_size <= 0:
+        if self.buffer_mode not in {"growing", "fifo"}:
+            raise ValueError("buffer_mode must be 'growing' or 'fifo'")
+        if self.max_buffer_size is not None and self.max_buffer_size <= 0:
             raise ValueError("max_buffer_size must be positive")
-        if self.rollout_length <= 0:
-            raise ValueError("rollout_length must be positive")
+        if self.buffer_mode == "fifo" and self.max_buffer_size is None:
+            raise ValueError("max_buffer_size is required when buffer_mode='fifo'")
         if self.fisher_damping < 0.0:
             raise ValueError("fisher_damping must be non-negative")
         if self.cg_iters <= 0:
@@ -142,9 +164,40 @@ class MultiParametrizedSBEED:
         self.beta = torch.zeros(self.rho_dim, dtype=torch.float64, device=self.device)
         self.W = torch.zeros((self.n_actions, self.policy_dim), dtype=torch.float64, device=self.device)
 
+        self.theta_history = []
+        self.beta_history = []
+        self.W_history = []
+        self.loss_history = []
         self.pi: Optional[torch.Tensor] = None
         self.update_index = 0
         self._reset_optimizer_state()
+
+    @staticmethod
+    def _canonical_optimizer(name: str, allowed: set, field_name: str) -> str:
+        opt = str(name).lower()
+        if opt not in allowed:
+            allowed_list = ", ".join(sorted(allowed))
+            raise ValueError(f"{field_name} must be one of: {allowed_list}")
+        return opt
+
+    @staticmethod
+    def _canonical_policy_optimizer(name: str) -> str:
+        opt = str(name).lower()
+        aliases = {
+            "sgd": "sgd",
+            "npg_exact": "npg_exact",
+            "exact_fisher": "npg_exact",
+            "fisher_exact": "npg_exact",
+            "npg_cg": "npg_cg",
+            "cg_fisher": "npg_cg",
+            "implicit_npg": "npg_cg",
+        }
+        if opt not in aliases:
+            raise ValueError(
+                "policy_optimizer must be one of: sgd, npg_exact/exact_fisher, "
+                "or npg_cg/cg_fisher"
+            )
+        return aliases[opt]
 
     def _reset_optimizer_state(self) -> None:
         self._adam_state = {
@@ -259,12 +312,6 @@ class MultiParametrizedSBEED:
         logits = self.POLICY_PHI_S @ W.T
         return self._row_softmax(logits)
 
-    def _policy_probs_for_state(self, state: int) -> torch.Tensor:
-        logits = self.POLICY_PHI_S[int(state)] @ self.W.T
-        z = logits - logits.max()
-        exp_z = torch.exp(z)
-        return exp_z / exp_z.sum()
-
     def _batch_indices(self) -> torch.Tensor:
         if self.n == 0:
             raise ValueError("Replay buffer D is empty. Collect data before calling step().")
@@ -272,197 +319,44 @@ class MultiParametrizedSBEED:
             return torch.arange(self.n, device=self.device)
         return torch.randint(self.n, (int(self.batch_size),), device=self.device)
 
-    def _valid_fragment_starts(self) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Return valid k-step fragment starts, realized lengths, and terminal flags.
-
-        A start is valid when either a complete rollout_length fragment exists
-        before the current buffer tail, or a terminal transition truncates the
-        fragment earlier. Incomplete non-terminal tails are excluded.
-        """
-        if self.n == 0:
-            raise ValueError("Replay buffer D is empty. Collect data before sampling fragments.")
-
-        if self.rollout_length == 1:
-            starts = torch.arange(self.n, dtype=torch.int64, device=self.device)
-            lengths = torch.ones(self.n, dtype=torch.int64, device=self.device)
-            terminals = self.dataset.D.to(device=self.device, dtype=torch.bool)
-            return starts, lengths, terminals
-
-        all_starts = torch.arange(self.n, dtype=torch.int64, device=self.device)
-        offsets = torch.arange(self.rollout_length, dtype=torch.int64, device=self.device)
-        window_indices = all_starts[:, None] + offsets[None, :]
-        in_buffer = window_indices < self.n
-        safe_indices = window_indices.clamp_max(max(self.n - 1, 0))
-        done_windows = self.dataset.D[safe_indices].to(dtype=torch.bool) & in_buffer
-
-        has_terminal = done_windows.any(dim=1)
-        first_terminal_offsets = done_windows.to(dtype=torch.int64).argmax(dim=1)
-        full_fragment_available = all_starts + self.rollout_length <= self.n
-        valid = has_terminal | full_fragment_available
-
-        if not bool(valid.any().item()):
-            raise ValueError(
-                "Replay buffer D has no valid multi-step fragments. "
-                "Collect at least rollout_length transitions or a terminal fragment."
-            )
-
-        starts = all_starts[valid]
-        terminals = has_terminal[valid]
-        lengths = torch.where(
-            terminals,
-            first_terminal_offsets[valid] + 1,
-            torch.full_like(starts, self.rollout_length),
-        )
-
-        return (
-            starts,
-            lengths,
-            terminals,
-        )
-
-    def _batch_fragment_starts(self) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        starts, lengths, terminals = self._valid_fragment_starts()
-        valid_n = int(starts.numel())
-        if self.batch_size is None or self.batch_size >= valid_n:
-            return starts, lengths, terminals
-
-        sample_positions = torch.randint(valid_n, (int(self.batch_size),), device=self.device)
-        return starts[sample_positions], lengths[sample_positions], terminals[sample_positions]
-
-    def _compute_multistep_batch(
-        self,
-        theta: torch.Tensor,
-        W: torch.Tensor,
-        starts: torch.Tensor,
-        lengths: torch.Tensor,
-        terminals: torch.Tensor,
-    ) -> Dict[str, torch.Tensor]:
-        """
-        Compute fragment-level quantities for the k-step SBEED objective:
-
-            delta = sum_l gamma^l [r_l - lambda log pi(a_l | s_l)]
-                    + I[nonterminal] gamma^h V_theta(s_h).
-        """
-        if self.rollout_length == 1:
-            return self._compute_one_step_batch(theta, W, starts)
-
-        pi_mat = self._policy_matrix(W)
-        batch_n = int(starts.numel())
-        offsets = torch.arange(self.rollout_length, dtype=torch.int64, device=self.device)
-        fragment_indices = starts[:, None] + offsets[None, :]
-        safe_indices = fragment_indices.clamp_max(max(self.n - 1, 0))
-        mask = offsets[None, :] < lengths[:, None]
-        discounts = torch.pow(
-            torch.tensor(self.gamma, dtype=torch.float64, device=self.device),
-            offsets.to(dtype=torch.float64),
-        )
-        weights = mask.to(dtype=torch.float64) * discounts[None, :]
-
-        X_steps = self.dataset.X[safe_indices].long()
-        A_steps = self.dataset.A[safe_indices].long()
-        R_steps = self.dataset.R[safe_indices]
-
-        Phi = self.PHI_S[self.dataset.X[starts].long()]
-        discounted_rewards = (weights * R_steps).sum(dim=1)
-
-        action_probs = pi_mat[X_steps]
-        selected_probs = torch.gather(
-            action_probs,
-            dim=2,
-            index=A_steps[:, :, None],
-        ).squeeze(dim=2).clamp_min(1e-12)
-        discounted_log_pi = (weights * torch.log(selected_probs)).sum(dim=1)
-
-        Rho_steps = self.RHO_SA[X_steps, A_steps]
-        Rho = (weights[:, :, None] * Rho_steps).sum(dim=1)
-
-        PolicyPhi_steps = self.POLICY_PHI_S[X_steps]
-        action_one_hot = torch.nn.functional.one_hot(
-            A_steps,
-            num_classes=self.n_actions,
-        ).to(dtype=torch.float64, device=self.device)
-        grad_log_pi_steps = (
-            (action_one_hot - action_probs)[:, :, :, None]
-            * PolicyPhi_steps[:, :, None, :]
-        )
-        grad_log_pi_sum = (weights[:, :, None, None] * grad_log_pi_steps).sum(dim=1)
-
-        bootstrap_indices = starts + lengths - 1
-        bootstrap_states = self.dataset.X_next[bootstrap_indices].long()
-        bootstrap_discounts = torch.pow(
-            torch.tensor(self.gamma, dtype=torch.float64, device=self.device),
-            lengths.to(dtype=torch.float64),
-        )
-        nonterminal = (~terminals).to(dtype=torch.float64)
-        bootstrap_phi = (
-            (nonterminal * bootstrap_discounts)[:, None]
-            * self.PHI_S[bootstrap_states]
-        )
-
-        delta = discounted_rewards - self.lambda_entropy * discounted_log_pi + bootstrap_phi @ theta
-        return {
-            "starts": starts,
-            "lengths": lengths,
-            "terminals": terminals,
-            "Phi": Phi,
-            "Rho": Rho,
-            "PolicyPhi": self.POLICY_PHI_S[self.dataset.X[starts].long()],
-            "bootstrap_phi": bootstrap_phi,
-            "bootstrap_states": bootstrap_states,
-            "delta": delta,
-            "grad_log_pi_sum": grad_log_pi_sum,
-        }
-
-    def _compute_one_step_batch(
+    def _compute_delta(
         self,
         theta: torch.Tensor,
         W: torch.Tensor,
         indices: torch.Tensor,
-    ) -> Dict[str, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Compute the one-step smoothed Bellman target sample:
+
+            delta_i = r_i + gamma (1 - done_i) V_theta(s'_i)
+                      - lambda_entropy log pi_W(a_i | s_i).
+
+        At the SBEED optimum, temporal consistency says V(s) should match this
+        quantity for every observed (s, a, s').
+        """
         X = self.dataset.X[indices].long()
         A = self.dataset.A[indices].long()
+        R = self.dataset.R[indices]
         D = self.dataset.D[indices].to(dtype=torch.float64)
-        Phi = self.PHI_S[X]
-        Phi_next = self.PHI_S[self.dataset.X_next[indices].long()]
-        PolicyPhi = self.POLICY_PHI_S[X]
-        Rho = self.RHO_SA[X, A]
-        bootstrap_phi = self.gamma * (1.0 - D)[:, None] * Phi_next
+        Phi_next = self.Phi_next[indices]
 
         pi_mat = self._policy_matrix(W)
-        action_probs = pi_mat[X]
-        log_pi = torch.log(action_probs[torch.arange(indices.numel(), device=self.device), A].clamp_min(1e-12))
-        delta = self.dataset.R[indices] - self.lambda_entropy * log_pi + bootstrap_phi @ theta
-
-        grad_log_pi_sum = -action_probs[:, :, None] * PolicyPhi[:, None, :]
-        grad_log_pi_sum[torch.arange(indices.numel(), device=self.device), A] += PolicyPhi
-
-        return {
-            "starts": indices,
-            "lengths": torch.ones(indices.numel(), dtype=torch.int64, device=self.device),
-            "terminals": self.dataset.D[indices].to(dtype=torch.bool),
-            "Phi": Phi,
-            "Rho": Rho,
-            "PolicyPhi": PolicyPhi,
-            "bootstrap_phi": bootstrap_phi,
-            "bootstrap_states": self.dataset.X_next[indices].long(),
-            "delta": delta,
-            "grad_log_pi_sum": grad_log_pi_sum,
-        }
+        pi_sa = pi_mat[X, A].clamp_min(1e-12)
+        log_pi = torch.log(pi_sa)
+        delta = R + self.gamma * (1.0 - D) * (Phi_next @ theta) - self.lambda_entropy * log_pi
+        return delta, pi_mat, log_pi
 
     def objective(self) -> Dict[str, float]:
         if self.n == 0:
             raise ValueError("Replay buffer D is empty. Cannot compute objective.")
         with torch.no_grad():
-            starts, lengths, terminals = self._valid_fragment_starts()
-            batch = self._compute_multistep_batch(self.theta, self.W, starts, lengths, terminals)
-            delta = batch["delta"]
-            V = batch["Phi"] @ self.theta
-            rho = batch["Rho"] @ self.beta
+            indices = torch.arange(self.n, device=self.device)
+            delta, _, _ = self._compute_delta(self.theta, self.W, indices)
+            V = self.Phi @ self.theta
+            rho = self.Rho @ self.beta
 
             # Empirical SBEED objective:
-            #   E[(delta_h - V(s_0))^2]
-            #   - eta E[(delta_h - rho(s_0,a_0:h-1))^2].
+            #   E[(delta - V(s))^2] - eta E[(delta - rho(s,a))^2].
             # The second term is the variance-cancellation dual term from the
             # paper. This variant updates beta by SGD, so the reported dual MSE
             # is a direct diagnostic of the current rho fit.
@@ -486,12 +380,18 @@ class MultiParametrizedSBEED:
         return param - step_size * m_hat / (torch.sqrt(v_hat) + self.adam_eps)
 
     def _apply_value_update(self, grad_theta: torch.Tensor, step_size: float) -> None:
-        self.theta = self._adam_update("theta", self.theta, grad_theta, step_size)
+        if self.value_optimizer == "adam":
+            self.theta = self._adam_update("theta", self.theta, grad_theta, step_size)
+        else:
+            self.theta = self.theta - step_size * grad_theta
 
     def _apply_rho_update(self, grad_beta: torch.Tensor, step_size: float) -> None:
         # grad_beta is -G_rho, so descent on grad_beta is equivalent to the
         # ascent-form rho prox step beta <- beta + step_size * G_rho.
-        self.beta = self._adam_update("beta", self.beta, grad_beta, step_size)
+        if self.rho_optimizer == "adam":
+            self.beta = self._adam_update("beta", self.beta, grad_beta, step_size)
+        else:
+            self.beta = self.beta - step_size * grad_beta
 
     def _flatten_policy_grad(self, grad_W: torch.Tensor) -> torch.Tensor:
         return grad_W.reshape(-1)
@@ -499,9 +399,31 @@ class MultiParametrizedSBEED:
     def _unflatten_policy_direction(self, direction: torch.Tensor) -> torch.Tensor:
         return direction.reshape_as(self.W)
 
+    def _policy_fisher_matrix(self, PolicyPhi: torch.Tensor, state_indices: torch.Tensor) -> torch.Tensor:
+        """
+        Explicit empirical Fisher for a softmax-linear policy:
+            E_s sum_a pi(a|s) grad log pi(a|s) grad log pi(a|s)^T.
+        """
+        probs = self._policy_matrix(self.W)[state_indices]
+        batch_n = int(PolicyPhi.shape[0])
+        param_dim = self.W.numel()
+        fisher = torch.zeros((param_dim, param_dim), dtype=torch.float64, device=self.device)
+
+        eye_actions = torch.eye(self.n_actions, dtype=torch.float64, device=self.device)
+        for i in range(batch_n):
+            chi = PolicyPhi[i]
+            centered = eye_actions - probs[i][None, :]
+            grads = centered[:, :, None] * chi[None, None, :]
+            grads_flat = grads.reshape(self.n_actions, param_dim)
+            weighted = probs[i][:, None] * grads_flat
+            fisher = fisher + weighted.T @ grads_flat
+
+        return fisher / float(batch_n)
+
     def _policy_kl_hessian_vector_product(
         self,
         vector: torch.Tensor,
+        PolicyPhi: torch.Tensor,
         state_indices: torch.Tensor,
     ) -> torch.Tensor:
         """
@@ -539,13 +461,14 @@ class MultiParametrizedSBEED:
     def _conjugate_gradient_policy_direction(
         self,
         grad_W: torch.Tensor,
+        PolicyPhi: torch.Tensor,
         state_indices: torch.Tensor,
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
         b = self._flatten_policy_grad(grad_W).detach()
 
         def matvec(v: torch.Tensor) -> torch.Tensor:
             return (
-                self._policy_kl_hessian_vector_product(v, state_indices)
+                self._policy_kl_hessian_vector_product(v, PolicyPhi, state_indices)
                 + self.fisher_damping * v
             )
 
@@ -581,19 +504,78 @@ class MultiParametrizedSBEED:
             "cg_relative_residual": float((residual_norm / b_norm.clamp_min(1e-30)).item()),
         }
 
+        if self.cg_diagnostics:
+            fisher = self._policy_fisher_matrix(PolicyPhi, state_indices)
+            damped_fisher = fisher + self.fisher_damping * torch.eye(
+                fisher.shape[0],
+                dtype=fisher.dtype,
+                device=fisher.device,
+            )
+            exact_direction_flat = torch.linalg.solve(damped_fisher, b)
+            exact_residual = torch.linalg.norm(damped_fisher @ x - b)
+            direction_error = torch.linalg.norm(x - exact_direction_flat)
+            exact_direction_norm = torch.linalg.norm(exact_direction_flat)
+
+            probe = torch.randn_like(b)
+            explicit_fvp = fisher @ probe
+            kl_hvp = self._policy_kl_hessian_vector_product(probe, PolicyPhi, state_indices)
+            hvp_error = torch.linalg.norm(explicit_fvp - kl_hvp)
+            explicit_fvp_norm = torch.linalg.norm(explicit_fvp)
+
+            diagnostics.update(
+                {
+                    "cg_exact_residual_norm": float(exact_residual.item()),
+                    "cg_direction_error_norm": float(direction_error.item()),
+                    "cg_relative_direction_error": float(
+                        (direction_error / exact_direction_norm.clamp_min(1e-30)).item()
+                    ),
+                    "kl_hvp_error_norm": float(hvp_error.item()),
+                    "kl_hvp_relative_error": float(
+                        (hvp_error / explicit_fvp_norm.clamp_min(1e-30)).item()
+                    ),
+                }
+            )
+
         return self._unflatten_policy_direction(x), diagnostics
+
+    def _policy_npg_exact_direction(
+        self,
+        grad_W: torch.Tensor,
+        PolicyPhi: torch.Tensor,
+        state_indices: torch.Tensor,
+    ) -> torch.Tensor:
+        fisher = self._policy_fisher_matrix(PolicyPhi, state_indices)
+        if self.fisher_damping > 0.0:
+            fisher = fisher + self.fisher_damping * torch.eye(
+                fisher.shape[0],
+                dtype=fisher.dtype,
+                device=fisher.device,
+            )
+        direction = torch.linalg.solve(fisher, self._flatten_policy_grad(grad_W).detach())
+        return self._unflatten_policy_direction(direction)
 
     def _apply_policy_update(
         self,
         grad_W: torch.Tensor,
+        PolicyPhi: torch.Tensor,
         state_indices: torch.Tensor,
         step_size: float,
     ) -> Tuple[torch.Tensor, str, Dict[str, float]]:
-        direction, diagnostics = self._conjugate_gradient_policy_direction(
-            grad_W,
-            state_indices,
-        )
-        direction_kind = "cg_fisher"
+        if self.policy_optimizer == "sgd":
+            direction = grad_W
+            direction_kind = "sgd_gradient"
+            diagnostics = {}
+        elif self.policy_optimizer == "npg_exact":
+            direction = self._policy_npg_exact_direction(grad_W, PolicyPhi, state_indices)
+            direction_kind = "exact_fisher"
+            diagnostics = {}
+        else:
+            direction, diagnostics = self._conjugate_gradient_policy_direction(
+                grad_W,
+                PolicyPhi,
+                state_indices,
+            )
+            direction_kind = "cg_fisher"
 
         self.W = self.W - step_size * direction
         return direction, direction_kind, diagnostics
@@ -601,14 +583,17 @@ class MultiParametrizedSBEED:
     def step(self) -> Dict[str, float]:
         if self.n == 0:
             raise ValueError("Replay buffer D is empty. Collect data before calling step().")
-        starts, lengths, terminals = self._batch_fragment_starts()
-        batch = self._compute_multistep_batch(self.theta, self.W, starts, lengths, terminals)
-        Phi = batch["Phi"]
-        Rho = batch["Rho"]
-        bootstrap_phi = batch["bootstrap_phi"]
+        indices = self._batch_indices()
+        Phi = self.Phi[indices]
+        Phi_next = self.Phi_next[indices]
+        PolicyPhi = self.PolicyPhi[indices]
+        Rho = self.Rho[indices]
+        A = self.dataset.A[indices].long()
+        D = self.dataset.D[indices].to(dtype=torch.float64)
+        bootstrap_phi = self.gamma * (1.0 - D)[:, None] * Phi_next
 
-        # 1. Build the multi-step delta with the current value and policy.
-        delta = batch["delta"]
+        # 1. Build delta with the current value and policy.
+        delta, _, _ = self._compute_delta(self.theta, self.W, indices)
 
         V = Phi @ self.theta
         rho = Rho @ self.beta
@@ -621,28 +606,37 @@ class MultiParametrizedSBEED:
         # fixed, matching the original exact-fit inner update role.
         grad_beta = -((residual_rho.detach())[:, None] * Rho).mean(dim=0)
 
-        # 3. Multi-step value gradient, specialized to
+        # 3. Value gradient from Theorem 4, specialized to
         #    V_theta(s) = theta^T phi(s):
         #
         # grad_theta =
-        #   2 E[(delta_h - V(s_0)) (I[nonterminal] gamma^h phi(s_h) - phi(s_0))]
-        #   - 2 eta E[(delta_h - rho(s_0,a_0:h-1)) I[nonterminal] gamma^h phi(s_h)].
+        #   2 E[(delta - V(s)) (gamma (1-done) phi(s') - phi(s))]
+        #   - 2 eta gamma E[(delta - rho(s,a)) (1-done) phi(s')].
         grad_theta = (
             2.0 * (residual_v[:, None] * (bootstrap_phi - Phi)).mean(dim=0)
             - 2.0 * self.eta * (residual_rho[:, None] * bootstrap_phi).mean(dim=0)
         )
 
-        # 4. Softmax-linear policy gradient over each fragment:
-        #   sum_l gamma^l grad_W log pi(a_l|s_l).
+        # 4. Softmax-linear policy gradient.
+        #
+        # For logits_l = W_l^T chi(s):
+        #   grad_W log pi(a|s) = (one_hot(a) - pi(.|s)) outer chi(s).
+        action_probs = self._policy_matrix(self.W)[self.dataset.X[indices].long()]
+        grad_log_pi = -action_probs[:, :, None] * PolicyPhi[:, None, :]
+        grad_log_pi[torch.arange(indices.numel(), device=self.device), A] += PolicyPhi
+
+        # Theorem 4 policy signal:
+        #   A_sbeed = (1 - eta) delta + eta rho(s,a) - V(s)
+        #   grad_W = -2 E[A_sbeed grad_W log pi(a|s)].
         advantage = (1.0 - self.eta) * delta + self.eta * rho - V
         grad_W = -2.0 * (
-            advantage[:, None, None] * batch["grad_log_pi_sum"]
+            advantage[:, None, None] * grad_log_pi
         ).mean(dim=0)
 
         # 5. Euclidean mirror descent = ordinary gradient descent with a
         # shared tau-controlled step-size decay across value, rho, and policy
-        # updates: zeta_j = zeta_0 / (1 + j / tau). Value and rho use Adam
-        # with the decayed step size as Adam's alpha.
+        # updates: zeta_j = zeta_0 / (1 + j / tau). For Adam-selected value
+        # and rho updates, the same decayed step size is used as Adam's alpha.
         # For NPG policy updates, grad_W is preconditioned by the empirical
         # Fisher induced by the KL geometry before applying the policy step.
         self.update_index += 1
@@ -654,7 +648,8 @@ class MultiParametrizedSBEED:
         self._apply_value_update(grad_theta, value_step_size)
         policy_direction, policy_direction_kind, policy_diagnostics = self._apply_policy_update(
             grad_W=grad_W,
-            state_indices=self.dataset.X[starts].long(),
+            PolicyPhi=PolicyPhi,
+            state_indices=self.dataset.X[indices].long(),
             step_size=policy_step_size,
         )
 
@@ -668,13 +663,10 @@ class MultiParametrizedSBEED:
                 "value_step_size": float(value_step_size),
                 "rho_step_size": float(rho_step_size),
                 "policy_step_size": float(policy_step_size),
-                "value_optimizer": "adam",
-                "rho_optimizer": "adam",
-                "policy_optimizer": "npg_cg",
+                "value_optimizer": self.value_optimizer,
+                "rho_optimizer": self.rho_optimizer,
+                "policy_optimizer": self.policy_optimizer,
                 "policy_direction": policy_direction_kind,
-                "rollout_length": int(self.rollout_length),
-                "mean_fragment_length": float(lengths.to(dtype=torch.float64).mean().item()),
-                "terminal_fragment_fraction": float(terminals.to(dtype=torch.float64).mean().item()),
                 "update_index": int(self.update_index),
             }
         )
@@ -684,13 +676,16 @@ class MultiParametrizedSBEED:
     def sample_action(
         self,
         state: int,
+        behavior: str = "policy",
         epsilon: float = 0.0,
     ) -> int:
         """
-        Sample an action from the current softmax policy.
+        Sample a discrete action for data collection.
 
-        With epsilon > 0, collection becomes epsilon-greedy around the current
-        policy. At initialization the policy is uniform because W starts at zero.
+        `behavior="uniform"` gives the paper's simple random behavior policy.
+        `behavior="policy"` follows the current softmax policy, which is uniform
+        at initialization because W starts at zero. With epsilon > 0, this
+        becomes epsilon-greedy exploration around the current policy.
         """
         state = int(state)
         if state < 0 or state >= self.n_states:
@@ -698,15 +693,13 @@ class MultiParametrizedSBEED:
         if not (0.0 <= epsilon <= 1.0):
             raise ValueError("epsilon must be in [0, 1]")
 
-        if self.rng.random() < epsilon:
+        if behavior not in {"policy", "uniform"}:
+            raise ValueError("behavior must be 'policy' or 'uniform'")
+
+        if behavior == "uniform" or self.rng.random() < epsilon:
             return int(self.rng.integers(self.n_actions))
 
-        with torch.no_grad():
-            probs = self._policy_probs_for_state(state)
-        if self.device.type == "cuda":
-            return int(torch.multinomial(probs, num_samples=1).item())
-
-        probs = probs.detach().cpu().numpy()
+        probs = self.get_policy_matrix()[state].detach().cpu().numpy()
         return int(self.rng.choice(self.n_actions, p=probs))
 
     @staticmethod
@@ -741,15 +734,16 @@ class MultiParametrizedSBEED:
         n_steps: int,
         start_state: Optional[int] = None,
         reward_fn: Optional[Callable[[int, int, int], float]] = None,
+        behavior: str = "policy",
         epsilon: float = 0.0,
         terminal_states: Optional[set] = None,
         reset_state_fn: Optional[Callable[[], int]] = None,
     ) -> int:
         """
-        Collect transitions into D with the current policy.
+        Collect transitions into D with the current behavior policy.
 
         This is the online part of Algorithm 1:
-            execute pi_W, append (s, a, r, s') to D.
+            execute behavior policy pi_b, append (s, a, r, s') to D.
 
         For simple deterministic grids, `transition_fn(s, a)` may return only
         next_state and `reward_fn(s, a, next_state)` supplies the reward.
@@ -766,19 +760,13 @@ class MultiParametrizedSBEED:
         else:
             state = int(start_state)
 
-        states = []
-        actions = []
-        rewards = []
-        next_states = []
-        dones = []
-
         for _ in range(n_steps):
             if state in terminal_states:
                 state = int(reset_state_fn()) if reset_state_fn is not None else (
                     self.spec.x0 if self.spec.x0 is not None else 0
                 )
 
-            action = self.sample_action(state, epsilon=epsilon)
+            action = self.sample_action(state, behavior=behavior, epsilon=epsilon)
             next_state, reward, done = self._parse_transition_result(transition_fn(state, action))
             if reward is None:
                 if reward_fn is None:
@@ -786,11 +774,17 @@ class MultiParametrizedSBEED:
                 reward = float(reward_fn(state, action, next_state))
             done = bool(done or next_state in terminal_states)
 
-            states.append(state)
-            actions.append(action)
-            rewards.append(reward)
-            next_states.append(next_state)
-            dones.append(done)
+            if self.buffer_mode == "fifo":
+                self.dataset.append_fifo(
+                    state,
+                    action,
+                    reward,
+                    next_state,
+                    capacity=self.max_buffer_size,
+                    done=done,
+                )
+            else:
+                self.dataset.append(state, action, reward, next_state, done=done)
 
             if done:
                 state = int(reset_state_fn()) if reset_state_fn is not None else (
@@ -799,14 +793,6 @@ class MultiParametrizedSBEED:
             else:
                 state = int(next_state)
 
-        self.dataset.append_many(
-            states,
-            actions,
-            rewards,
-            next_states,
-            dones,
-            capacity=self.max_buffer_size,
-        )
         self.dataset.validate(self.n_states, self.n_actions)
         self._refresh_dataset_features()
         return self.dataset.n
@@ -820,10 +806,14 @@ class MultiParametrizedSBEED:
         updates_per_episode: int = 10,
         initial_collect_steps: int = 0,
         start_state: Optional[int] = None,
+        behavior: str = "policy",
         epsilon: float = 0.1,
         terminal_states: Optional[set] = None,
         reset_state_fn: Optional[Callable[[], int]] = None,
+        verbose: bool = False,
         log_every: int = 10,
+        tqdm_print: bool = True,
+        store_history: bool = True,
     ) -> torch.Tensor:
         """
         Online SBEED loop matching Algorithm 1 at a notebook-friendly level.
@@ -831,8 +821,8 @@ class MultiParametrizedSBEED:
         Each invocation starts from a fresh replay buffer D.
 
         For each episode:
-            1. collect K transitions with the current policy into D,
-            2. run N primal/dual updates by sampling from FIFO replay,
+            1. collect K transitions with behavior policy pi_b into D,
+            2. run N primal/dual updates by sampling from the growing D,
             3. continue collecting with the updated policy.
 
         Reproducibility is controlled by the solver seed. The initial policy is
@@ -853,6 +843,12 @@ class MultiParametrizedSBEED:
         if log_every <= 0:
             raise ValueError("log_every must be positive")
 
+        if store_history:
+            self.theta_history = []
+            self.beta_history = []
+            self.W_history = []
+            self.loss_history = []
+
         self.dataset = SBEEDDataset.empty(device=self.device)
         self._refresh_dataset_features()
         self.update_index = 0
@@ -864,16 +860,18 @@ class MultiParametrizedSBEED:
                 n_steps=initial_collect_steps,
                 start_state=start_state,
                 reward_fn=reward_fn,
-                epsilon=epsilon,
+                behavior="uniform",
+                epsilon=0.0,
                 terminal_states=terminal_states,
                 reset_state_fn=reset_state_fn,
             )
 
+        iterator = trange(episodes, disable=not tqdm_print)
         last_stats = None
-        for episode in range(episodes):
+        for episode in iterator:
             # Periodic logging happens before collecting the next block of data.
             # The reported metrics are from the previous completed update block.
-            if last_stats is not None and episode % log_every == 0:
+            if verbose and last_stats is not None and episode % log_every == 0:
                 print(
                     f"episode={episode}/{episodes} "
                     f"buffer={self.n} "
@@ -889,6 +887,7 @@ class MultiParametrizedSBEED:
                 n_steps=collect_per_episode,
                 start_state=start_state,
                 reward_fn=reward_fn,
+                behavior=behavior,
                 epsilon=epsilon,
                 terminal_states=terminal_states,
                 reset_state_fn=reset_state_fn,
@@ -896,8 +895,27 @@ class MultiParametrizedSBEED:
 
             for _ in range(updates_per_episode):
                 last_stats = self.step()
+                if store_history:
+                    self.theta_history.append(self.theta.detach().clone())
+                    self.beta_history.append(self.beta.detach().clone())
+                    self.W_history.append(self.W.detach().clone())
+                    self.loss_history.append(last_stats)
 
-        if last_stats is not None and episodes % log_every == 0:
+            if tqdm_print:
+                postfix = {"buffer": self.n}
+                if last_stats is not None:
+                    postfix.update(
+                        {
+                            "objective": f"{last_stats['objective']:.4g}",
+                            "primal_mse": f"{last_stats['primal_mse']:.4g}",
+                            "dual_mse": f"{last_stats['dual_mse']:.4g}",
+                            "theta_grad": f"{last_stats['theta_grad_norm']:.2e}",
+                            "policy_grad": f"{last_stats['policy_grad_norm']:.2e}",
+                        }
+                    )
+                iterator.set_postfix(postfix)
+
+        if verbose and last_stats is not None:
             print(
                 f"episode={episodes}/{episodes} "
                 f"buffer={self.n} "

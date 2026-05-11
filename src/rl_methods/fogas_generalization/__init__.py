@@ -5,12 +5,29 @@ from .solvers import (
     FOGASSolverBeta,
     FOGASSolverBetaObjectivePolicyVectorized,
     FOGASSolverBetaVectorized,
+    LinearBetaPiSolver,
+    LinearSolver,
+    LossThetaBetaPiSolver,
     LinearPolicyFOGAS,
+    RegularizedLossThetaBetaPiSolver,
     VBetaLogitSolver,
     VBetaObjectivePolicySolver,
     VBetaSolver,
 )
-from .policy_features import TabularPolicyFeatures
+from .fogas_parameters import GeneralizedFOGASParameters, StandaloneFOGASParameters
+from .features import (
+    FeatureFunction,
+    LinearFunction,
+    LinearQFunction,
+    LinearUFunction,
+    TabularFeatures,
+    TabularPolicyFeatures,
+    build_feature_table,
+    build_policy_feature_table,
+    build_q_feature_table,
+    build_u_feature_table,
+)
+from .u_functions import UFunction
 
 try:
     from .solver_policy import FOGASSolverPolicy
@@ -25,7 +42,23 @@ __all__ = [
     "VBetaObjectivePolicySolver",
     "VBetaLogitSolver",
     "LinearPolicyFOGAS",
+    "LinearSolver",
+    "LinearBetaPiSolver",
+    "LossThetaBetaPiSolver",
+    "RegularizedLossThetaBetaPiSolver",
+    "GeneralizedFOGASParameters",
+    "StandaloneFOGASParameters",
     "TabularPolicyFeatures",
+    "TabularFeatures",
+    "UFunction",
+    "FeatureFunction",
+    "LinearFunction",
+    "LinearUFunction",
+    "LinearQFunction",
+    "build_feature_table",
+    "build_u_feature_table",
+    "build_q_feature_table",
+    "build_policy_feature_table",
     "FOGASSolverBeta",
     "FOGASSolverBetaVectorized",
     "FOGASSolverBetaObjectivePolicyVectorized",

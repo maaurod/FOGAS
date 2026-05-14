@@ -20,9 +20,6 @@ class SBEEDSolver:
         rho_beta(s, a) = beta^T rho_features(s, a)
         pi_W(a | s) = softmax(W policy_features(s))[a]
 
-    It does not assume linear rewards, linear transitions, omega, or LinearMDP
-    transition features.
-
     The solver starts with an empty replay buffer D. Each `run` call resets D
     and grows a fresh buffer by interacting with a user-provided discrete
     transition function. Parameter updates use a shared tau-controlled decay,

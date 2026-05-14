@@ -19,7 +19,8 @@ class LinearSolver:
     """
 
     _THETA_UPDATES = {"exact", "sgd", "adam"}
-    _POLICY_OPTIMIZERS = {"sgd", "adam"}
+    _POLICY_OPTIMIZERS = {"sgd", "adam", "npg"}
+    _POLICY_GRADIENTS = {"exact", "reinforce"}
     _EPS = 1e-12
 
     def __init__(
@@ -237,7 +238,14 @@ class LinearSolver:
     def _canonical_policy_optimizer(cls, policy_optimizer):
         name = str(policy_optimizer).lower()
         if name not in cls._POLICY_OPTIMIZERS:
-            raise ValueError("policy_optimizer must be either 'sgd' or 'adam'")
+            raise ValueError("policy_optimizer must be one of 'sgd', 'adam', or 'npg'")
+        return name
+
+    @classmethod
+    def _canonical_policy_gradient(cls, policy_gradient):
+        name = str(policy_gradient).lower()
+        if name not in cls._POLICY_GRADIENTS:
+            raise ValueError("policy_gradient must be either 'exact' or 'reinforce'")
         return name
 
     @staticmethod
@@ -363,6 +371,144 @@ class LinearSolver:
             final_grad = c_t + lambda_theta * theta_t
         return theta_t, float(torch.linalg.norm(final_grad).detach().cpu().item())
 
+    def _exact_policy_gradient(self, pi_mat, q_all, policy_state_weights):
+        G = policy_state_weights[:, None] * q_all
+        policy_objective = (pi_mat * G).sum()
+        V_G = (pi_mat * G).sum(dim=1)
+        advantage_G = G - V_G[:, None]
+        policy_grad = (
+            pi_mat[..., None] * advantage_G[..., None] * self.OMEGA_PI_XA
+        ).sum(dim=(0, 1))
+        return policy_grad, policy_objective
+
+    def _reinforce_policy_gradient(
+        self,
+        pi_mat,
+        q_all,
+        coeff,
+        state_weights,
+        policy_state_weights,
+        state_weight_update,
+        reinforce_samples,
+    ):
+        if state_weight_update == "normal":
+            states = torch.cat(
+                (
+                    torch.tensor([self.x0], dtype=torch.long, device=self.device),
+                    self.X_nexts,
+                )
+            )
+            weights = torch.cat(
+                (
+                    torch.tensor([1.0 - self.gamma], dtype=torch.float64, device=self.device),
+                    (self.gamma / self.n) * coeff,
+                )
+            )
+        else:
+            states = torch.arange(self.N, dtype=torch.long, device=self.device)
+            weights = policy_state_weights
+
+        sample_count = self._canonical_positive_int(reinforce_samples, "reinforce_samples")
+        probs = pi_mat[states]
+        sampled_actions = torch.multinomial(
+            probs.reshape(-1, self.A),
+            num_samples=sample_count,
+            replacement=True,
+        )
+
+        q_states = q_all[states]
+        baseline = (probs * q_states).sum(dim=1)
+        sampled_q = q_states.gather(1, sampled_actions)
+        advantages = sampled_q - baseline[:, None]
+
+        omega_states = self.OMEGA_PI_XA[states]
+        expected_omega = (probs[..., None] * omega_states).sum(dim=1)
+        sampled_omega = omega_states.gather(
+            1,
+            sampled_actions[..., None].expand(-1, -1, self.d_pi),
+        )
+        grad_log_pi = sampled_omega - expected_omega[:, None, :]
+        weighted_terms = weights[:, None, None] * advantages[..., None] * grad_log_pi
+        policy_grad = weighted_terms.sum(dim=(0, 1)) / float(sample_count)
+
+        policy_objective = (pi_mat * (policy_state_weights[:, None] * q_all)).sum()
+        return policy_grad, policy_objective
+
+    def _policy_kl_hessian_vector_product(self, vector, psi_t, state_indices):
+        old_probs = self._linear_policy_matrix(psi_t)[state_indices].detach().clamp_min(self._EPS)
+        psi_var = psi_t.detach().clone().requires_grad_(True)
+        new_probs = self._linear_policy_matrix(psi_var)[state_indices].clamp_min(self._EPS)
+
+        empirical_kl = (old_probs * (torch.log(old_probs) - torch.log(new_probs))).sum(
+            dim=1
+        ).mean()
+        grad_kl = torch.autograd.grad(empirical_kl, psi_var, create_graph=True)[0]
+        grad_vector_product = torch.dot(grad_kl.reshape(-1), vector.detach())
+        hvp = torch.autograd.grad(grad_vector_product, psi_var, retain_graph=False)[0]
+        return hvp.reshape(-1).detach()
+
+    def _conjugate_gradient_policy_direction(
+        self,
+        policy_grad,
+        psi_t,
+        state_indices,
+        fisher_damping,
+        cg_iters,
+        cg_tol,
+    ):
+        b = policy_grad.detach().reshape(-1)
+
+        def matvec(v):
+            return (
+                self._policy_kl_hessian_vector_product(v, psi_t, state_indices)
+                + fisher_damping * v
+            )
+
+        x = torch.zeros_like(b)
+        r = b.clone()
+        p = r.clone()
+        rs_old = torch.dot(r, r)
+        if torch.sqrt(rs_old) <= cg_tol:
+            return x, {
+                "cg_iters_used": 0,
+                "cg_residual_norm": float(torch.sqrt(rs_old).detach().cpu().item()),
+                "cg_relative_residual": 0.0,
+            }
+
+        iters_used = 0
+        for _ in range(cg_iters):
+            Ap = matvec(p)
+            alpha = rs_old / torch.dot(p, Ap).clamp_min(1e-30)
+            x = x + alpha * p
+            r = r - alpha * Ap
+            rs_new = torch.dot(r, r)
+            iters_used += 1
+            if torch.sqrt(rs_new) <= cg_tol:
+                break
+            p = r + (rs_new / rs_old) * p
+            rs_old = rs_new
+
+        residual_norm = torch.linalg.norm(matvec(x) - b)
+        b_norm = torch.linalg.norm(b)
+        diagnostics = {
+            "cg_iters_used": int(iters_used),
+            "cg_residual_norm": float(residual_norm.detach().cpu().item()),
+            "cg_relative_residual": float(
+                (residual_norm / b_norm.clamp_min(1e-30)).detach().cpu().item()
+            ),
+        }
+        return x, diagnostics
+
+    def _policy_update_state_indices(self, state_weight_update):
+        if state_weight_update == "normal":
+            return torch.cat(
+                (
+                    torch.tensor([self.x0], dtype=torch.long, device=self.device),
+                    self.X_nexts,
+                )
+            )
+        return torch.arange(self.N, dtype=torch.long, device=self.device)
+
     def get_diagnostics(self):
         return self.diagnostics_history
 
@@ -382,6 +528,11 @@ class LinearSolver:
         theta_inner_steps=None,
         theta_loss_include_beta_reg=None,
         policy_optimizer="sgd",
+        policy_gradient="exact",
+        reinforce_samples=1,
+        fisher_damping=1e-3,
+        cg_iters=10,
+        cg_tol=1e-10,
         adam_betas=(0.9, 0.999),
         adam_eps=1e-8,
         verbose=False,
@@ -430,6 +581,11 @@ class LinearSolver:
                 theta_bar_init=theta_bar_init,
                 psi_init=psi_init,
                 policy_optimizer=policy_optimizer,
+                policy_gradient=policy_gradient,
+                reinforce_samples=reinforce_samples,
+                fisher_damping=fisher_damping,
+                cg_iters=cg_iters,
+                cg_tol=cg_tol,
                 adam_betas=adam_betas,
                 adam_eps=adam_eps,
                 verbose=verbose,
@@ -456,6 +612,11 @@ class LinearSolver:
         theta_bar_init,
         psi_init,
         policy_optimizer,
+        policy_gradient,
+        reinforce_samples,
+        fisher_damping,
+        cg_iters,
+        cg_tol,
         adam_betas,
         adam_eps,
         verbose,
@@ -467,6 +628,15 @@ class LinearSolver:
         if state_weight_update not in {"normal", "clipped"}:
             raise ValueError("state_weight_update must be either 'normal' or 'clipped'")
         policy_optimizer = self._canonical_policy_optimizer(policy_optimizer)
+        policy_gradient = self._canonical_policy_gradient(policy_gradient)
+        reinforce_samples = self._canonical_positive_int(reinforce_samples, "reinforce_samples")
+        fisher_damping = float(fisher_damping)
+        cg_iters = self._canonical_positive_int(cg_iters, "cg_iters")
+        cg_tol = float(cg_tol)
+        if fisher_damping < 0.0:
+            raise ValueError("fisher_damping must be non-negative")
+        if cg_tol < 0.0:
+            raise ValueError("cg_tol must be non-negative")
         self.policy_optimizer_name = policy_optimizer
 
         beta_t = self._prepare_beta_init(beta_init)
@@ -548,21 +718,48 @@ class LinearSolver:
             else:
                 policy_state_weights = torch.clamp(state_weights, min=c_min)
 
-            G = policy_state_weights[:, None] * q_all
-            policy_objective = (pi_mat * G).sum()
-            V_G = (pi_mat * G).sum(dim=1)
-            advantage_G = G - V_G[:, None]
-            policy_grad = (
-                pi_mat[..., None] * advantage_G[..., None] * self.OMEGA_PI_XA
-            ).sum(dim=(0, 1))
+            if policy_gradient == "exact":
+                policy_grad, policy_objective = self._exact_policy_gradient(
+                    pi_mat,
+                    q_all,
+                    policy_state_weights,
+                )
+            else:
+                policy_grad, policy_objective = self._reinforce_policy_gradient(
+                    pi_mat,
+                    q_all,
+                    coeff,
+                    state_weights,
+                    policy_state_weights,
+                    state_weight_update,
+                    reinforce_samples,
+                )
 
             if policy_optimizer == "sgd":
                 psi_next = psi_t + alpha * policy_grad
-            else:
+                policy_direction = policy_grad
+                policy_direction_kind = "sgd_gradient"
+                policy_diagnostics = {}
+            elif policy_optimizer == "adam":
                 adam_optimizer.zero_grad(set_to_none=True)
                 adam_param.grad = -policy_grad.clone()
                 adam_optimizer.step()
                 psi_next = adam_param.detach().clone()
+                policy_direction = policy_grad
+                policy_direction_kind = "adam_gradient"
+                policy_diagnostics = {}
+            else:
+                policy_state_indices = self._policy_update_state_indices(state_weight_update)
+                policy_direction, policy_diagnostics = self._conjugate_gradient_policy_direction(
+                    policy_grad=policy_grad,
+                    psi_t=psi_t,
+                    state_indices=policy_state_indices,
+                    fisher_damping=fisher_damping,
+                    cg_iters=cg_iters,
+                    cg_tol=cg_tol,
+                )
+                policy_direction_kind = "cg_fisher"
+                psi_next = psi_t + alpha * policy_direction
 
             beta_t = (1.0 / (1.0 + rho * eta)) * (beta_t + eta * beta_update_direction)
             theta_bar_t = theta_bar_t + theta_t
@@ -578,11 +775,19 @@ class LinearSolver:
                 "beta_objective": float(beta_objective.detach().cpu().item()),
                 "q_objective": float(q_objective.detach().cpu().item()),
                 "policy_grad_norm": float(torch.linalg.norm(policy_grad).detach().cpu().item()),
+                "policy_direction_norm": float(
+                    torch.linalg.norm(policy_direction).detach().cpu().item()
+                ),
                 "beta_grad_norm": float(torch.linalg.norm(beta_grad).detach().cpu().item()),
                 "theta_grad_norm": float(theta_grad_norm),
+                "policy_optimizer": policy_optimizer,
+                "policy_gradient": policy_gradient,
+                "policy_direction": policy_direction_kind,
+                "reinforce_samples": int(reinforce_samples),
                 "D_theta": float(D_theta),
                 "effective_D_theta": float(effective_D_theta),
             }
+            diagnostics.update(policy_diagnostics)
             diagnostics_history.append(diagnostics)
 
             if use_tqdm:

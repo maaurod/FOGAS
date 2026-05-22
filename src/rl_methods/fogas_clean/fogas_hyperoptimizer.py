@@ -388,19 +388,21 @@ class FOGASHyperOptimizer:
         completed = []
         progress_history = []
 
-        with ThreadPoolExecutor(max_workers=n_jobs) as executor:
-            futures = {
-                executor.submit(self._evaluate_candidate_on_solver_copy, candidate, num_runs): idx
-                for idx, candidate in enumerate(candidates)
-            }
-            for future in as_completed(futures):
-                idx = futures[future]
-                record = future.result()
-                completed.append((idx, record))
-                progress_history.append(record)
-                self._update_progress_bar(progress_bar, record, progress_history)
+        # Use joblib to bypass Python's GIL and utilize multiple CPU cores.
+        # joblib's 'loky' backend uses advanced serialization (cloudpickle under the hood)
+        # which can pickle user-defined functions like phi and psi in Jupyter Notebooks.
+        from joblib import Parallel, delayed
 
-        history.extend(record for _, record in sorted(completed, key=lambda item: item[0]))
+        results = Parallel(n_jobs=n_jobs)(
+            delayed(self._evaluate_candidate_on_solver_copy)(candidate, num_runs)
+            for candidate in candidates
+        )
+
+        for record in results:
+            progress_history.append(record)
+            self._update_progress_bar(progress_bar, record, progress_history)
+
+        history.extend(results)
 
     def _evaluate_candidate_on_solver_copy(self, params, num_runs):
         solver = copy.deepcopy(self.solver)
@@ -508,8 +510,8 @@ class FOGASHyperOptimizer:
         progress_bar.set_postfix(
             {
                 "stage": record["stage"],
-                "metric": f"{record['metric']:.3g}",
-                "best": f"{best['metric']:.3g}",
+                "metric": f"{record['metric']:.3f}",
+                "best": f"{best['metric']:.3f}",
             }
         )
         progress_bar.update(1)
@@ -912,19 +914,18 @@ class FOGASHyperOptimizer:
         if not history:
             return
 
-        metrics = np.array([record["metric"] for record in history], dtype=float)
-        best_so_far = np.minimum.accumulate(metrics)
-
-        plt.figure(figsize=(8, 5))
-        plt.plot(best_so_far, marker="o", linewidth=2)
-        plt.xlabel("Evaluation")
-        plt.ylabel("Best metric so far")
-        plt.title("FOGAS hyperparameter optimization")
-        plt.grid(True)
-        plt.tight_layout()
-        plt.show()
-
         if result["mode"] != "grid":
+            metrics = np.array([record["metric"] for record in history], dtype=float)
+            best_so_far = np.minimum.accumulate(metrics)
+
+            plt.figure(figsize=(8, 5))
+            plt.plot(best_so_far, marker="o", linewidth=2)
+            plt.xlabel("Evaluation")
+            plt.ylabel("Best metric so far")
+            plt.title("FOGAS hyperparameter optimization")
+            plt.grid(True)
+            plt.tight_layout()
+            plt.show()
             return
 
         varied = [

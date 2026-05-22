@@ -72,6 +72,7 @@ class DiscreteMDP:
 
         self.r = self._build_reward(r=r, reward_fn=reward_fn, omega=self.omega, phi=phi)
         self.P = self._build_transition(P=P, transition_fn=transition_fn, psi=psi, phi=phi, feature_dim=feature_dim)
+        self.nu0 = self.nu0.to(self.r.device)
 
     @staticmethod
     def _as_1d_tensor(value, name):

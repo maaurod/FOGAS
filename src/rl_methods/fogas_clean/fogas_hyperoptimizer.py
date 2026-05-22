@@ -1,7 +1,5 @@
-import copy
 import inspect
 import itertools
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
 
@@ -108,7 +106,6 @@ class FOGASHyperOptimizer:
                     history=history,
                     run_kwargs=run_kwargs,
                     progress_bar=progress_bar,
-                    grid_n_jobs=grid_n_jobs,
                 )
                 result["smart_mode"] = None
                 result["strategy"] = None
@@ -175,7 +172,6 @@ class FOGASHyperOptimizer:
         history,
         run_kwargs,
         progress_bar,
-        grid_n_jobs,
     ):
         if not values:
             raise ValueError("values is required when mode='grid'.")
@@ -199,23 +195,14 @@ class FOGASHyperOptimizer:
             candidate.update(dict(zip(value_keys, combo)))
             candidates.append(candidate)
 
-        if self._use_parallel_grid(grid_n_jobs):
-            self._evaluate_grid_parallel(
-                candidates=candidates,
-                num_runs=num_runs,
-                history=history,
+        for candidate in candidates:
+            self._evaluate_candidate(
+                candidate,
+                num_runs,
+                history,
+                stage="grid",
                 progress_bar=progress_bar,
-                n_jobs=grid_n_jobs,
             )
-        else:
-            for candidate in candidates:
-                self._evaluate_candidate(
-                    candidate,
-                    num_runs,
-                    history,
-                    stage="grid",
-                    progress_bar=progress_bar,
-                )
 
         return self._best_result(history)
 
@@ -363,73 +350,6 @@ class FOGASHyperOptimizer:
 
     def _metric_value(self):
         value = self.metric()
-        try:
-            import torch
-        except ImportError:
-            torch = None
-        if torch is not None and isinstance(value, torch.Tensor):
-            return float(value.item())
-        return float(value)
-
-    def _use_parallel_grid(self, grid_n_jobs):
-        grid_n_jobs = int(grid_n_jobs)
-        if grid_n_jobs <= 1:
-            return False
-        if not isinstance(self.metric_spec, str):
-            raise ValueError("Parallel grid search supports string evaluator metrics only.")
-
-        device = getattr(self.solver, "device", None)
-        if device is None and hasattr(self.solver, "mdp") and hasattr(self.solver.mdp, "r"):
-            device = self.solver.mdp.r.device
-        return device is None or str(device) == "cpu"
-
-    def _evaluate_grid_parallel(self, candidates, num_runs, history, progress_bar, n_jobs):
-        n_jobs = int(n_jobs)
-        completed = []
-        progress_history = []
-
-        # Use joblib to bypass Python's GIL and utilize multiple CPU cores.
-        # joblib's 'loky' backend uses advanced serialization (cloudpickle under the hood)
-        # which can pickle user-defined functions like phi and psi in Jupyter Notebooks.
-        from joblib import Parallel, delayed
-
-        results = Parallel(n_jobs=n_jobs)(
-            delayed(self._evaluate_candidate_on_solver_copy)(candidate, num_runs)
-            for candidate in candidates
-        )
-
-        for record in results:
-            progress_history.append(record)
-            self._update_progress_bar(progress_bar, record, progress_history)
-
-        history.extend(results)
-
-    def _evaluate_candidate_on_solver_copy(self, params, num_runs):
-        solver = copy.deepcopy(self.solver)
-        planner = copy.deepcopy(getattr(self.evaluator, "planner", None))
-        evaluator = self.evaluator.__class__(solver=solver, planner=planner)
-        metric = evaluator.get_metric(self.metric_spec, **self.metric_kwargs)
-
-        params = self._complete_params(params)
-        run_params = self._filter_solver_params_for_solver(solver, params)
-        per_run = []
-
-        for _ in range(num_runs):
-            if hasattr(solver, "D_pi"):
-                solver.D_pi = params["D_pi"]
-            solver.run(**run_params)
-            value = metric()
-            per_run.append(self._as_float_metric(value))
-
-        return {
-            "stage": "grid",
-            "params": dict(params),
-            "metric": float(np.mean(per_run)),
-            "per_run_metrics": per_run,
-        }
-
-    @staticmethod
-    def _as_float_metric(value):
         try:
             import torch
         except ImportError:
@@ -914,47 +834,45 @@ class FOGASHyperOptimizer:
         if not history:
             return
 
-        if result["mode"] != "grid":
-            metrics = np.array([record["metric"] for record in history], dtype=float)
-            best_so_far = np.minimum.accumulate(metrics)
-
-            plt.figure(figsize=(8, 5))
-            plt.plot(best_so_far, marker="o", linewidth=2)
-            plt.xlabel("Evaluation")
-            plt.ylabel("Best metric so far")
-            plt.title("FOGAS hyperparameter optimization")
-            plt.grid(True)
-            plt.tight_layout()
-            plt.show()
-            return
-
         varied = [
             parameter
             for parameter in parameters
             if len({record["params"][parameter] for record in history}) > 1
         ]
-        if len(varied) == 1:
-            p = varied[0]
-            xs = [record["params"][p] for record in history]
-            ys = [record["metric"] for record in history]
-            plt.figure(figsize=(8, 5))
-            plt.plot(xs, ys, marker="o", linewidth=0)
-            plt.xlabel(p)
-            plt.ylabel("Metric")
-            plt.title(f"Grid search: {p}")
-            plt.grid(True)
-            plt.tight_layout()
-            plt.show()
-        elif len(varied) == 2:
-            p1, p2 = varied
-            xs = [record["params"][p1] for record in history]
-            ys = [record["params"][p2] for record in history]
-            cs = [record["metric"] for record in history]
-            plt.figure(figsize=(8, 5))
-            scatter = plt.scatter(xs, ys, c=cs)
-            plt.xlabel(p1)
-            plt.ylabel(p2)
-            plt.title(f"Grid search: {p1} vs {p2}")
-            plt.colorbar(scatter, label="Metric")
-            plt.tight_layout()
-            plt.show()
+        if not varied:
+            return
+
+        fig, axes = plt.subplots(
+            len(varied),
+            1,
+            figsize=(8, max(4, 3 * len(varied))),
+            squeeze=False,
+        )
+
+        for ax, parameter in zip(axes[:, 0], varied):
+            grouped = {}
+            for record in history:
+                value = self._coerce_numeric(record["params"][parameter])
+                grouped.setdefault(value, []).extend(
+                    float(metric) for metric in record.get("per_run_metrics", [record["metric"]])
+                )
+
+            xs = sorted(grouped)
+            means = []
+            intervals = []
+            for value in xs:
+                samples = np.asarray(grouped[value], dtype=float)
+                means.append(float(np.mean(samples)))
+                if len(samples) > 1:
+                    intervals.append(float(1.96 * np.std(samples, ddof=1) / np.sqrt(len(samples))))
+                else:
+                    intervals.append(0.0)
+
+            ax.errorbar(xs, means, yerr=intervals, marker="o", capsize=4, linewidth=1.5)
+            ax.set_xlabel(parameter)
+            ax.set_ylabel("Metric")
+            ax.set_title(f"{parameter} metric by tried value")
+            ax.grid(True)
+
+        plt.tight_layout()
+        plt.show()

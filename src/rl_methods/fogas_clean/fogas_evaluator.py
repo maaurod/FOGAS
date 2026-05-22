@@ -393,8 +393,9 @@ class FOGASEvaluator:
         """
         planner = self._require_planner()
         pi = self.get_policy(policy_mode)
-        v_star = planner.v_star
-        q_star = planner.q_star
+        device = self.mdp.r.device
+        v_star = planner.v_star.to(dtype=torch.float64, device=device)
+        q_star = planner.q_star.to(dtype=torch.float64, device=device)
         v_pi, q_pi = planner.evaluate_policy(pi)
 
         print("\n========== VALUE FUNCTION COMPARISON ==========\n")

@@ -129,15 +129,6 @@ def build_mdp():
         vec[int(x) * n_actions + int(a)] = 1.0
         return vec
 
-    step_cost = -0.1
-    goal_reward = 1.0
-    pit_reward = -5.0
-
-    omega = torch.full((n_states * n_actions,), step_cost, dtype=torch.float64)
-    omega[goal * n_actions : goal * n_actions + n_actions] = goal_reward
-    for pit in pits:
-        omega[pit * n_actions : pit * n_actions + n_actions] = pit_reward
-
     def to_rc(s):
         return divmod(s, 10)
 
@@ -165,6 +156,26 @@ def build_mdp():
             return s
         return next_s
 
+    terminal_states = {goal, *pits}
+    step_cost = -0.1
+    goal_reward = 1.0
+    pit_reward = -5.0
+    terminal_self_loop_reward = 0.0
+
+    omega = torch.empty(n_states * n_actions, dtype=torch.float64)
+    for state in range(n_states):
+        for action in range(n_actions):
+            next_s = next_state(state, action)
+            idx = state * n_actions + action
+            if state in terminal_states:
+                omega[idx] = terminal_self_loop_reward
+            elif next_s == goal:
+                omega[idx] = goal_reward
+            elif next_s in pits:
+                omega[idx] = pit_reward
+            else:
+                omega[idx] = step_cost
+
     def psi(xp):
         v = torch.zeros(n_states * n_actions, dtype=torch.float64)
         for x in states:
@@ -173,7 +184,6 @@ def build_mdp():
                     v[int(x) * n_actions + int(a)] = 1.0
         return v
 
-    terminal_states = {goal, *pits}
     mdp = DiscreteMDP(
         states=states,
         actions=actions,
@@ -212,8 +222,13 @@ def ordered_results_frame(results):
         return df
 
     return df.sort_values(
-        by=["greedy_success_rate", "greedy_avg_reward"],
-        ascending=[False, False],
+        by=[
+            "greedy_success_rate",
+            "solver_success_rate",
+            "greedy_avg_reward",
+            "solver_avg_reward",
+        ],
+        ascending=[False, False, False, False],
         na_position="last",
     ).reset_index(drop=True)
 
@@ -228,34 +243,18 @@ def save_results(results):
         successful.head(1).to_csv(BEST_CSV, index=False)
 
 
-def greedy_goal_count(evaluator, goal, terminal_states):
+def success_rate(evaluator, policy_mode, goal, terminal_states):
     count = 0
     for idx in range(NUM_TRAJECTORIES):
         trajectory = evaluator.simulate_trajectory(
-            policy_mode="greedy",
+            policy_mode=policy_mode,
             max_steps=MAX_STEPS,
             seed=SEED + idx,
             goal_state=goal,
             terminal_states=terminal_states,
         )
         count += int(bool(trajectory) and trajectory[-1]["next_state"] == int(goal))
-    return count
-
-
-def single_path_diagnostics(evaluator, goal, terminal_states):
-    trajectory = evaluator.simulate_trajectory(
-        policy_mode="greedy",
-        max_steps=MAX_STEPS,
-        seed=SEED,
-        goal_state=goal,
-        terminal_states=terminal_states,
-    )
-    if not trajectory:
-        return False, -1, 0
-
-    final_state = int(trajectory[-1]["next_state"])
-    reached_goal = final_state == int(goal)
-    return reached_goal, final_state, len(trajectory)
+    return float(count / NUM_TRAJECTORIES)
 
 
 def run_candidate(solver, evaluator, params, device, goal, terminal_states, progress):
@@ -274,11 +273,9 @@ def run_candidate(solver, evaluator, params, device, goal, terminal_states, prog
         "error": "",
         "elapsed_seconds": np.nan,
         "greedy_avg_reward": np.nan,
-        "greedy_goal_count": np.nan,
         "greedy_success_rate": np.nan,
-        "reached_goal": False,
-        "final_state": -1,
-        "path_length": 0,
+        "solver_avg_reward": np.nan,
+        "solver_success_rate": np.nan,
     }
 
     try:
@@ -291,26 +288,30 @@ def run_candidate(solver, evaluator, params, device, goal, terminal_states, prog
             tqdm_print=progress,
         )
 
-        avg_reward = evaluator.average_return(
+        greedy_avg_reward = evaluator.average_return(
             policy_mode="greedy",
             num_trajectories=NUM_TRAJECTORIES,
             max_steps=MAX_STEPS,
             seed=SEED,
             terminal_states=terminal_states,
         )["policy"]
-        goal_count = greedy_goal_count(evaluator, goal, terminal_states)
-        reached_goal, final_state, path_length = single_path_diagnostics(
-            evaluator, goal, terminal_states
-        )
+        greedy_success_rate = success_rate(evaluator, "greedy", goal, terminal_states)
+
+        solver_avg_reward = evaluator.average_return(
+            policy_mode="solver",
+            num_trajectories=NUM_TRAJECTORIES,
+            max_steps=MAX_STEPS,
+            seed=SEED,
+            terminal_states=terminal_states,
+        )["policy"]
+        solver_success_rate = success_rate(evaluator, "solver", goal, terminal_states)
 
         row.update(
             {
-                "greedy_avg_reward": float(avg_reward),
-                "greedy_goal_count": int(goal_count),
-                "greedy_success_rate": float(goal_count / NUM_TRAJECTORIES),
-                "reached_goal": bool(reached_goal),
-                "final_state": int(final_state),
-                "path_length": int(path_length),
+                "greedy_avg_reward": float(greedy_avg_reward),
+                "greedy_success_rate": float(greedy_success_rate),
+                "solver_avg_reward": float(solver_avg_reward),
+                "solver_success_rate": float(solver_success_rate),
             }
         )
     except Exception as exc:
@@ -395,6 +396,7 @@ def main():
                 {
                     "success": row["greedy_success_rate"],
                     "reward": row["greedy_avg_reward"],
+                    "solver_success": row["solver_success_rate"],
                     "status": row["status"],
                 }
             )

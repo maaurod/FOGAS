@@ -418,6 +418,12 @@ class DiscreteDataBuffer:
         return int(self.rng.choice(len(proportions), p=proportions))
 
     @staticmethod
+    def _fine_to_coarse_state(x_fine, *, fine_size, coarse_size, factor):
+        r_f, c_f = divmod(int(x_fine), int(fine_size))
+        r_c, c_c = r_f // int(factor), c_f // int(factor)
+        return int(r_c * int(coarse_size) + c_c)
+
+    @staticmethod
     def _save_fogas_csv(df, save_path):
         directory = os.path.dirname(save_path)
         if directory:
@@ -550,6 +556,146 @@ class DiscreteDataBuffer:
 
         if verbose:
             self._print_collect_summary(df, save_path=save_path)
+
+        return df
+
+    def collect_macro_dataset_n_repeated_actions(
+        self,
+        *,
+        policy="random",
+        n_macro_steps=1000,
+        gamma=0.99,
+        fine_size=20,
+        coarse_size=10,
+        factor=2,
+        n_repeats=None,
+        save_path=None,
+        verbose=True,
+    ):
+        """
+        Collect macro transitions by repeating the same fine action.
+
+        Each row saved to CSV is:
+            coarse(s_t), a_t, sum_k gamma^k r_{t+k}, coarse(s_{t+n_repeats})
+
+        The returned DataFrame includes diagnostic fine-state and macro metadata.
+        """
+        n_macro_steps = int(n_macro_steps)
+        fine_size = int(fine_size)
+        coarse_size = int(coarse_size)
+        factor = int(factor)
+        n_repeats = factor if n_repeats is None else int(n_repeats)
+
+        if n_macro_steps < 0:
+            raise ValueError("n_macro_steps must be nonnegative.")
+        if n_repeats <= 0:
+            raise ValueError("n_repeats must be positive.")
+        if fine_size <= 0 or coarse_size <= 0 or factor <= 0:
+            raise ValueError("fine_size, coarse_size, and factor must be positive.")
+        if coarse_size * factor != fine_size:
+            raise ValueError(
+                "Expected fine_size == coarse_size * factor, got "
+                f"{fine_size} != {coarse_size} * {factor}."
+            )
+        if fine_size * fine_size != self.N:
+            raise ValueError(
+                "fine_size must match the MDP state count, got "
+                f"{fine_size}^2 != {self.N}."
+            )
+
+        policy_object = self._make_policy(policy)
+
+        data = {
+            "episode": [],
+            "macro_step": [],
+            "fine_state": [],
+            "state": [],
+            "action": [],
+            "reward": [],
+            "next_fine_state": [],
+            "next_state": [],
+            "macro_complete": [],
+            "reset_mode": [],
+            "restricted_start": [],
+        }
+
+        episode = 0
+        macro_step = 0
+        fine_step = 0
+        state, reset_mode, restricted_start = self._sample_reset()
+
+        for _ in range(n_macro_steps):
+            fine_state = int(state)
+            coarse_state = self._fine_to_coarse_state(
+                fine_state,
+                fine_size=fine_size,
+                coarse_size=coarse_size,
+                factor=factor,
+            )
+
+            if restricted_start:
+                action = int(self.rng.integers(self.A))
+            else:
+                action = self._validate_action_id(policy_object.sample(state))
+
+            macro_reward = 0.0
+            any_terminated = False
+            any_truncated = False
+
+            for k in range(n_repeats):
+                next_state, reward, terminated, truncated = self._step_from(
+                    state,
+                    action,
+                    fine_step,
+                )
+                macro_reward += (float(gamma) ** k) * float(reward)
+
+                state = next_state
+                fine_step += 1
+
+                if terminated:
+                    any_terminated = True
+                if truncated:
+                    any_truncated = True
+                    break
+
+            next_fine_state = int(state)
+            next_coarse_state = self._fine_to_coarse_state(
+                next_fine_state,
+                fine_size=fine_size,
+                coarse_size=coarse_size,
+                factor=factor,
+            )
+
+            data["episode"].append(episode)
+            data["macro_step"].append(macro_step)
+            data["fine_state"].append(fine_state)
+            data["state"].append(coarse_state)
+            data["action"].append(int(action))
+            data["reward"].append(float(macro_reward))
+            data["next_fine_state"].append(next_fine_state)
+            data["next_state"].append(next_coarse_state)
+            data["macro_complete"].append(not any_truncated)
+            data["reset_mode"].append(reset_mode)
+            data["restricted_start"].append(bool(restricted_start))
+
+            macro_step += 1
+
+            if any_terminated or any_truncated:
+                episode += 1
+                macro_step = 0
+                fine_step = 0
+                state, reset_mode, restricted_start = self._sample_reset()
+
+        df = pd.DataFrame(data)
+
+        if save_path is not None:
+            self._save_fogas_csv(df, save_path)
+
+        if verbose:
+            print(f"Collected {len(df)} macro transitions ({n_repeats} fine steps each).")
+            if save_path is not None:
+                print(f"Saved FOGAS macro dataset to {save_path}")
 
         return df
 

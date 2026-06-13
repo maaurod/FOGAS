@@ -1,16 +1,16 @@
 #!/bin/bash
-# Submit MountainCar rebuilt grid search as a batch job on a GPU node
-# Usage: bash submit_grid_search_mountaincar_rebuilt.sh [time] [gpu_count]
+# Submit MountainCar grid search as a batch job on a GPU node
+# Usage: bash submit_grid_mountaincar.sh [time] [gpu_count]
 
 TIME=${1:-"20:00:00"}
 GPU_COUNT=${2:-1}
-JOB_NAME="mc_rebuilt"
+JOB_NAME="grid_mountaincar"
 
 LOG_DIR="/shared/home/mauro.diaz/logs/fogas"
 mkdir -p "$LOG_DIR"
 LOG_FILE="$LOG_DIR/${JOB_NAME}_%j.log"
 
-echo "📤 Submitting MountainCar rebuilt grid search job to the frida partition..."
+echo "📤 Submitting MountainCar grid search job to the frida partition..."
 echo "   GPUs       : $GPU_COUNT × A100_80GB"
 echo "   Log        : $LOG_FILE"
 echo ""
@@ -36,7 +36,7 @@ echo "🎮 GPUs available:"
 nvidia-smi --query-gpu=index,name,memory.total --format=csv,noheader
 echo ""
 
-python3 /shared/home/mauro.diaz/work/FOGAS/testing_vectorized/utils/grid_search_mountaincar_rebuilt.py
+python3 /shared/home/mauro.diaz/work/FOGAS/experiments/fogas_clean/scripts/grid_mountaincar.py
 
 echo ""
 echo "✅ Job finished at: \$(date)"

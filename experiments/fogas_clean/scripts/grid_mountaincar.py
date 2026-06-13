@@ -1,4 +1,5 @@
 import json
+import os
 import random
 import sys
 import tempfile
@@ -21,19 +22,25 @@ def find_root(current_path, marker="setup.py"):
 
 
 PROJECT_ROOT = find_root(Path(__file__).resolve())
+DATASETS_DIR = PROJECT_ROOT / "data" / "datasets_clean"
+RESULTS_DIR = PROJECT_ROOT / "data" / "results_clean" / "mountainCar"
+MPLCONFIGDIR = Path(tempfile.gettempdir()) / "matplotlib"
+MPLCONFIGDIR.mkdir(parents=True, exist_ok=True)
+os.environ.setdefault("MPLCONFIGDIR", str(MPLCONFIGDIR))
+
 if str(PROJECT_ROOT / "src") not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 
-from rl_methods import (  # noqa: E402
-    BoxStateDiscretizer,
-    DiscreteActionDiscretizer,
-    FeatureOnlyAbstractMDP,
-    build_uniform_reset_distribution_from_policy_trajectory,
-    collect_change_of_state_dataset_from_env_policy,
-    run_q_learning,
-)
+from rl_methods.data_collection_clean import GymDataBuffer  # noqa: E402
 from rl_methods.fogas_clean import FOGASSolver  # noqa: E402
+from rl_methods.fqi_clean import FQISolver  # noqa: E402
+from rl_methods.mdp_clean import (  # noqa: E402
+    ActionDiscretizer,
+    FeaturesMDP,
+    StateDiscretizer,
+)
+from rl_methods.q_learning import run_q_learning  # noqa: E402
 
 
 SEED = 44
@@ -58,7 +65,7 @@ RBF_BINS = np.array([15, 15], dtype=np.int64)
 VARIANCE_SCALE = 0.05
 
 Q_LEARNING_CONFIG = {
-    "episodes": 5000,
+    "episodes": 6000,
     "alpha": 0.9,
     "gamma": 0.9,
     "epsilon_start": 1.0,
@@ -73,13 +80,10 @@ DATASET_GRID = {
         (0.6, 0.4),
         (0.4, 0.6),
         (0.2, 0.8),
-        (0.0, 1.0)
+        (0.0, 1.0),
     ],
 }
 
-# Fill these with the reset mixtures you want to test.
-# If a config includes "custom", the script uses the reset distribution built
-# from the Q-learning trajectory exactly like in the notebook.
 RESET_CONFIGS = [
     {"name": "x0_0_custom_100", "reset_probs": {"x0": 0.0, "custom": 1.0}},
     {"name": "x0_10_custom_90", "reset_probs": {"x0": 0.1, "custom": 0.9}},
@@ -100,12 +104,19 @@ FOGAS_CONFIG = {
     "T": 20_000,
 }
 
+FQI_CONFIG = {
+    "K": 5_000,
+    "tau": 0.1,
+    "ridge": 1e-2,
+    "augment_terminal_transitions": True,
+}
+
 EVAL_CONFIG = {
     "n_trials": 10,
     "max_steps": TIME_LIMIT,
 }
 
-OUTPUT_CSV = RESULTS_DIR / "grids" / "mountaincar_rebuilt_grid_search.csv"
+OUTPUT_CSV = RESULTS_DIR / "grids" / "grid_mountaincar.csv"
 
 
 def set_global_seed(seed):
@@ -114,16 +125,21 @@ def set_global_seed(seed):
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+    if hasattr(torch.backends, "cudnn"):
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
 
 
 def build_abstraction():
-    state_disc = BoxStateDiscretizer(
+    state_disc = StateDiscretizer(
         low=OBS_LOW,
         high=OBS_HIGH,
         bins=STATE_BINS,
-        terminal_obs_predicate=lambda obs: obs[0] >= GOAL_POSITION and obs[1] >= GOAL_VELOCITY,
+        terminal_obs_predicate=lambda obs: (
+            obs[0] >= GOAL_POSITION and obs[1] >= GOAL_VELOCITY
+        ),
     )
-    action_disc = DiscreteActionDiscretizer(
+    action_disc = ActionDiscretizer(
         action_values=ACTION_IDS,
         action_labels=ACTION_LABELS,
     )
@@ -142,7 +158,7 @@ def build_rbf_mdp(state_disc, action_disc):
     rbf_centers = np.array(list(itertools.product(*rbf_grid_centers)), dtype=np.float64)
 
     width_position = (MAX_POSITION - MIN_POSITION) / RBF_BINS[0]
-    width_velocity = (2 * MAX_SPEED) / RBF_BINS[1]
+    width_velocity = (MAX_SPEED - (-MAX_SPEED)) / RBF_BINS[1]
     sigma_squared = np.array(
         [width_position**2, width_velocity**2],
         dtype=np.float64,
@@ -164,7 +180,7 @@ def build_rbf_mdp(state_disc, action_disc):
         feat[start_idx:start_idx + k_centers] = f_x
         return torch.from_numpy(feat)
 
-    return FeatureOnlyAbstractMDP(
+    return FeaturesMDP(
         states=states,
         actions=actions,
         phi=phi_rbf,
@@ -219,6 +235,7 @@ def evaluate_policy_mean_steps(
     n_trials=10,
     max_steps=200,
     seed=SEED,
+    action_selection="greedy",
 ):
     if hasattr(policy, "detach"):
         policy = policy.detach().cpu()
@@ -226,6 +243,13 @@ def evaluate_policy_mean_steps(
     if policy.ndim == 1:
         policy = policy.reshape(state_disc.n_states, action_disc.n_actions)
 
+    if action_selection not in {"greedy", "sample"}:
+        raise ValueError(
+            "action_selection must be one of {'greedy', 'sample'}, "
+            f"got {action_selection}"
+        )
+
+    rng = np.random.default_rng(seed)
     env = gym.make(env_id, max_episode_steps=max_steps, goal_velocity=goal_velocity)
     total_steps_list = []
     success_count = 0
@@ -237,7 +261,19 @@ def evaluate_policy_mean_steps(
 
         while not done:
             state_id = state_disc.obs_to_state_id(obs)
-            action_id = int(torch.argmax(policy[state_id]).item())
+            action_probs = policy[state_id]
+            if action_selection == "greedy":
+                action_id = int(torch.argmax(action_probs).item())
+            else:
+                probs = action_probs.numpy().astype(np.float64)
+                probs = np.clip(probs, 0.0, None)
+                prob_sum = probs.sum()
+                if not np.isfinite(prob_sum) or np.isclose(prob_sum, 0.0):
+                    probs = np.full(action_disc.n_actions, 1.0 / action_disc.n_actions)
+                else:
+                    probs = probs / prob_sum
+                action_id = int(rng.choice(action_disc.n_actions, p=probs))
+
             env_action = action_disc.action_id_to_env_action(action_id)
             obs, _, terminated, truncated, _ = env.step(env_action)
             steps += 1
@@ -250,6 +286,121 @@ def evaluate_policy_mean_steps(
     env.close()
     mean_steps = float(np.mean(total_steps_list))
     return mean_steps, success_count
+
+
+def run_fogas(mdp, dataset_path, state_disc, action_disc, device, seed):
+    solver = FOGASSolver(
+        mdp=mdp,
+        phi=mdp.phi,
+        csv_path=dataset_path,
+        device=device,
+        beta=FOGAS_CONFIG["beta"],
+        seed=seed,
+    )
+    solver.run(
+        alpha=FOGAS_CONFIG["alpha"],
+        eta=FOGAS_CONFIG["eta"],
+        rho=FOGAS_CONFIG["rho"],
+        T=FOGAS_CONFIG["T"],
+        tqdm_print=False,
+    )
+
+    greedy_mean_steps, greedy_success_count = evaluate_policy_mean_steps(
+        policy=solver.pi,
+        state_disc=state_disc,
+        action_disc=action_disc,
+        n_trials=EVAL_CONFIG["n_trials"],
+        max_steps=EVAL_CONFIG["max_steps"],
+        seed=seed,
+        action_selection="greedy",
+    )
+    solver_mean_steps, solver_success_count = evaluate_policy_mean_steps(
+        policy=solver.pi,
+        state_disc=state_disc,
+        action_disc=action_disc,
+        n_trials=EVAL_CONFIG["n_trials"],
+        max_steps=EVAL_CONFIG["max_steps"],
+        seed=seed + 100_000,
+        action_selection="sample",
+    )
+
+    return {
+        "mean_steps": greedy_mean_steps,
+        "successes": greedy_success_count,
+        "solver_alpha": FOGAS_CONFIG["alpha"],
+        "solver_eta": FOGAS_CONFIG["eta"],
+        "solver_rho": FOGAS_CONFIG["rho"],
+        "solver_T": FOGAS_CONFIG["T"],
+        "solver_beta": FOGAS_CONFIG["beta"],
+        "fogas_mean_steps": greedy_mean_steps,
+        "fogas_successes": greedy_success_count,
+        "fogas_greedy_mean_steps": greedy_mean_steps,
+        "fogas_greedy_successes": greedy_success_count,
+        "fogas_solver_mean_steps": solver_mean_steps,
+        "fogas_solver_successes": solver_success_count,
+        "fogas_alpha": FOGAS_CONFIG["alpha"],
+        "fogas_eta": FOGAS_CONFIG["eta"],
+        "fogas_rho": FOGAS_CONFIG["rho"],
+        "fogas_T": FOGAS_CONFIG["T"],
+        "fogas_beta": FOGAS_CONFIG["beta"],
+        "fogas_status": "ok",
+        "fogas_error": "",
+    }
+
+
+def run_fqi(mdp, dataset_path, state_disc, action_disc, device, seed):
+    solver = FQISolver(
+        mdp=mdp,
+        phi=mdp.phi,
+        csv_path=dataset_path,
+        device=device,
+        seed=seed,
+        ridge=FQI_CONFIG["ridge"],
+        augment_terminal_transitions=FQI_CONFIG["augment_terminal_transitions"],
+    )
+    solver.run(
+        K=FQI_CONFIG["K"],
+        tau=FQI_CONFIG["tau"],
+        verbose=False,
+    )
+
+    mean_steps, success_count = evaluate_policy_mean_steps(
+        policy=solver.pi,
+        state_disc=state_disc,
+        action_disc=action_disc,
+        n_trials=EVAL_CONFIG["n_trials"],
+        max_steps=EVAL_CONFIG["max_steps"],
+        seed=seed,
+    )
+
+    theta_delta = np.nan
+    if len(solver.theta_history) >= 2:
+        theta_delta = float(
+            torch.linalg.norm(
+                solver.theta_history[-1] - solver.theta_history[-2]
+            ).detach().cpu().item()
+        )
+
+    return {
+        "fqi_mean_steps": mean_steps,
+        "fqi_successes": success_count,
+        "fqi_greedy_mean_steps": mean_steps,
+        "fqi_greedy_successes": success_count,
+        "fqi_solver_mean_steps": mean_steps,
+        "fqi_solver_successes": success_count,
+        "fqi_K": FQI_CONFIG["K"],
+        "fqi_tau": FQI_CONFIG["tau"],
+        "fqi_ridge": FQI_CONFIG["ridge"],
+        "fqi_augment_terminal_transitions": FQI_CONFIG[
+            "augment_terminal_transitions"
+        ],
+        "fqi_added_terminal_samples": int(
+            getattr(solver, "added_terminal_samples", 0)
+        ),
+        "fqi_final_theta_delta": theta_delta,
+        "fqi_status": "ok",
+        "fqi_error": "",
+    }
 
 
 def run_single_experiment(
@@ -266,7 +417,7 @@ def run_single_experiment(
     dataset_path,
     seed,
 ):
-    dataset_df = collect_change_of_state_dataset_from_env_policy(
+    dataset_df = GymDataBuffer.collect(
         policy_matrix=pi_matrix_ql,
         state_disc=state_disc,
         action_disc=action_disc,
@@ -285,35 +436,12 @@ def run_single_experiment(
         drop_self_transitions=False,
         start_obs=INITIAL_OBS_REFERENCE,
         goal_velocity=GOAL_VELOCITY,
+        wait_for_state_change=False,
     )
 
     mdp = build_mdp(feature_type, state_disc, action_disc)
-    solver = FOGASSolver(
-        mdp=mdp,
-        phi=mdp.phi,
-        csv_path=dataset_path,
-        device=device,
-        beta=FOGAS_CONFIG["beta"],
-        seed=seed,
-    )
-    solver.run(
-        alpha=FOGAS_CONFIG["alpha"],
-        eta=FOGAS_CONFIG["eta"],
-        rho=FOGAS_CONFIG["rho"],
-        T=FOGAS_CONFIG["T"],
-        tqdm_print=False,
-    )
 
-    mean_steps, success_count = evaluate_policy_mean_steps(
-        policy=solver.pi,
-        state_disc=state_disc,
-        action_disc=action_disc,
-        n_trials=EVAL_CONFIG["n_trials"],
-        max_steps=EVAL_CONFIG["max_steps"],
-        seed=seed,
-    )
-
-    return {
+    row = {
         "feature_type": feature_type,
         "reset_name": reset_config["name"],
         "reset_probs": json.dumps(reset_config["reset_probs"], sort_keys=True),
@@ -321,17 +449,82 @@ def run_single_experiment(
         "random_fraction": proportions[1],
         "epsilon": epsilon,
         "n_transitions": n_transitions,
-        "mean_steps": mean_steps,
-        "successes": success_count,
-        "solver_alpha": FOGAS_CONFIG["alpha"],
-        "solver_eta": FOGAS_CONFIG["eta"],
-        "solver_rho": FOGAS_CONFIG["rho"],
-        "solver_T": FOGAS_CONFIG["T"],
-        "solver_beta": FOGAS_CONFIG["beta"],
         "dataset_rows": len(dataset_df),
         "status": "ok",
         "error": "",
     }
+
+    try:
+        row.update(
+            run_fogas(
+                mdp=mdp,
+                dataset_path=dataset_path,
+                state_disc=state_disc,
+                action_disc=action_disc,
+                device=device,
+                seed=seed,
+            )
+        )
+    except Exception as exc:
+        row.update({
+            "mean_steps": np.nan,
+            "successes": np.nan,
+            "solver_alpha": FOGAS_CONFIG["alpha"],
+            "solver_eta": FOGAS_CONFIG["eta"],
+            "solver_rho": FOGAS_CONFIG["rho"],
+            "solver_T": FOGAS_CONFIG["T"],
+            "solver_beta": FOGAS_CONFIG["beta"],
+            "fogas_mean_steps": np.nan,
+            "fogas_successes": np.nan,
+            "fogas_greedy_mean_steps": np.nan,
+            "fogas_greedy_successes": np.nan,
+            "fogas_solver_mean_steps": np.nan,
+            "fogas_solver_successes": np.nan,
+            "fogas_alpha": FOGAS_CONFIG["alpha"],
+            "fogas_eta": FOGAS_CONFIG["eta"],
+            "fogas_rho": FOGAS_CONFIG["rho"],
+            "fogas_T": FOGAS_CONFIG["T"],
+            "fogas_beta": FOGAS_CONFIG["beta"],
+            "fogas_status": "error",
+            "fogas_error": str(exc),
+        })
+
+    try:
+        row.update(
+            run_fqi(
+                mdp=mdp,
+                dataset_path=dataset_path,
+                state_disc=state_disc,
+                action_disc=action_disc,
+                device=device,
+                seed=seed,
+            )
+        )
+    except Exception as exc:
+        row.update({
+            "fqi_mean_steps": np.nan,
+            "fqi_successes": np.nan,
+            "fqi_greedy_mean_steps": np.nan,
+            "fqi_greedy_successes": np.nan,
+            "fqi_solver_mean_steps": np.nan,
+            "fqi_solver_successes": np.nan,
+            "fqi_K": FQI_CONFIG["K"],
+            "fqi_tau": FQI_CONFIG["tau"],
+            "fqi_ridge": FQI_CONFIG["ridge"],
+            "fqi_augment_terminal_transitions": FQI_CONFIG[
+                "augment_terminal_transitions"
+            ],
+            "fqi_added_terminal_samples": np.nan,
+            "fqi_final_theta_delta": np.nan,
+            "fqi_status": "error",
+            "fqi_error": str(exc),
+        })
+
+    if row["fogas_status"] != "ok" or row["fqi_status"] != "ok":
+        row["status"] = "partial_error"
+        row["error"] = "one_or_more_algorithms_failed"
+
+    return row
 
 
 def main():
@@ -342,7 +535,7 @@ def main():
     state_disc, action_disc = build_abstraction()
     pi_matrix_ql = build_q_learning_policy(state_disc, action_disc, seed=SEED)
     _, trajectory_reset_distribution, trajectory_steps = (
-        build_uniform_reset_distribution_from_policy_trajectory(
+        GymDataBuffer.create_distribution(
             policy_matrix=pi_matrix_ql,
             state_disc=state_disc,
             action_disc=action_disc,
@@ -369,7 +562,7 @@ def main():
 
     with tempfile.TemporaryDirectory(prefix="mountaincar_grid_") as temp_dir:
         run_idx = 0
-        with tqdm(total=total_runs, desc="MountainCar rebuilt grid") as pbar:
+        with tqdm(total=total_runs, desc="MountainCar grid") as pbar:
             for feature_type in FEATURE_TYPES:
                 for reset_config in RESET_CONFIGS:
                     for proportions in DATASET_GRID["proportions"]:
@@ -413,6 +606,7 @@ def main():
                                         "random_fraction": proportions[1],
                                         "epsilon": epsilon,
                                         "n_transitions": n_transitions,
+                                        "dataset_rows": np.nan,
                                         "mean_steps": np.nan,
                                         "successes": np.nan,
                                         "solver_alpha": FOGAS_CONFIG["alpha"],
@@ -420,7 +614,35 @@ def main():
                                         "solver_rho": FOGAS_CONFIG["rho"],
                                         "solver_T": FOGAS_CONFIG["T"],
                                         "solver_beta": FOGAS_CONFIG["beta"],
-                                        "dataset_rows": np.nan,
+                                        "fogas_mean_steps": np.nan,
+                                        "fogas_successes": np.nan,
+                                        "fogas_greedy_mean_steps": np.nan,
+                                        "fogas_greedy_successes": np.nan,
+                                        "fogas_solver_mean_steps": np.nan,
+                                        "fogas_solver_successes": np.nan,
+                                        "fogas_alpha": FOGAS_CONFIG["alpha"],
+                                        "fogas_eta": FOGAS_CONFIG["eta"],
+                                        "fogas_rho": FOGAS_CONFIG["rho"],
+                                        "fogas_T": FOGAS_CONFIG["T"],
+                                        "fogas_beta": FOGAS_CONFIG["beta"],
+                                        "fogas_status": "not_run",
+                                        "fogas_error": "",
+                                        "fqi_mean_steps": np.nan,
+                                        "fqi_successes": np.nan,
+                                        "fqi_greedy_mean_steps": np.nan,
+                                        "fqi_greedy_successes": np.nan,
+                                        "fqi_solver_mean_steps": np.nan,
+                                        "fqi_solver_successes": np.nan,
+                                        "fqi_K": FQI_CONFIG["K"],
+                                        "fqi_tau": FQI_CONFIG["tau"],
+                                        "fqi_ridge": FQI_CONFIG["ridge"],
+                                        "fqi_augment_terminal_transitions": FQI_CONFIG[
+                                            "augment_terminal_transitions"
+                                        ],
+                                        "fqi_added_terminal_samples": np.nan,
+                                        "fqi_final_theta_delta": np.nan,
+                                        "fqi_status": "not_run",
+                                        "fqi_error": "",
                                         "status": "error",
                                         "error": str(exc),
                                     }

@@ -2,7 +2,7 @@
 
 The search uses the tabular value, rho, and softmax-linear policy
 parametrizations on fixed offline CSV datasets. One row is written per
-dataset/hyperparameter configuration after 30k SBEED updates.
+dataset/hyperparameter/step-count configuration after SBEED updates.
 """
 
 from __future__ import annotations
@@ -60,7 +60,7 @@ ETA = 1.0
 TAU = 500.0
 ROLLOUT_LENGTH = 1
 BATCH_SIZE = None
-STEPS = 30_000
+STEP_GRID = [3_000, 5_000, 10_000]
 MAX_EVAL_STEPS = 50
 N_EVAL_EPISODES = 100
 
@@ -432,7 +432,8 @@ def build_configs(args: argparse.Namespace) -> List[Dict[str, Any]]:
     for dataset_id, dataset_path in enumerate(args.dataset_paths):
         dataset_path = Path(dataset_path)
         dataset_name = dataset_path.stem
-        for lambda_entropy, lr_value, lr_rho, lr_policy in product(
+        for steps, lambda_entropy, lr_value, lr_rho, lr_policy in product(
+            args.step_grid,
             args.lambda_grid,
             args.lr_value_grid,
             args.lr_rho_grid,
@@ -452,7 +453,7 @@ def build_configs(args: argparse.Namespace) -> List[Dict[str, Any]]:
                     "seed": args.seed,
                     "device": args.device,
                     "torch_threads": args.torch_threads,
-                    "steps": args.steps,
+                    "steps": steps,
                 }
             )
     return configs
@@ -460,6 +461,10 @@ def build_configs(args: argparse.Namespace) -> List[Dict[str, Any]]:
 
 def parse_float_list(value: str) -> List[float]:
     return [float(item.strip()) for item in value.split(",") if item.strip()]
+
+
+def parse_int_list(value: str) -> List[int]:
+    return [int(item.strip()) for item in value.split(",") if item.strip()]
 
 
 def parse_path_list(value: str) -> List[Path]:
@@ -554,7 +559,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", type=str, default="cpu")
     parser.add_argument("--torch-threads", type=int, default=1)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--steps", type=int, default=STEPS)
+    parser.add_argument(
+        "--step-grid",
+        type=parse_int_list,
+        default=STEP_GRID,
+        help="Comma-separated SBEED update counts. Defaults to 3000,5000,10000.",
+    )
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--lambda-grid", type=parse_float_list, default=LAMBDA_GRID)
     parser.add_argument("--lr-value-grid", type=parse_float_list, default=LR_VALUE_GRID)
@@ -591,7 +601,7 @@ def main() -> None:
     print(f"Output CSV : {output_csv.resolve()}")
     print(f"Configs    : {len(configs)}")
     print(f"Workers    : {args.workers}")
-    print(f"Steps      : {args.steps}")
+    print(f"Step grid  : {args.step_grid}")
     print(f"Eval       : {N_EVAL_EPISODES} greedy stochastic rollouts, horizon {MAX_EVAL_STEPS}")
     print("Ranking    : greedy_success desc, eval_success_rate desc, eval_return_mean desc")
 

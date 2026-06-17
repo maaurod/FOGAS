@@ -930,13 +930,50 @@ class FinalParametrizedSolver:
             rows.append(torch.cat(row))
         return torch.stack(rows, dim=0)
 
-    def _compute_nonlinear_beta_update_direction(self, td_error):
+    def _u_sample_jacobian(self):
         params = self._trainable_params(self.u_param)
-        u_values = self._u_sample_values()
-        td = td_error.detach().to(dtype=u_values.dtype)
-        objective = (u_values * td).mean()
-        beta_grad = self._flat_grads(objective, params, retain_graph=True).detach()
-        jacobian = self._jacobian_outputs(u_values, params).detach()
+        if not params:
+            return torch.empty(self.n, 0, dtype=torch.float64, device=self.device)
+
+        try:
+            from torch.func import functional_call, grad, vmap
+        except ImportError:
+            outputs = self._u_sample_values()
+            return self._jacobian_outputs(outputs, params)
+
+        named_params = {
+            name: param
+            for name, param in self.u_param.named_parameters()
+            if param.requires_grad
+        }
+        buffers = dict(self.u_param.named_buffers())
+        param_names = list(named_params)
+
+        def single_u(param_dict, buffer_dict, state, action):
+            value = functional_call(
+                self.u_param,
+                (param_dict, buffer_dict),
+                (state, action),
+            )
+            return value.reshape(())
+
+        try:
+            grads = vmap(
+                grad(single_u),
+                in_dims=(None, None, 0, 0),
+            )(named_params, buffers, self.Xs, self.As)
+            return torch.cat(
+                [grads[name].reshape(self.n, -1) for name in param_names],
+                dim=1,
+            )
+        except Exception:
+            outputs = self._u_sample_values()
+            return self._jacobian_outputs(outputs, params)
+
+    def _compute_nonlinear_beta_update_direction(self, td_error):
+        jacobian = self._u_sample_jacobian().detach()
+        td = td_error.detach().to(dtype=jacobian.dtype)
+        beta_grad = (jacobian.T @ td) / self.n
 
         if self.beta_update == "fogas_full":
             H = (jacobian.T @ jacobian) / self.n

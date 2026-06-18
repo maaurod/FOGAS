@@ -328,6 +328,8 @@ def load_existing_results(resume, output_csv):
         return [], set()
 
     df = pd.read_csv(output_csv)
+    if "status" in df.columns:
+        df = df[df["status"] == "ok"].copy()
     rows = df.to_dict("records")
     completed = {candidate_key(row) for row in rows}
     return rows, completed

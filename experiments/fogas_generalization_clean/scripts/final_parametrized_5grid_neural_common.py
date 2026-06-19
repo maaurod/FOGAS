@@ -90,6 +90,37 @@ POLICY_OPTIMIZER = "adam"
 REINFORCE_SAMPLES = 1
 STATE_WEIGHT_UPDATE = "normal"
 
+# The stochastic grid is harder than the deterministic one: transition noise
+# and the pit make raw solver policies much less reliable than greedy rollouts.
+# These candidates put the next rerun around the best observed stochastic
+# regions first, then append the old broad baseline grid as a fallback.
+STOCHASTIC_BASE_POINTS = [
+    # Best greedy policy from the previous stochastic run.
+    (1e-3, 1e-5, 0.1, 1000, 3e-2, 3, 1e-4, (8,), 1e-3, "exact", 123),
+    # Best reinforce greedy policy.
+    (1e-3, 1e-5, 0.01, 600, 3e-2, 2, 1e-4, (16,), 1e-3, "reinforce", 123),
+    # Best raw solver policy.
+    (1e-3, 3e-5, 0.1, 1000, 3e-2, 3, 1e-3, (8,), 1e-4, "exact", 123),
+    # Good solver/greedy compromise with stronger theta regularization.
+    (1e-3, 3e-5, 0.1, 600, 1e-2, 3, 1e-2, (16,), 1e-3, "exact", 42),
+    # Good reinforce row with longer horizon and theta_lambda=1e-2.
+    (1e-3, 1e-5, 0.01, 1000, 1e-2, 3, 1e-2, (16,), 1e-4, "reinforce", 42),
+]
+
+STOCHASTIC_ONE_FACTOR_SWEEPS = {
+    0: [3e-4, 5e-4, 1e-3, 2e-3, 3e-3],
+    1: [3e-6, 1e-5, 3e-5, 1e-4],
+    2: [0.003, 0.01, 0.03, 0.05, 0.1, 0.2],
+    3: [300, 600, 1000, 1500, 2000],
+    4: [3e-3, 1e-2, 3e-2, 6e-2],
+    5: [2, 3, 5],
+    6: [1e-5, 1e-4, 1e-3, 1e-2, 3e-2],
+    7: [(8,), (16,), (32,), (16, 16)],
+    8: [1e-5, 1e-4, 1e-3, 1e-2],
+    9: ["exact", "reinforce"],
+    10: [42, 123, 777],
+}
+
 PROBLEMS = {
     "deterministic": {
         "description": "deterministic 5x5 FinalParametrizedSolver neural grid search",
@@ -591,9 +622,10 @@ def run_candidate(params, problem_name, mdp, planner, dataset_path, device, d_st
     return row
 
 
-def all_candidates():
-    return list(
-        itertools.product(
+def baseline_candidates():
+    return [
+        tuple(candidate)
+        for candidate in itertools.product(
             ALPHA_GRID,
             ETA_GRID,
             RHO_GRID,
@@ -606,23 +638,86 @@ def all_candidates():
             POLICY_GRADIENT_GRID,
             NN_SEED_GRID,
         )
+    ]
+
+
+def dedupe_candidates(candidates):
+    unique = []
+    seen = set()
+    for candidate in candidates:
+        candidate = tuple(candidate)
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        unique.append(candidate)
+    return unique
+
+
+def stochastic_one_factor_candidates():
+    candidates = list(STOCHASTIC_BASE_POINTS)
+    for base in STOCHASTIC_BASE_POINTS:
+        base = list(base)
+        for idx, values in STOCHASTIC_ONE_FACTOR_SWEEPS.items():
+            for value in values:
+                candidate = list(base)
+                candidate[idx] = value
+                candidates.append(tuple(candidate))
+    return candidates
+
+
+def stochastic_exact_focus_candidates():
+    return list(
+        itertools.product(
+            [5e-4, 1e-3, 2e-3],
+            [1e-5, 3e-5],
+            [0.05, 0.1, 0.2],
+            [1000, 1500, 2000],
+            [3e-2, 6e-2],
+            [3, 5],
+            [1e-4, 1e-3, 1e-2],
+            [(8,), (16,)],
+            [1e-4, 1e-3],
+            ["exact"],
+            [42, 123],
+        )
     )
 
 
-def total_grid_size():
-    return (
-        len(ALPHA_GRID)
-        * len(ETA_GRID)
-        * len(RHO_GRID)
-        * len(T_GRID)
-        * len(THETA_LR_GRID)
-        * len(THETA_INNER_STEPS_GRID)
-        * len(THETA_LAMBDA_GRID)
-        * len(HIDDEN_SIZES_GRID)
-        * len(BETA_REG_GRID)
-        * len(POLICY_GRADIENT_GRID)
-        * len(NN_SEED_GRID)
+def stochastic_reinforce_focus_candidates():
+    return list(
+        itertools.product(
+            [5e-4, 1e-3],
+            [1e-5, 3e-5],
+            [0.01, 0.05, 0.1],
+            [600, 1000, 1500],
+            [1e-2, 3e-2],
+            [2, 3],
+            [1e-4, 1e-3, 1e-2],
+            [(8,), (16,)],
+            [1e-4, 1e-3],
+            ["reinforce"],
+            [42, 123],
+        )
     )
+
+
+def stochastic_candidates():
+    priority_candidates = (
+        stochastic_one_factor_candidates()
+        + stochastic_exact_focus_candidates()
+        + stochastic_reinforce_focus_candidates()
+    )
+    return dedupe_candidates(priority_candidates + baseline_candidates())
+
+
+def all_candidates(problem_name=None):
+    if problem_name == "stochastic":
+        return stochastic_candidates()
+    return baseline_candidates()
+
+
+def total_grid_size(problem_name=None):
+    return len(all_candidates(problem_name))
 
 
 def run_grid_search(problem_name):
@@ -653,7 +748,7 @@ def run_grid_search(problem_name):
     d_star = planner.state_mu_star.detach().cpu()
     v_star = planner.v_star.detach().cpu()
 
-    candidates_all = all_candidates()
+    candidates_all = all_candidates(problem_name)
     if args.max_runs is not None:
         candidates_all = candidates_all[: max(0, int(args.max_runs))]
 
@@ -664,7 +759,7 @@ def run_grid_search(problem_name):
         if candidate_key(base_row(candidate, device)) not in completed
     ]
 
-    print(f"Total grid size: {total_grid_size()}")
+    print(f"Total grid size: {total_grid_size(problem_name)}")
     print(f"Candidates to run: {len(candidates)}")
     if args.resume:
         print(f"Resumed rows: {len(results)}")

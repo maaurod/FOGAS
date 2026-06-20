@@ -2,8 +2,8 @@
 Shared FinalParametrizedSolver neural grid-search utilities for 5x5 grids.
 
 This mirrors the FinalLinearSolver RBF search but uses small tanh MLP
-parametrizations for u_beta, Q_theta, and the policy. It is intentionally
-single-process for one-GPU runs and writes results after every candidate.
+parametrizations for u_beta, Q_theta, and the policy. It writes results after
+every candidate and can shard candidates across multiple GPU worker processes.
 """
 
 from __future__ import annotations
@@ -11,10 +11,12 @@ from __future__ import annotations
 import argparse
 import itertools
 import math
+import multiprocessing as mp
 import os
 import random
 import sys
 import time
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
 import numpy as np
@@ -165,19 +167,37 @@ def parse_args(description):
         "--device",
         type=str,
         default=str(DEFAULT_DEVICE),
-        help="Torch device for the single-process run, e.g. cuda, cuda:0, or cpu.",
+        help="Torch device for a single-worker run, e.g. cuda, cuda:0, or cpu.",
+    )
+    parser.add_argument(
+        "--devices",
+        type=str,
+        default=None,
+        help=(
+            "Comma-separated devices for parallel runs, e.g. cuda:0,cuda:1. "
+            "Use 'auto' to use all visible CUDA devices. Defaults to --device."
+        ),
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=None,
+        help=(
+            "Parallel candidate workers. Defaults to the number of --devices, "
+            "or 1 when --devices is omitted."
+        ),
     )
     parser.add_argument(
         "--torch-threads",
         type=int,
         default=1,
-        help="Torch CPU threads. Default 1 for one-GPU runs.",
+        help="Torch CPU threads per worker. Default 1 for GPU grid searches.",
     )
     parser.add_argument(
         "--time-budget-hours",
         type=float,
-        default=15.0,
-        help="Stop after this many hours. Use 0 or a negative value to disable.",
+        default=0.0,
+        help="Stop after this many hours. Default 0 disables the time limit.",
     )
     return parser.parse_args()
 
@@ -191,6 +211,35 @@ def configure_torch_threads(torch_threads):
         torch.set_num_interop_threads(torch_threads)
     except RuntimeError:
         pass
+
+
+def resolve_devices(args):
+    if args.devices is None:
+        devices = [str(args.device)]
+    elif str(args.devices).strip().lower() == "auto":
+        if torch.cuda.is_available() and torch.cuda.device_count() > 0:
+            devices = [f"cuda:{idx}" for idx in range(torch.cuda.device_count())]
+        else:
+            devices = [str(args.device)]
+    else:
+        devices = [device.strip() for device in str(args.devices).split(",") if device.strip()]
+
+    if not devices:
+        raise ValueError("No devices were provided. Use --device or --devices.")
+
+    if args.workers is None:
+        workers = len(devices) if args.devices is not None else 1
+    else:
+        workers = max(1, int(args.workers))
+
+    return devices, workers
+
+
+def configure_device(device):
+    device = torch.device(device)
+    if device.type == "cuda" and device.index is not None:
+        torch.cuda.set_device(device)
+    return device
 
 
 def set_seed(seed):
@@ -622,6 +671,33 @@ def run_candidate(params, problem_name, mdp, planner, dataset_path, device, d_st
     return row
 
 
+def run_candidate_worker(params, problem_name, dataset_path, device_name, torch_threads):
+    start = time.perf_counter()
+    device = torch.device(device_name)
+    try:
+        configure_torch_threads(torch_threads)
+        device = configure_device(device_name)
+        set_seed(SEED)
+
+        mdp, planner = build_mdp(problem_name, device)
+        d_star = planner.state_mu_star.detach().cpu()
+        v_star = planner.v_star.detach().cpu()
+        return run_candidate(
+            params=params,
+            problem_name=problem_name,
+            mdp=mdp,
+            planner=planner,
+            dataset_path=Path(dataset_path),
+            device=device,
+            d_star=d_star,
+            v_star=v_star,
+        )
+    except Exception as exc:
+        row = base_row(params, device, status="failed", error=repr(exc))
+        row["elapsed_seconds"] = float(time.perf_counter() - start)
+        return row
+
+
 def baseline_candidates():
     return [
         tuple(candidate)
@@ -728,7 +804,8 @@ def run_grid_search(problem_name):
     args = parse_args(problem["description"])
     configure_torch_threads(args.torch_threads)
     set_seed(SEED)
-    device = torch.device(args.device)
+    devices, workers = resolve_devices(args)
+    primary_device = torch.device(devices[0])
 
     dataset_path = problem["dataset_path"]
     output_csv = problem["output_csv"]
@@ -736,17 +813,16 @@ def run_grid_search(problem_name):
     if not dataset_path.exists():
         raise FileNotFoundError(f"Dataset not found: {dataset_path}")
 
-    print(f"Using device: {device}")
+    print(f"Using devices: {', '.join(devices)}")
     print(f"Problem: {problem_name}")
     print(f"Dataset: {dataset_path}")
     print(f"Results: {output_csv}")
-    print("Workers: 1")
+    print(f"Workers: {workers}")
     print(f"Torch threads: {max(1, int(args.torch_threads))}")
-    print(f"Time budget hours: {args.time_budget_hours}")
-
-    mdp, planner = build_mdp(problem_name, device)
-    d_star = planner.state_mu_star.detach().cpu()
-    v_star = planner.v_star.detach().cpu()
+    if args.time_budget_hours is None or float(args.time_budget_hours) <= 0:
+        print("Time budget hours: disabled")
+    else:
+        print(f"Time budget hours: {args.time_budget_hours}")
 
     candidates_all = all_candidates(problem_name)
     if args.max_runs is not None:
@@ -756,7 +832,7 @@ def run_grid_search(problem_name):
     candidates = [
         candidate
         for candidate in candidates_all
-        if candidate_key(base_row(candidate, device)) not in completed
+        if candidate_key(base_row(candidate, primary_device)) not in completed
     ]
 
     print(f"Total grid size: {total_grid_size(problem_name)}")
@@ -776,33 +852,118 @@ def run_grid_search(problem_name):
     outer = tqdm(candidates, desc=desc, unit="run", disable=not progress)
 
     stopped_for_budget = False
-    for run_idx, params in enumerate(outer, start=len(results) + 1):
-        if time_budget_seconds is not None and time.perf_counter() - started_at >= time_budget_seconds:
-            stopped_for_budget = True
-            break
+    if workers == 1:
+        device = configure_device(devices[0])
+        mdp, planner = build_mdp(problem_name, device)
+        d_star = planner.state_mu_star.detach().cpu()
+        v_star = planner.v_star.detach().cpu()
 
-        row = run_candidate(
-            params=params,
-            problem_name=problem_name,
-            mdp=mdp,
-            planner=planner,
-            dataset_path=dataset_path,
-            device=device,
-            d_star=d_star,
-            v_star=v_star,
-        )
-        row["run_idx"] = int(run_idx)
-        results.append(row)
-        save_results(results, output_csv, best_csv)
+        for run_idx, params in enumerate(outer, start=len(results) + 1):
+            if time_budget_seconds is not None and time.perf_counter() - started_at >= time_budget_seconds:
+                stopped_for_budget = True
+                break
 
-        if progress:
-            outer.set_postfix(
-                {
-                    "greedy_success": row["greedy_success_rate"],
-                    "greedy_return": row["greedy_avg_return"],
-                    "status": row["status"],
-                }
+            row = run_candidate(
+                params=params,
+                problem_name=problem_name,
+                mdp=mdp,
+                planner=planner,
+                dataset_path=dataset_path,
+                device=device,
+                d_star=d_star,
+                v_star=v_star,
             )
+            row["run_idx"] = int(run_idx)
+            results.append(row)
+            save_results(results, output_csv, best_csv)
+
+            if progress:
+                outer.set_postfix(
+                    {
+                        "greedy_success": row["greedy_success_rate"],
+                        "greedy_return": row["greedy_avg_return"],
+                        "status": row["status"],
+                    }
+                )
+    else:
+        outer.close()
+        next_run_idx = len(results) + 1
+        next_submit_idx = 0
+        future_to_candidate = {}
+        context = mp.get_context("spawn")
+
+        def can_submit_more():
+            if next_submit_idx >= len(candidates):
+                return False
+            if time_budget_seconds is None:
+                return True
+            return time.perf_counter() - started_at < time_budget_seconds
+
+        with ProcessPoolExecutor(max_workers=workers, mp_context=context) as executor:
+            def submit_next():
+                nonlocal next_submit_idx
+                if not can_submit_more():
+                    return False
+
+                submit_idx = next_submit_idx
+                params = candidates[submit_idx]
+                device_name = devices[submit_idx % len(devices)]
+                future = executor.submit(
+                    run_candidate_worker,
+                    params,
+                    problem_name,
+                    str(dataset_path),
+                    device_name,
+                    max(1, int(args.torch_threads)),
+                )
+                future_to_candidate[future] = (submit_idx, params, device_name)
+                next_submit_idx += 1
+                return True
+
+            for _ in range(min(workers, len(candidates))):
+                submit_next()
+
+            outer = tqdm(
+                total=len(candidates),
+                desc=desc,
+                unit="run",
+                disable=not progress,
+            )
+            try:
+                while future_to_candidate:
+                    for future in as_completed(list(future_to_candidate)):
+                        _, params, device_name = future_to_candidate.pop(future)
+                        try:
+                            row = future.result()
+                        except Exception as exc:
+                            row = base_row(
+                                params,
+                                torch.device(device_name),
+                                status="failed",
+                                error=repr(exc),
+                            )
+                        row["run_idx"] = int(next_run_idx)
+                        next_run_idx += 1
+                        results.append(row)
+                        save_results(results, output_csv, best_csv)
+
+                        if progress:
+                            outer.update(1)
+                            outer.set_postfix(
+                                {
+                                    "greedy_success": row["greedy_success_rate"],
+                                    "greedy_return": row["greedy_avg_return"],
+                                    "status": row["status"],
+                                }
+                            )
+
+                        if can_submit_more():
+                            submit_next()
+                        else:
+                            stopped_for_budget = next_submit_idx < len(candidates)
+                        break
+            finally:
+                outer.close()
 
     save_results(results, output_csv, best_csv)
     df = ordered_results_frame(results)

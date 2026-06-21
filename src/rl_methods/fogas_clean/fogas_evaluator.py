@@ -157,6 +157,47 @@ class FOGASEvaluator:
             },
         )
 
+    def average_return_stats(
+        self,
+        policy_mode,
+        num_trajectories,
+        max_steps,
+        seed=None,
+        goal_state=None,
+        terminal_states=None,
+        ddof=1,
+    ):
+        """
+        Mean and standard deviation of discounted simulated returns.
+        """
+        pi = self.get_policy(policy_mode)
+        terminal_states = self._terminal_states(terminal_states, goal_state)
+        returns = self._simulated_returns(
+            pi=pi,
+            num_trajectories=num_trajectories,
+            max_steps=max_steps,
+            seed=seed,
+            terminal_states=terminal_states,
+        )
+
+        if returns.size == 0:
+            mean = 0.0
+            std = 0.0
+        else:
+            mean = float(np.mean(returns))
+            std = float(np.std(returns, ddof=int(ddof))) if returns.size > int(ddof) else 0.0
+
+        return {
+            "policy": mean,
+            "policy_std": std,
+            "policy_mode": policy_mode,
+            "terminal_states": sorted(terminal_states),
+            "num_trajectories": int(num_trajectories),
+            "max_steps": int(max_steps),
+            "ddof": int(ddof),
+            "returns": returns,
+        }
+
     def success_rate(
         self,
         goal_state,
@@ -204,7 +245,7 @@ class FOGASEvaluator:
             },
         )
 
-    def _average_simulated_return(self, pi, num_trajectories, max_steps, seed=None, terminal_states=None):
+    def _simulated_returns(self, pi, num_trajectories, max_steps, seed=None, terminal_states=None):
         returns = []
         for idx in range(int(num_trajectories)):
             current_seed = None if seed is None else int(seed) + idx
@@ -215,7 +256,17 @@ class FOGASEvaluator:
                 terminal_states=terminal_states,
             )
             returns.append(self._discounted_return(trajectory, self.mdp.gamma))
-        return float(np.mean(returns)) if returns else 0.0
+        return np.asarray(returns, dtype=float)
+
+    def _average_simulated_return(self, pi, num_trajectories, max_steps, seed=None, terminal_states=None):
+        returns = self._simulated_returns(
+            pi=pi,
+            num_trajectories=num_trajectories,
+            max_steps=max_steps,
+            seed=seed,
+            terminal_states=terminal_states,
+        )
+        return float(np.mean(returns)) if returns.size else 0.0
 
     def _success_rate(self, pi, goal_state, num_trajectories, max_steps, seed=None, terminal_states=None):
         successes = 0

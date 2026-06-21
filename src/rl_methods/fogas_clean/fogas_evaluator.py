@@ -166,6 +166,7 @@ class FOGASEvaluator:
         goal_state=None,
         terminal_states=None,
         ddof=1,
+        compare_with_optimal=False,
     ):
         """
         Mean and standard deviation of discounted simulated returns.
@@ -187,9 +188,12 @@ class FOGASEvaluator:
             mean = float(np.mean(returns))
             std = float(np.std(returns, ddof=int(ddof))) if returns.size > int(ddof) else 0.0
 
-        return {
+        result = {
             "policy": mean,
             "policy_std": std,
+            "optimal": None,
+            "optimal_std": None,
+            "difference": None,
             "policy_mode": policy_mode,
             "terminal_states": sorted(terminal_states),
             "num_trajectories": int(num_trajectories),
@@ -197,6 +201,32 @@ class FOGASEvaluator:
             "ddof": int(ddof),
             "returns": returns,
         }
+
+        if compare_with_optimal:
+            planner = self._require_planner()
+            optimal_returns = self._simulated_returns(
+                pi=planner.pi_star,
+                num_trajectories=num_trajectories,
+                max_steps=max_steps,
+                seed=seed,
+                terminal_states=terminal_states,
+            )
+            optimal_mean = float(np.mean(optimal_returns)) if optimal_returns.size else 0.0
+            optimal_std = (
+                float(np.std(optimal_returns, ddof=int(ddof)))
+                if optimal_returns.size > int(ddof)
+                else 0.0
+            )
+            result.update(
+                {
+                    "optimal": optimal_mean,
+                    "optimal_std": optimal_std,
+                    "difference": float(optimal_mean - mean),
+                    "optimal_returns": optimal_returns,
+                }
+            )
+
+        return result
 
     def success_rate(
         self,

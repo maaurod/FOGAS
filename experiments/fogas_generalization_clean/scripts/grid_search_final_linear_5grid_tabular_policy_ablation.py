@@ -2,9 +2,9 @@
 FinalLinearSolver tabular policy ablation for deterministic and stochastic 5x5 grids.
 
 The script writes CSV results after every completed candidate so interrupted
-runs can be resumed with --resume. Candidate evaluation records only solver
-success rate, greedy success rate, solver average reward, greedy average
-reward, and elapsed runtime, plus the parameters needed to identify each run.
+runs can be resumed with --resume. It also evaluates policy checkpoints every
+20 solver iterations and writes both raw learning curves and grouped curve
+statistics.
 """
 
 from __future__ import annotations
@@ -38,6 +38,8 @@ RESULTS_DIR = PROJECT_ROOT / "data" / "results_clean" / "generalization"
 OUTPUT_CSV = RESULTS_DIR / "final_linear_5grid_tabular_policy_ablation.csv"
 BEST_CSV = RESULTS_DIR / "final_linear_5grid_tabular_policy_ablation_best.csv"
 STATS_CSV = RESULTS_DIR / "final_linear_5grid_tabular_policy_ablation_stats.csv"
+CURVES_CSV = RESULTS_DIR / "final_linear_5grid_tabular_policy_ablation_curves.csv"
+CURVE_STATS_CSV = RESULTS_DIR / "final_linear_5grid_tabular_policy_ablation_curve_stats.csv"
 
 if str(PROJECT_ROOT / "src") not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT / "src"))
@@ -52,8 +54,10 @@ from rl_methods.mdp_clean import DiscreteMDP, Planner  # noqa: E402
 
 
 SEED = 42
+EVAL_SEED = 10_000
 NUM_TRAJECTORIES = 100
 MAX_STEPS = 20
+EVAL_INTERVAL = 20
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 STATES = torch.arange(25, dtype=torch.long)
@@ -69,13 +73,13 @@ INTENDED_PROB = 0.8
 
 BASE_ALPHA = 1e-3
 BASE_ETA = 1e-4
-BASE_T = 1000
+BASE_T = 3000
 BASE_REINFORCE_SAMPLES = 4
-NPG_ALPHA_GRID = [1e-5, 3e-5, 1e-4, 3e-4, 1e-3, 3e-3, 1e-2, 3e-2]
-SGD_ALPHA_GRID = [1e-5, 3e-5, 1e-4, 3e-4, 1e-3, 3e-3, 1e-2]
+NPG_ALPHA_GRID = [1e-5, 3e-5, 1e-4, 3e-4, 1e-3, 3e-3, 1e-2, 3e-2, 1e-1]
+SGD_ALPHA_GRID = [1e-5, 3e-5, 1e-4, 3e-4, 1e-3, 3e-3, 1e-2, 3e-2]
 REINFORCE_SAMPLES_GRID = [2**power for power in range(8)]
 REINFORCE_SEEDS = [42, 43, 44, 45, 46]
-FISHER_DAMPING_GRID = [1e-5, 3e-5, 1e-4, 3e-4, 1e-3, 3e-3, 1e-2]
+FISHER_DAMPING_GRID = [1e-6, 3e-6, 1e-5, 3e-5, 1e-4, 3e-4, 1e-3, 3e-3, 1e-2]
 BASE_FISHER_DAMPING = 1e-3
 CG_ITERS = 50
 CG_TOL = 1e-10
@@ -86,17 +90,19 @@ PROBLEMS = {
         "gamma": 0.99,
         "terminal_states": {GOAL_GRID},
         "stochastic": False,
-        "theta_lambda": 1e-3,
-        "theta_lr": 3e-1,
-        "baseline_rho": 0.05,
+        "theta_lambda": 1e-7,
+        "theta_lr": 1e-3,
+        "theta_inner_steps": 10,
+        "baseline_rho": 0.03,
     },
     "stochastic": {
         "dataset_path": DATASETS_DIR / "5grid_stochastic.csv",
         "gamma": 0.9,
         "terminal_states": {GOAL_GRID, PIT_GRID},
         "stochastic": True,
-        "theta_lambda": 1e-4,
-        "theta_lr": 3e-2,
+        "theta_lambda": 3e-7,
+        "theta_lr": 1e-3,
+        "theta_inner_steps": 10,
         "baseline_rho": 1.0,
     },
 }
@@ -282,7 +288,7 @@ def make_solver(problem_name, dataset_path, device, seed):
         theta_mode="reg_fixed",
         theta_lambda=float(problem["theta_lambda"]),
         theta_optimizer="adam",
-        theta_inner_steps=40,
+        theta_inner_steps=int(problem["theta_inner_steps"]),
         theta_lr=float(problem["theta_lr"]),
         theta_start_mode="warm",
         beta_update="fogas_full",
@@ -296,6 +302,12 @@ def candidate_key(row):
         str(row["policy_optimizer"]),
         str(row["policy_gradient"]),
         float(row["alpha"]),
+        float(row["eta"]),
+        float(row["rho"]),
+        int(row["T"]),
+        float(row["theta_lambda"]),
+        float(row["theta_lr"]),
+        int(row["theta_inner_steps"]),
         int(row["reinforce_samples"]),
         float(row["fisher_damping"]),
         int(row["cg_iters"]),
@@ -308,6 +320,13 @@ def selected_problem_names(problem_arg):
     if problem_arg == "both":
         return ["deterministic", "stochastic"]
     return [problem_arg]
+
+
+def row_in_current_grid(row, current_keys):
+    try:
+        return candidate_key(row) in current_keys
+    except (KeyError, TypeError, ValueError):
+        return False
 
 
 def make_candidate(
@@ -331,7 +350,7 @@ def make_candidate(
         "rho": float(problem["baseline_rho"]),
         "theta_lambda": float(problem["theta_lambda"]),
         "theta_lr": float(problem["theta_lr"]),
-        "theta_inner_steps": 40,
+        "theta_inner_steps": int(problem["theta_inner_steps"]),
         "policy_optimizer": policy_optimizer,
         "policy_gradient": policy_gradient,
         "reinforce_samples": int(reinforce_samples),
@@ -398,7 +417,7 @@ def all_candidates(problem_names):
 
 def load_existing_results(resume):
     if not resume or not OUTPUT_CSV.exists():
-        return [], set()
+        return [], [], set()
 
     df = pd.read_csv(OUTPUT_CSV)
     rows = df.to_dict("records")
@@ -407,7 +426,10 @@ def load_existing_results(resume):
     else:
         completed_df = df
     completed = {candidate_key(row) for row in completed_df.to_dict("records")}
-    return rows, completed
+    curve_rows = []
+    if CURVES_CSV.exists():
+        curve_rows = pd.read_csv(CURVES_CSV).to_dict("records")
+    return rows, curve_rows, completed
 
 
 def blank_metrics():
@@ -431,6 +453,7 @@ def base_row(candidate, device, status="ok", error=""):
             "num_trajectories": int(NUM_TRAJECTORIES),
             "max_steps": int(MAX_STEPS),
             "seed": int(candidate.get("seed", SEED)),
+            "eval_seed": int(EVAL_SEED),
             "device": str(device),
             "status": status,
             "error": error,
@@ -497,6 +520,88 @@ def evaluate_policy_rollouts(mdp, pi, terminal_states, seed):
     }
 
 
+def checkpoint_steps(T):
+    steps = list(range(EVAL_INTERVAL, int(T) + 1, EVAL_INTERVAL))
+    if not steps or steps[-1] != int(T):
+        steps.append(int(T))
+    return steps
+
+
+def curve_base_row(candidate, step):
+    return {
+        "problem": candidate["problem"],
+        "ablation": candidate["ablation"],
+        "beta_update": candidate["beta_update"],
+        "T": int(candidate["T"]),
+        "checkpoint_step": int(step),
+        "alpha": float(candidate["alpha"]),
+        "eta": float(candidate["eta"]),
+        "rho": float(candidate["rho"]),
+        "theta_lambda": float(candidate["theta_lambda"]),
+        "theta_lr": float(candidate["theta_lr"]),
+        "theta_inner_steps": int(candidate["theta_inner_steps"]),
+        "policy_optimizer": candidate["policy_optimizer"],
+        "policy_gradient": candidate["policy_gradient"],
+        "reinforce_samples": int(candidate["reinforce_samples"]),
+        "fisher_damping": float(candidate["fisher_damping"]),
+        "cg_iters": int(candidate["cg_iters"]),
+        "cg_tol": float(candidate["cg_tol"]),
+        "state_weight_update": candidate["state_weight_update"],
+        "dataset_path": candidate["dataset_path"],
+        "seed": int(candidate.get("seed", SEED)),
+        "eval_seed": int(EVAL_SEED),
+    }
+
+
+def evaluate_policy_checkpoint(mdp, pi, terminal_states):
+    solver_stats = evaluate_policy_rollouts(
+        mdp=mdp,
+        pi=pi,
+        terminal_states=terminal_states,
+        seed=EVAL_SEED,
+    )
+    greedy_stats = evaluate_policy_rollouts(
+        mdp=mdp,
+        pi=greedy_policy(pi),
+        terminal_states=terminal_states,
+        seed=EVAL_SEED,
+    )
+    return {
+        "solver_success_rate": finite_float(solver_stats["success_rate"]),
+        "greedy_success_rate": finite_float(greedy_stats["success_rate"]),
+        "solver_avg_reward": finite_float(solver_stats["avg_reward"]),
+        "greedy_avg_reward": finite_float(greedy_stats["avg_reward"]),
+    }
+
+
+def evaluate_policy_curve(candidate, solver, mdp, terminal_states):
+    rows = []
+    psi_history = solver.psi_history or []
+    for step in checkpoint_steps(candidate["T"]):
+        if step > len(psi_history):
+            continue
+        pi = solver._linear_policy_matrix(psi_history[step - 1])
+        curve_row = curve_base_row(candidate, step)
+        curve_row.update(evaluate_policy_checkpoint(mdp, pi, terminal_states))
+        rows.append(curve_row)
+    return rows
+
+
+def final_metrics_from_curve(curve_rows):
+    if not curve_rows:
+        return None
+    final_step = max(row["checkpoint_step"] for row in curve_rows)
+    for row in reversed(curve_rows):
+        if row["checkpoint_step"] == final_step:
+            return {
+                "solver_success_rate": row["solver_success_rate"],
+                "greedy_success_rate": row["greedy_success_rate"],
+                "solver_avg_reward": row["solver_avg_reward"],
+                "greedy_avg_reward": row["greedy_avg_reward"],
+            }
+    return None
+
+
 def finite_float(value, default=np.nan):
     try:
         value = float(value)
@@ -509,6 +614,7 @@ def run_candidate(candidate, mdp, planner, dataset_path, device):
     del planner
     start = time.perf_counter()
     row = base_row(candidate, device)
+    curve_rows = []
     problem_name = candidate["problem"]
     seed = int(candidate.get("seed", SEED))
     terminal_states = set(PROBLEMS[problem_name]["terminal_states"])
@@ -537,34 +643,18 @@ def run_candidate(candidate, mdp, planner, dataset_path, device):
             beta_update=candidate["beta_update"],
         )
 
-        solver_stats = evaluate_policy_rollouts(
-            mdp=mdp,
-            pi=solver.pi,
-            terminal_states=terminal_states,
-            seed=seed,
-        )
-        greedy_stats = evaluate_policy_rollouts(
-            mdp=mdp,
-            pi=greedy_policy(solver.pi),
-            terminal_states=terminal_states,
-            seed=seed,
-        )
-
-        row.update(
-            {
-                "solver_success_rate": finite_float(solver_stats["success_rate"]),
-                "greedy_success_rate": finite_float(greedy_stats["success_rate"]),
-                "solver_avg_reward": finite_float(solver_stats["avg_reward"]),
-                "greedy_avg_reward": finite_float(greedy_stats["avg_reward"]),
-            }
-        )
+        curve_rows = evaluate_policy_curve(candidate, solver, mdp, terminal_states)
+        final_metrics = final_metrics_from_curve(curve_rows)
+        if final_metrics is None:
+            final_metrics = evaluate_policy_checkpoint(mdp, solver.pi, terminal_states)
+        row.update(final_metrics)
     except Exception as exc:
         row["status"] = "failed"
         row["error"] = repr(exc)
     finally:
         row["elapsed_seconds"] = float(time.perf_counter() - start)
 
-    return row
+    return row, curve_rows
 
 
 def run_candidate_worker(payload):
@@ -583,7 +673,7 @@ def run_candidate_worker(payload):
 
 
 def failed_worker_row(candidate, exc):
-    return base_row(candidate, DEVICE, status="failed", error=repr(exc))
+    return base_row(candidate, DEVICE, status="failed", error=repr(exc)), []
 
 
 def ordered_results_frame(results):
@@ -622,6 +712,12 @@ def build_stats_frame(results):
         "policy_optimizer",
         "policy_gradient",
         "alpha",
+        "eta",
+        "rho",
+        "T",
+        "theta_lambda",
+        "theta_lr",
+        "theta_inner_steps",
         "reinforce_samples",
         "fisher_damping",
         "cg_iters",
@@ -634,6 +730,12 @@ def build_stats_frame(results):
             policy_optimizer,
             policy_gradient,
             alpha,
+            eta,
+            rho,
+            T,
+            theta_lambda,
+            theta_lr,
+            theta_inner_steps,
             reinforce_samples,
             fisher_damping,
             cg_iters,
@@ -646,6 +748,12 @@ def build_stats_frame(results):
             "policy_optimizer": policy_optimizer,
             "policy_gradient": policy_gradient,
             "alpha": float(alpha),
+            "eta": float(eta),
+            "rho": float(rho),
+            "T": int(T),
+            "theta_lambda": float(theta_lambda),
+            "theta_lr": float(theta_lr),
+            "theta_inner_steps": int(theta_inner_steps),
             "reinforce_samples": int(reinforce_samples),
             "fisher_damping": float(fisher_damping),
             "cg_iters": int(cg_iters),
@@ -679,7 +787,105 @@ def build_stats_frame(results):
     )
 
 
-def save_results(results):
+def build_curve_stats_frame(curve_results):
+    df = pd.DataFrame(curve_results)
+    if df.empty:
+        return df
+
+    metrics = [
+        "solver_success_rate",
+        "greedy_success_rate",
+        "solver_avg_reward",
+        "greedy_avg_reward",
+    ]
+    group_columns = [
+        "problem",
+        "ablation",
+        "policy_optimizer",
+        "policy_gradient",
+        "alpha",
+        "eta",
+        "rho",
+        "T",
+        "theta_lambda",
+        "theta_lr",
+        "theta_inner_steps",
+        "reinforce_samples",
+        "fisher_damping",
+        "cg_iters",
+        "cg_tol",
+        "checkpoint_step",
+    ]
+    rows = []
+    for group_key, group in df.groupby(group_columns, dropna=False):
+        (
+            problem,
+            ablation,
+            policy_optimizer,
+            policy_gradient,
+            alpha,
+            eta,
+            rho,
+            T,
+            theta_lambda,
+            theta_lr,
+            theta_inner_steps,
+            reinforce_samples,
+            fisher_damping,
+            cg_iters,
+            cg_tol,
+            checkpoint_step,
+        ) = group_key
+        row = {
+            "problem": problem,
+            "ablation": ablation,
+            "policy_optimizer": policy_optimizer,
+            "policy_gradient": policy_gradient,
+            "alpha": float(alpha),
+            "eta": float(eta),
+            "rho": float(rho),
+            "T": int(T),
+            "theta_lambda": float(theta_lambda),
+            "theta_lr": float(theta_lr),
+            "theta_inner_steps": int(theta_inner_steps),
+            "reinforce_samples": int(reinforce_samples),
+            "fisher_damping": float(fisher_damping),
+            "cg_iters": int(cg_iters),
+            "cg_tol": float(cg_tol),
+            "checkpoint_step": int(checkpoint_step),
+            "count": int(len(group)),
+            "seed_count": int(group["seed"].nunique()) if "seed" in group.columns else int(len(group)),
+        }
+        for metric in metrics:
+            values = group[metric] if metric in group.columns else pd.Series(dtype=float)
+            row[f"{metric}_best"] = float(values.max()) if not values.empty else np.nan
+            row[f"{metric}_mean"] = float(values.mean()) if not values.empty else np.nan
+            metric_std = float(values.std(ddof=1)) if len(values) > 1 else 0.0
+            metric_sem = metric_std / math.sqrt(len(values)) if len(values) > 1 else 0.0
+            row[f"{metric}_std"] = metric_std
+            row[f"{metric}_sem"] = metric_sem
+            row[f"{metric}_ci95"] = 1.96 * metric_sem
+        rows.append(row)
+
+    return pd.DataFrame(rows).sort_values(
+        by=[
+            "problem",
+            "ablation",
+            "policy_optimizer",
+            "policy_gradient",
+            "alpha",
+            "rho",
+            "theta_lambda",
+            "reinforce_samples",
+            "fisher_damping",
+            "checkpoint_step",
+        ],
+        ascending=True,
+        na_position="last",
+    )
+
+
+def save_results(results, curve_results):
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     df = ordered_results_frame(results)
     df.to_csv(OUTPUT_CSV, index=False)
@@ -692,6 +898,14 @@ def save_results(results):
     stats = build_stats_frame(results)
     if not stats.empty:
         stats.to_csv(STATS_CSV, index=False)
+
+    curves = pd.DataFrame(curve_results)
+    if not curves.empty:
+        curves.to_csv(CURVES_CSV, index=False)
+
+    curve_stats = build_curve_stats_frame(curve_results)
+    if not curve_stats.empty:
+        curve_stats.to_csv(CURVE_STATS_CSV, index=False)
 
 
 def validate_datasets(problem_names):
@@ -715,7 +929,14 @@ def run_grid_search():
     if args.max_runs is not None:
         candidates_all = candidates_all[: max(0, int(args.max_runs))]
 
-    results, completed = load_existing_results(args.resume)
+    results, curve_results, completed = load_existing_results(args.resume)
+    current_keys = {candidate_key(candidate) for candidate in candidates_all}
+    if args.resume:
+        results = [row for row in results if row_in_current_grid(row, current_keys)]
+        curve_results = [
+            row for row in curve_results if row_in_current_grid(row, current_keys)
+        ]
+        completed = {candidate_key(row) for row in results if row.get("status") == "ok"}
     candidates = [
         candidate
         for candidate in candidates_all
@@ -726,6 +947,8 @@ def run_grid_search():
     print(f"Problems: {', '.join(problem_names)}")
     print(f"Results: {OUTPUT_CSV}")
     print(f"Stats: {STATS_CSV}")
+    print(f"Curves: {CURVES_CSV}")
+    print(f"Curve stats: {CURVE_STATS_CSV}")
     print(f"Workers: {workers}")
     print(f"Torch threads per worker: {torch_threads}")
     print(f"Total candidate grid size: {len(candidates_all)}")
@@ -746,7 +969,7 @@ def run_grid_search():
             if problem_name not in mdp_by_problem:
                 mdp_by_problem[problem_name] = build_mdp(problem_name, DEVICE)
             mdp, planner = mdp_by_problem[problem_name]
-            row = run_candidate(
+            row, curve_rows = run_candidate(
                 candidate=candidate,
                 mdp=mdp,
                 planner=planner,
@@ -754,8 +977,11 @@ def run_grid_search():
                 device=DEVICE,
             )
             row["run_idx"] = int(run_idx)
+            for curve_row in curve_rows:
+                curve_row["run_idx"] = int(run_idx)
             results.append(row)
-            save_results(results)
+            curve_results.extend(curve_rows)
+            save_results(results, curve_results)
 
             if progress:
                 outer.set_postfix(
@@ -785,13 +1011,16 @@ def run_grid_search():
             for future in outer:
                 candidate = future_to_candidate[future]
                 try:
-                    row = future.result()
+                    row, curve_rows = future.result()
                 except Exception as exc:
-                    row = failed_worker_row(candidate, exc)
+                    row, curve_rows = failed_worker_row(candidate, exc)
                 row["run_idx"] = int(next_run_idx)
+                for curve_row in curve_rows:
+                    curve_row["run_idx"] = int(next_run_idx)
                 next_run_idx += 1
                 results.append(row)
-                save_results(results)
+                curve_results.extend(curve_rows)
+                save_results(results, curve_results)
 
                 if progress:
                     outer.set_postfix(
@@ -804,7 +1033,7 @@ def run_grid_search():
                         }
                     )
 
-    save_results(results)
+    save_results(results, curve_results)
     df = ordered_results_frame(results)
     ok_count = int((df["status"] == "ok").sum()) if not df.empty else 0
     failed_count = int((df["status"] == "failed").sum()) if not df.empty else 0
@@ -820,6 +1049,10 @@ def run_grid_search():
         print(pd.read_csv(BEST_CSV).to_string(index=False))
     if STATS_CSV.exists():
         print(f"Stats CSV: {STATS_CSV}")
+    if CURVES_CSV.exists():
+        print(f"Curves CSV: {CURVES_CSV}")
+    if CURVE_STATS_CSV.exists():
+        print(f"Curve stats CSV: {CURVE_STATS_CSV}")
 
 
 if __name__ == "__main__":

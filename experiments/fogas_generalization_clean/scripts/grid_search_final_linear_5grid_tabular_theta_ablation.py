@@ -54,6 +54,7 @@ from rl_methods.mdp_clean import DiscreteMDP, Planner  # noqa: E402
 
 
 SEED = 42
+SEEDS = [42, 43, 44, 45, 46]
 EVAL_SEED = 10_000
 NUM_TRAJECTORIES = 100
 MAX_STEPS = 20
@@ -293,7 +294,7 @@ def make_solver(problem_name, dataset_path, device, candidate):
         u_function=LinearFunction(u_features),
         q_function=LinearQFunction(q_features),
         policy_features=policy_features,
-        seed=SEED,
+        seed=int(candidate.get("seed", SEED)),
         device=device,
         D_theta=candidate["D_theta"],
         theta_include_beta_cov=False,
@@ -330,6 +331,7 @@ def candidate_key(row):
         float(row["theta_lr"]),
         float(row["rho"]),
         int(row["T"]),
+        int(row.get("seed", SEED)),
     )
 
 
@@ -354,6 +356,7 @@ def make_candidate(
     D_theta=None,
     theta_inner_steps=BASE_THETA_INNER_STEPS,
     theta_start_mode=BASE_THETA_START_MODE,
+    seed=SEED,
 ):
     problem = PROBLEMS[problem_name]
     return {
@@ -378,6 +381,7 @@ def make_candidate(
         "cg_tol": float(CG_TOL),
         "state_weight_update": "normal",
         "dataset_path": str(problem["dataset_path"]),
+        "seed": int(seed),
     }
 
 
@@ -387,53 +391,58 @@ def all_candidates(problem_names):
         problem = PROBLEMS[problem_name]
         default_theta_lambda = float(problem["theta_lambda"])
 
-        for theta_start_mode in THETA_START_MODE_GRID:
-            candidates.append(
-                make_candidate(
-                    problem_name=problem_name,
-                    ablation="reg_fixed_baseline",
-                    theta_mode="reg_fixed",
-                    theta_lambda=default_theta_lambda,
-                    theta_inner_steps=BASE_THETA_INNER_STEPS,
-                    theta_start_mode=theta_start_mode,
-                )
-            )
-
-            for D_theta in PROJECTION_D_THETA_GRID:
+        for seed in SEEDS:
+            for theta_start_mode in THETA_START_MODE_GRID:
                 candidates.append(
                     make_candidate(
                         problem_name=problem_name,
-                        ablation="projection_dtheta",
-                        theta_mode="projection",
-                        D_theta=D_theta,
-                        theta_inner_steps=BASE_THETA_INNER_STEPS,
-                        theta_start_mode=theta_start_mode,
-                    )
-                )
-
-            for theta_lambda in THETA_LAMBDA_GRID:
-                candidates.append(
-                    make_candidate(
-                        problem_name=problem_name,
-                        ablation="reg_fixed_lambda",
-                        theta_mode="reg_fixed",
-                        theta_lambda=theta_lambda,
-                        theta_inner_steps=BASE_THETA_INNER_STEPS,
-                        theta_start_mode=theta_start_mode,
-                    )
-                )
-
-            for theta_inner_steps in THETA_INNER_STEPS_GRID:
-                candidates.append(
-                    make_candidate(
-                        problem_name=problem_name,
-                        ablation="reg_fixed_inner_steps",
+                        ablation="reg_fixed_baseline",
                         theta_mode="reg_fixed",
                         theta_lambda=default_theta_lambda,
-                        theta_inner_steps=theta_inner_steps,
+                        theta_inner_steps=BASE_THETA_INNER_STEPS,
                         theta_start_mode=theta_start_mode,
+                        seed=seed,
                     )
                 )
+
+                for D_theta in PROJECTION_D_THETA_GRID:
+                    candidates.append(
+                        make_candidate(
+                            problem_name=problem_name,
+                            ablation="projection_dtheta",
+                            theta_mode="projection",
+                            D_theta=D_theta,
+                            theta_inner_steps=BASE_THETA_INNER_STEPS,
+                            theta_start_mode=theta_start_mode,
+                            seed=seed,
+                        )
+                    )
+
+                for theta_lambda in THETA_LAMBDA_GRID:
+                    candidates.append(
+                        make_candidate(
+                            problem_name=problem_name,
+                            ablation="reg_fixed_lambda",
+                            theta_mode="reg_fixed",
+                            theta_lambda=theta_lambda,
+                            theta_inner_steps=BASE_THETA_INNER_STEPS,
+                            theta_start_mode=theta_start_mode,
+                            seed=seed,
+                        )
+                    )
+
+                for theta_inner_steps in THETA_INNER_STEPS_GRID:
+                    candidates.append(
+                        make_candidate(
+                            problem_name=problem_name,
+                            ablation="reg_fixed_inner_steps",
+                            theta_mode="reg_fixed",
+                            theta_lambda=default_theta_lambda,
+                            theta_inner_steps=theta_inner_steps,
+                            theta_start_mode=theta_start_mode,
+                            seed=seed,
+                        )
+                    )
 
     return candidates
 
@@ -473,7 +482,7 @@ def base_row(candidate, device, status="ok", error=""):
             "theta_include_beta_cov": False,
             "num_trajectories": int(NUM_TRAJECTORIES),
             "max_steps": int(MAX_STEPS),
-            "seed": int(SEED),
+            "seed": int(candidate.get("seed", SEED)),
             "eval_seed": int(EVAL_SEED),
             "device": str(device),
             "status": status,
@@ -574,7 +583,7 @@ def curve_base_row(candidate, step):
         "cg_tol": float(candidate["cg_tol"]),
         "state_weight_update": candidate["state_weight_update"],
         "dataset_path": candidate["dataset_path"],
-        "seed": int(SEED),
+        "seed": int(candidate.get("seed", SEED)),
         "eval_seed": int(EVAL_SEED),
     }
 
@@ -701,7 +710,7 @@ def run_candidate(candidate, mdp, planner, dataset_path, device):
 def run_candidate_worker(payload):
     candidate, device_str, torch_threads = payload
     configure_worker_threads(torch_threads)
-    set_seed(SEED)
+    set_seed(int(candidate.get("seed", SEED)))
     device = torch.device(device_str)
     mdp, planner = build_mdp(candidate["problem"], device)
     return run_candidate(
@@ -785,6 +794,7 @@ def build_stats_frame(results):
             "rho": float(rho),
             "T": int(T),
             "count": int(len(group)),
+            "seed_count": int(ok["seed"].nunique()) if "seed" in ok.columns and not ok.empty else 0,
             "ok_count": int(len(ok)),
             "failed_count": int((group["status"] == "failed").sum()),
             "elapsed_seconds_mean": float(ok["elapsed_seconds"].mean()) if not ok.empty else np.nan,
@@ -859,6 +869,7 @@ def build_curve_stats_frame(curve_results):
             "T": int(T),
             "checkpoint_step": int(checkpoint_step),
             "count": int(len(group)),
+            "seed_count": int(group["seed"].nunique()) if "seed" in group.columns else int(len(group)),
         }
         for metric in metrics:
             values = group[metric] if metric in group.columns else pd.Series(dtype=float)

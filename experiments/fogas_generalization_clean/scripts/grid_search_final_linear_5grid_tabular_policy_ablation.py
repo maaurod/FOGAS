@@ -78,7 +78,7 @@ BASE_REINFORCE_SAMPLES = 4
 NPG_ALPHA_GRID = [1e-5, 3e-5, 1e-4, 3e-4, 1e-3, 3e-3, 1e-2, 3e-2, 1e-1]
 SGD_ALPHA_GRID = [1e-5, 3e-5, 1e-4, 3e-4, 1e-3, 3e-3, 1e-2, 3e-2]
 REINFORCE_SAMPLES_GRID = [2**power for power in range(8)]
-REINFORCE_SEEDS = [42, 43, 44, 45, 46]
+SWEEP_SEEDS = [42, 43, 44, 45, 46]
 FISHER_DAMPING_GRID = [1e-6, 3e-6, 1e-5, 3e-5, 1e-4, 3e-4, 1e-3, 3e-3, 1e-2]
 BASE_FISHER_DAMPING = 1e-3
 CG_ITERS = 50
@@ -366,41 +366,45 @@ def make_candidate(
 def all_candidates(problem_names):
     candidates = []
     for problem_name in problem_names:
-        candidates.append(
-            make_candidate(
-                problem_name=problem_name,
-                ablation="adam_exact_baseline",
-                policy_optimizer="adam",
-                policy_gradient="exact",
-            )
-        )
-
-        for alpha in NPG_ALPHA_GRID:
-            for fisher_damping in FISHER_DAMPING_GRID:
-                candidates.append(
-                    make_candidate(
-                        problem_name=problem_name,
-                        ablation="npg_exact_alpha_fisher",
-                        policy_optimizer="npg",
-                        policy_gradient="exact",
-                        alpha=alpha,
-                        fisher_damping=fisher_damping,
-                    )
-                )
-
-        for alpha in SGD_ALPHA_GRID:
+        for seed in SWEEP_SEEDS:
             candidates.append(
                 make_candidate(
                     problem_name=problem_name,
-                    ablation="sgd_exact_alpha",
-                    policy_optimizer="sgd",
+                    ablation="adam_exact_baseline",
+                    policy_optimizer="adam",
                     policy_gradient="exact",
-                    alpha=alpha,
+                    seed=seed,
                 )
             )
 
+            for alpha in NPG_ALPHA_GRID:
+                for fisher_damping in FISHER_DAMPING_GRID:
+                    candidates.append(
+                        make_candidate(
+                            problem_name=problem_name,
+                            ablation="npg_exact_alpha_fisher",
+                            policy_optimizer="npg",
+                            policy_gradient="exact",
+                            alpha=alpha,
+                            fisher_damping=fisher_damping,
+                            seed=seed,
+                        )
+                    )
+
+            for alpha in SGD_ALPHA_GRID:
+                candidates.append(
+                    make_candidate(
+                        problem_name=problem_name,
+                        ablation="sgd_exact_alpha",
+                        policy_optimizer="sgd",
+                        policy_gradient="exact",
+                        alpha=alpha,
+                        seed=seed,
+                    )
+                )
+
         for reinforce_samples in REINFORCE_SAMPLES_GRID:
-            for seed in REINFORCE_SEEDS:
+            for seed in SWEEP_SEEDS:
                 candidates.append(
                     make_candidate(
                         problem_name=problem_name,

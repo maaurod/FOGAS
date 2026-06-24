@@ -13,6 +13,7 @@ from .linear_policy_fogas import LinearPolicyFOGAS
 from .linear_solver import LinearSolver
 from .final_linear_solver import FinalLinearSolver
 from .final_parametrized_solver import FinalParametrizedSolver
+from .continuous_parametrized_solver import ContinuousFinalParametrizedSolver
 from .linear_beta_pi_solver import LinearBetaPiSolver
 from .loss_theta_beta_pi_solver import LossThetaBetaPiSolver
 from .regularized_loss_theta_beta_pi_solver import RegularizedLossThetaBetaPiSolver
@@ -26,6 +27,7 @@ __all__ = [
     "LinearSolver",
     "FinalLinearSolver",
     "FinalParametrizedSolver",
+    "ContinuousFinalParametrizedSolver",
     "LinearBetaPiSolver",
     "LossThetaBetaPiSolver",
     "RegularizedLossThetaBetaPiSolver",

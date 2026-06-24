@@ -2,6 +2,7 @@
 
 from .solvers import (
     BetaSolver,
+    ContinuousFinalParametrizedSolver,
     FinalLinearSolver,
     FinalParametrizedSolver,
     LinearBetaPiSolver,
@@ -12,6 +13,15 @@ from .solvers import (
     VBetaLogitSolver,
     VBetaObjectivePolicySolver,
     VBetaSolver,
+)
+from .continuous_features import (
+    ContinuousDiscretePolicyParam,
+    ContinuousGaussianPolicyModule,
+    ContinuousGaussianPolicyParam,
+    ContinuousNeuralQParam,
+    ContinuousNeuralUParam,
+    ContinuousStateActionMLPModule,
+    ContinuousStateMLPPolicyModule,
 )
 from .fogas_parameters import GeneralizedFOGASParameters, StandaloneFOGASParameters
 from .features import (
@@ -50,6 +60,7 @@ except ModuleNotFoundError as exc:
 
 __all__ = [
     "BetaSolver",
+    "ContinuousFinalParametrizedSolver",
     "VBetaSolver",
     "VBetaObjectivePolicySolver",
     "VBetaLogitSolver",
@@ -80,6 +91,13 @@ __all__ = [
     "NeuralUParam",
     "NeuralQParam",
     "NeuralPolicyParam",
+    "ContinuousStateActionMLPModule",
+    "ContinuousStateMLPPolicyModule",
+    "ContinuousGaussianPolicyModule",
+    "ContinuousNeuralUParam",
+    "ContinuousNeuralQParam",
+    "ContinuousDiscretePolicyParam",
+    "ContinuousGaussianPolicyParam",
     "StateActionMLPModule",
     "StateMLPPolicyModule",
     "build_feature_table",

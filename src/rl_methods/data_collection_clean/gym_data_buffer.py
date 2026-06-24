@@ -105,6 +105,269 @@ class GymDataBuffer:
         return unique_state_ids, reset_distribution, steps
 
     @staticmethod
+    def collect_continuous(
+        policy_matrix,
+        state_disc,
+        action_disc,
+        env_id,
+        n_transitions=50_000,
+        gamma=0.9,
+        epsilon=0.2,
+        proportions=(0.7, 0.3),
+        episode_based=True,
+        max_steps_per_episode=500,
+        reset_probs=None,
+        custom_reset_distribution=None,
+        reset_obs_mode="uniform_in_bin",
+        seed=42,
+        save_path=None,
+        verbose=True,
+        max_repeat_same_state=10_000,
+        drop_self_transitions=False,
+        start_obs=None,
+        goal_velocity=0.0,
+        env_kwargs: Optional[dict] = None,
+        wait_for_state_change=False,
+    ):
+        rng = np.random.default_rng(seed)
+        env = _make_env(
+            env_id=env_id,
+            env_kwargs=env_kwargs,
+            goal_velocity=goal_velocity,
+        )
+
+        n_states = state_disc.n_states
+        n_actions = action_disc.n_actions
+        core_state_count = state_disc.core_state_count
+        goal_state_id = state_disc.absorbing_state_id
+        bin_edges = state_disc.bin_edges
+
+        if start_obs is None:
+            env.close()
+            raise ValueError("start_obs must be provided")
+
+        if reset_probs is None:
+            reset_probs = {"x0": 0.5, "random": 0.5}
+
+        policy_matrix = _to_numpy_policy_matrix(
+            policy_matrix=policy_matrix,
+            n_states=n_states,
+            n_actions=n_actions,
+        )
+
+        p_policy, p_random = proportions
+        if not np.isclose(p_policy + p_random, 1.0):
+            env.close()
+            raise ValueError("proportions must sum to 1.0")
+
+        reset_mode_names = list(reset_probs.keys())
+        reset_mode_probs = np.array(list(reset_probs.values()), dtype=np.float64)
+        if np.any(reset_mode_probs < 0):
+            env.close()
+            raise ValueError("reset_probs must be nonnegative")
+        if np.isclose(reset_mode_probs.sum(), 0.0):
+            env.close()
+            raise ValueError("reset_probs must have positive total mass")
+        reset_mode_probs = reset_mode_probs / reset_mode_probs.sum()
+
+        if "custom" in reset_mode_names:
+            if custom_reset_distribution is None:
+                env.close()
+                raise ValueError(
+                    "custom_reset_distribution must be provided when reset_probs includes 'custom'."
+                )
+
+            custom_state_ids = np.array(list(custom_reset_distribution.keys()), dtype=np.int64)
+            custom_state_probs = np.array(list(custom_reset_distribution.values()), dtype=np.float64)
+
+            if len(custom_state_ids) == 0:
+                env.close()
+                raise ValueError("custom_reset_distribution cannot be empty.")
+            if np.any(custom_state_ids < 0) or np.any(custom_state_ids >= core_state_count):
+                env.close()
+                raise ValueError(
+                    f"custom reset state ids must be in [0, {core_state_count - 1}]."
+                )
+            if np.any(custom_state_probs < 0):
+                env.close()
+                raise ValueError("custom reset probabilities must be nonnegative.")
+            if np.isclose(custom_state_probs.sum(), 0.0):
+                env.close()
+                raise ValueError("custom_reset_distribution must have positive total mass.")
+
+            custom_state_probs = custom_state_probs / custom_state_probs.sum()
+        else:
+            custom_state_ids = None
+            custom_state_probs = None
+
+        def sample_obs_from_state_id(state_id, mode="uniform_in_bin"):
+            state_id = int(state_id)
+            if goal_state_id is not None and state_id == goal_state_id:
+                raise ValueError("Cannot reset directly into GOAL_STATE_ID")
+
+            if mode == "center":
+                return state_disc.state_id_to_center_obs(state_id).copy()
+
+            if mode == "uniform_in_bin":
+                multi_bin = state_disc.state_id_to_multi_bin(state_id)
+                obs = np.empty(len(multi_bin), dtype=np.float64)
+
+                for d, idx in enumerate(multi_bin):
+                    lo = bin_edges[d][idx]
+                    hi = bin_edges[d][idx + 1]
+                    obs[d] = rng.uniform(lo, hi)
+
+                obs = state_disc.clip(obs)
+
+                for _ in range(10):
+                    if (not state_disc.is_terminal_obs(obs)) and (
+                        state_disc.obs_to_state_id(obs) == state_id
+                    ):
+                        return obs
+
+                    for d, idx in enumerate(multi_bin):
+                        lo = bin_edges[d][idx]
+                        hi = bin_edges[d][idx + 1]
+                        obs[d] = rng.uniform(lo, hi)
+                    obs = state_disc.clip(obs)
+
+                return state_disc.state_id_to_center_obs(state_id).copy()
+
+            raise ValueError(f"Unknown reset_obs_mode: {mode}")
+
+        def reset_env():
+            mode = rng.choice(reset_mode_names, p=reset_mode_probs)
+            obs, _ = env.reset(seed=int(rng.integers(0, 1_000_000)))
+
+            if mode == "x0":
+                obs = np.asarray(start_obs, dtype=np.float64).copy()
+                env.unwrapped.state = obs.copy()
+                return obs, mode
+
+            if mode == "random":
+                while state_disc.is_terminal_obs(obs):
+                    obs, _ = env.reset(seed=int(rng.integers(0, 1_000_000)))
+                return np.asarray(obs, dtype=np.float64), mode
+
+            if mode == "custom":
+                sampled_idx = int(rng.choice(len(custom_state_ids), p=custom_state_probs))
+                sampled_state = int(custom_state_ids[sampled_idx])
+                obs = sample_obs_from_state_id(sampled_state, mode=reset_obs_mode)
+                env.unwrapped.state = obs.copy()
+                return obs, mode
+
+            raise ValueError(f"Unknown reset mode: {mode}")
+
+        def choose_policy_id():
+            return int(rng.choice([0, 1], p=[p_policy, p_random]))
+
+        def choose_action_id(obs, policy_id):
+            state_id = state_disc.obs_to_state_id(obs)
+
+            if policy_id == 1:
+                return int(rng.integers(n_actions))
+            if rng.random() < epsilon:
+                return int(rng.integers(n_actions))
+            return int(rng.choice(n_actions, p=policy_matrix[state_id]))
+
+        rows = []
+        episode = 0
+        step_in_episode = 0
+        obs, reset_mode = reset_env()
+        current_policy_id = choose_policy_id() if episode_based else None
+
+        try:
+            with tqdm(total=n_transitions, desc="Collecting continuous dataset") as pbar:
+                while len(rows) < n_transitions:
+                    obs = np.asarray(obs, dtype=np.float64)
+                    state_id = state_disc.obs_to_state_id(obs)
+                    policy_id = current_policy_id if episode_based else choose_policy_id()
+                    action_id = choose_action_id(obs, policy_id)
+                    env_action = action_disc.action_id_to_env_action(action_id)
+
+                    accumulated_reward = 0.0
+                    terminated = False
+                    truncated = False
+                    next_obs = obs
+                    primitive_steps = 0
+
+                    while True:
+                        next_obs, reward, term, trunc, _ = env.step(env_action)
+                        next_obs = np.asarray(next_obs, dtype=np.float64)
+
+                        accumulated_reward += (gamma ** primitive_steps) * float(reward)
+                        primitive_steps += 1
+                        step_in_episode += 1
+
+                        terminated = terminated or term
+                        truncated = truncated or trunc
+
+                        if terminated:
+                            next_state_id = goal_state_id
+                            break
+
+                        next_state_id = state_disc.obs_to_state_id(next_obs)
+                        if not wait_for_state_change:
+                            break
+                        if next_state_id != state_id:
+                            break
+                        if truncated or step_in_episode >= max_steps_per_episode:
+                            break
+                        if primitive_steps >= max_repeat_same_state:
+                            break
+
+                    keep_row = (
+                        next_state_id != state_id or terminated or (not drop_self_transitions)
+                    )
+
+                    if keep_row and len(rows) < n_transitions:
+                        row = {
+                            "episode": episode,
+                            "step": step_in_episode,
+                            "state": state_id,
+                            "action": action_id,
+                            "reward": -1.0 * accumulated_reward,
+                            "next_state": next_state_id,
+                            "done": bool(terminated),
+                            "policy_id": policy_id,
+                            "reset_mode": reset_mode,
+                        }
+                        row.update({f"obs_{i}": v for i, v in enumerate(obs)})
+                        row.update({f"next_obs_{i}": v for i, v in enumerate(next_obs)})
+                        if obs.shape == (2,):
+                            row.update(
+                                {
+                                    "position": obs[0],
+                                    "velocity": obs[1],
+                                    "next_position": next_obs[0],
+                                    "next_velocity": next_obs[1],
+                                }
+                            )
+
+                        rows.append(row)
+                        pbar.update(1)
+
+                    obs = next_obs
+
+                    if terminated or truncated or step_in_episode >= max_steps_per_episode:
+                        episode += 1
+                        step_in_episode = 0
+                        obs, reset_mode = reset_env()
+                        if episode_based:
+                            current_policy_id = choose_policy_id()
+        finally:
+            env.close()
+
+        df = pd.DataFrame(rows)
+
+        if save_path is not None:
+            df.to_csv(save_path, index=False)
+            if verbose:
+                print(f"Saved continuous dataset to {save_path}")
+
+        return df
+
+    @staticmethod
     def collect(
         policy_matrix,
         state_disc,

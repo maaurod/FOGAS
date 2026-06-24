@@ -134,15 +134,16 @@ SBEED_BATCH_SIZE = None
 
 
 # ---------------------------------------------------------------------
-# Fixed generalized FOGAS hyperparameters from 10grid_comparation.ipynb.
+# Fixed generalized FOGAS hyperparameters from the 10grid_tabular_new
+# hyperparameter search best row.
 # ---------------------------------------------------------------------
-GEN_ALPHA = 0.003
-GEN_ETA = 0.001
-GEN_RHO = 2.0
-GEN_T = 4_000
+GEN_ALPHA = 0.0005
+GEN_ETA = 3e-05
+GEN_RHO = 0.1
+GEN_T = 5_000
 GEN_THETA_LR = 0.01
 GEN_THETA_INNER_STEPS = 20
-GEN_THETA_LAMBDA = 1e-6
+GEN_THETA_LAMBDA = 1e-9
 GEN_THETA_MODE = "reg_fixed"
 GEN_THETA_OPTIMIZER = "adam"
 GEN_THETA_START_MODE = "warm"
@@ -186,7 +187,7 @@ ALGORITHM_ALIASES = {
 
 OUTPUT_FILES = {
     "sbeed": "sbeed_dataset_grid.csv",
-    "generalized_fogas": "generalized_fogas_dataset_grid.csv",
+    "generalized_fogas": "generalized_fogas_dataset_grid_best_hparams.csv",
 }
 
 BASE_COLUMNS = [
@@ -934,7 +935,7 @@ def parse_args():
     parser.add_argument(
         "--algorithms",
         type=parse_algorithms,
-        default=parse_algorithms("sbeed,generalized_fogas"),
+        default=parse_algorithms("generalized_fogas"),
         help="Comma-separated algorithms: sbeed,generalized_fogas.",
     )
     parser.add_argument(

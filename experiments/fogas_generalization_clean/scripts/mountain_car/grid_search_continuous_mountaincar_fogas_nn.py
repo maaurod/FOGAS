@@ -3,7 +3,7 @@ Continuous-observation FOGAS NN grid search for MountainCar.
 
 This script uses the generic ContinuousFinalParametrizedSolver on the
 continuous MountainCar dataset and evaluates candidates by rollout mean steps.
-Lower solver_mean_steps is better.
+Lower greedy_mean_steps is better, with solver_mean_steps used as the tie-break.
 """
 
 from __future__ import annotations
@@ -68,8 +68,7 @@ X0_OBS = np.array([-0.5, 0.0], dtype=np.float64)
 OBS_DIM = 2
 N_ACTIONS = 3
 
-DATASET_PATH = DATASETS_DIR / "mountaincar_data.csv"
-PREPARED_DATASET_PATH = RESULTS_DIR / "mountaincar_data_obs_columns.csv"
+DATASET_PATH = RESULTS_DIR / "mountaincar_data_obs_columns.csv"
 OUTPUT_CSV = RESULTS_DIR / "continuous_fogas_nn_grid_search.csv"
 BEST_CSV = RESULTS_DIR / "continuous_fogas_nn_grid_search_best.csv"
 CHECKPOINT_CSV = RESULTS_DIR / "continuous_fogas_nn_eval_checkpoints.csv"
@@ -80,7 +79,6 @@ HIDDEN_SIZES = (32, 32)
 BETA_REG = None
 POLICY_GRADIENT = "exact"
 POLICY_OPTIMIZER = "adam"
-BATCH_SIZE = 40_000
 
 ALPHA_GRID = [3e-5, 1e-4, 3e-4]
 ETA_GRID = [1e-8, 3e-8, 1e-7, 3e-7, 1e-6]
@@ -113,7 +111,6 @@ def parse_args():
     parser.add_argument("--dataset-path", type=Path, default=DATASET_PATH)
     parser.add_argument("--eval-trajectories", type=int, default=EVAL_TRAJECTORIES)
     parser.add_argument("--eval-max-steps", type=int, default=EVAL_MAX_STEPS)
-    parser.add_argument("--batch-size", type=int, default=BATCH_SIZE)
     parser.add_argument("--u-jacobian-batch-size", type=int, default=None)
     parser.add_argument("--value-batch-size", type=int, default=None)
     return parser.parse_args()
@@ -182,29 +179,15 @@ def prepare_dataset(dataset_path):
     if required_generic.issubset(set(header)):
         return dataset_path
 
-    required_old = {
-        "position",
-        "velocity",
-        "next_position",
-        "next_velocity",
-        "action",
-        "reward",
-    }
-    if not required_old.issubset(set(header)):
-        raise ValueError(
-            "Dataset must contain generic obs columns or old MountainCar columns. "
-            f"Found columns: {list(header)}"
-        )
+    raise ValueError(
+        "MountainCar dataset must contain obs_0, obs_1, next_obs_0, next_obs_1, "
+        f"action, and reward columns. Found columns: {list(header)}"
+    )
 
-    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-    df = pd.read_csv(dataset_path)
-    df = df.copy()
-    df["obs_0"] = df["position"]
-    df["obs_1"] = df["velocity"]
-    df["next_obs_0"] = df["next_position"]
-    df["next_obs_1"] = df["next_velocity"]
-    df.to_csv(PREPARED_DATASET_PATH, index=False)
-    return PREPARED_DATASET_PATH
+
+def dataset_row_count(dataset_path):
+    with Path(dataset_path).open() as handle:
+        return max(0, sum(1 for _ in handle) - 1)
 
 
 def hidden_sizes_label(hidden_sizes):
@@ -242,6 +225,9 @@ def load_existing_results(resume, output_csv):
     if not resume or not output_csv.exists():
         return [], set()
     df = pd.read_csv(output_csv)
+    if "greedy_mean_steps" not in df.columns:
+        return [], set()
+    df = df[df["greedy_mean_steps"].notna()].copy()
     rows = df.to_dict("records")
     completed = {candidate_key(row) for row in rows}
     return rows, completed
@@ -251,9 +237,12 @@ def ordered_results_frame(results):
     df = pd.DataFrame(results)
     if df.empty:
         return df
+    for column in ("greedy_mean_steps", "solver_mean_steps", "elapsed_seconds"):
+        if column not in df.columns:
+            df[column] = np.nan
     return df.sort_values(
-        by=["solver_mean_steps", "elapsed_seconds"],
-        ascending=[True, True],
+        by=["greedy_mean_steps", "solver_mean_steps", "elapsed_seconds"],
+        ascending=[True, True, True],
         na_position="last",
     ).reset_index(drop=True)
 
@@ -283,6 +272,9 @@ def finite_float(value, default=np.nan):
 
 def blank_metrics():
     return {
+        "greedy_mean_steps": np.nan,
+        "greedy_success_rate": np.nan,
+        "greedy_avg_env_return": np.nan,
         "solver_mean_steps": np.nan,
         "solver_success_rate": np.nan,
         "solver_avg_env_return": np.nan,
@@ -297,7 +289,7 @@ def blank_metrics():
     }
 
 
-def base_row(params, device, status="ok", error=""):
+def base_row(params, device, status="ok", error="", batch_size=np.nan):
     alpha, eta, rho, theta_lr, theta_lambda = params
     row = {
         "alpha": float(alpha),
@@ -307,6 +299,7 @@ def base_row(params, device, status="ok", error=""):
         "theta_lr": float(theta_lr),
         "theta_inner_steps": int(THETA_INNER_STEPS),
         "theta_lambda": float(theta_lambda),
+        "batch_size": batch_size,
         "hidden_sizes": hidden_sizes_label(HIDDEN_SIZES),
         "beta_reg": BETA_REG,
         "theta_mode": "reg_fixed",
@@ -388,11 +381,12 @@ def make_solver(
     )
 
 
-def evaluate_solver_policy(
+def evaluate_policy_rollouts(
     solver,
     num_trajectories,
     max_steps,
     seed,
+    deterministic,
 ):
     env = gym.make(ENV_ID, max_episode_steps=max_steps, goal_velocity=GOAL_VELOCITY)
     steps_list = []
@@ -407,7 +401,7 @@ def evaluate_solver_policy(
             total_return = 0.0
 
             while not done and steps < int(max_steps):
-                action = solver.sample_action(obs, deterministic=False)
+                action = solver.sample_action(obs, deterministic=deterministic)
                 obs, reward, terminated, truncated, _ = env.step(action)
                 total_return += float(reward)
                 steps += 1
@@ -421,9 +415,39 @@ def evaluate_solver_policy(
         env.close()
 
     return {
-        "solver_mean_steps": float(np.mean(steps_list)),
-        "solver_success_rate": float(successes / max(1, int(num_trajectories))),
-        "solver_avg_env_return": float(np.mean(returns)),
+        "mean_steps": float(np.mean(steps_list)),
+        "success_rate": float(successes / max(1, int(num_trajectories))),
+        "avg_env_return": float(np.mean(returns)),
+    }
+
+
+def prefixed_metrics(prefix, metrics):
+    return {f"{prefix}_{key}": value for key, value in metrics.items()}
+
+
+def evaluate_solver_policy(
+    solver,
+    num_trajectories,
+    max_steps,
+    seed,
+):
+    greedy_metrics = evaluate_policy_rollouts(
+        solver=solver,
+        num_trajectories=num_trajectories,
+        max_steps=max_steps,
+        seed=seed,
+        deterministic=True,
+    )
+    solver_metrics = evaluate_policy_rollouts(
+        solver=solver,
+        num_trajectories=num_trajectories,
+        max_steps=max_steps,
+        seed=seed,
+        deterministic=False,
+    )
+    return {
+        **prefixed_metrics("greedy", greedy_metrics),
+        **prefixed_metrics("solver", solver_metrics),
     }
 
 
@@ -446,6 +470,9 @@ def diagnostics_metrics(diagnostics):
 def checkpoint_row(base, iteration, eval_metrics, diagnostics):
     row = dict(base)
     row["checkpoint_iter"] = int(iteration)
+    row["greedy_mean_steps"] = eval_metrics["greedy_mean_steps"]
+    row["greedy_success_rate"] = eval_metrics["greedy_success_rate"]
+    row["greedy_avg_env_return"] = eval_metrics["greedy_avg_env_return"]
     row["solver_mean_steps"] = eval_metrics["solver_mean_steps"]
     row["solver_success_rate"] = eval_metrics["solver_success_rate"]
     row["solver_avg_env_return"] = eval_metrics["solver_avg_env_return"]
@@ -470,13 +497,12 @@ def run_candidate(
     device,
     eval_trajectories,
     eval_max_steps,
-    batch_size,
     u_jacobian_batch_size,
     value_batch_size,
 ):
     alpha, eta, rho, theta_lr, theta_lambda = params
     start = time.perf_counter()
-    row = base_row(params, device)
+    row = base_row(params, device, batch_size=batch_size)
     checkpoint_rows = []
 
     try:
@@ -571,7 +597,7 @@ def run_candidate_worker(
             value_batch_size=value_batch_size,
         )
     except Exception as exc:
-        row = base_row(params, device, status="failed", error=repr(exc))
+        row = base_row(params, device, status="failed", error=repr(exc), batch_size=batch_size)
         row["elapsed_seconds"] = float(time.perf_counter() - start)
         return row, []
 
@@ -590,11 +616,13 @@ def run_grid_search():
     print(f"Checkpoints: {CHECKPOINT_CSV}")
     print(f"Workers: {workers}")
     print(f"Torch threads: {max(1, int(args.torch_threads))}")
-    print(f"Total grid size: {total_grid_size()}")
     print(f"Fixed T: {T_FIXED}")
     print(f"Fixed hidden sizes: {HIDDEN_SIZES}")
     print(f"Fixed NN seed: {NN_SEED}")
-    batch_size = max(1, int(args.batch_size))
+    batch_size = dataset_row_count(dataset_path)
+    if batch_size <= 0:
+        raise ValueError(f"Dataset is empty: {dataset_path}")
+    print(f"Total grid size: {total_grid_size()}")
     u_jacobian_batch_size = (
         None
         if args.u_jacobian_batch_size is None
@@ -603,9 +631,15 @@ def run_grid_search():
     value_batch_size = (
         None if args.value_batch_size is None else max(1, int(args.value_batch_size))
     )
-    print(f"Batch size: {batch_size}")
-    print(f"U Jacobian batch size: {batch_size if u_jacobian_batch_size is None else u_jacobian_batch_size}")
-    print(f"Value batch size: {batch_size if value_batch_size is None else value_batch_size}")
+    print(f"Full dataset batch size: {batch_size}")
+    print(
+        "U Jacobian batch size: "
+        f"{'full dataset batch size' if u_jacobian_batch_size is None else u_jacobian_batch_size}"
+    )
+    print(
+        "Value batch size: "
+        f"{'full dataset batch size' if value_batch_size is None else value_batch_size}"
+    )
 
     candidates_all = all_candidates()
     if args.max_runs is not None:
@@ -613,13 +647,16 @@ def run_grid_search():
 
     results, completed = load_existing_results(args.resume, OUTPUT_CSV)
     checkpoint_rows = []
-    if args.resume and CHECKPOINT_CSV.exists():
-        checkpoint_rows = pd.read_csv(CHECKPOINT_CSV).to_dict("records")
+    if args.resume and CHECKPOINT_CSV.exists() and results:
+        checkpoint_df = pd.read_csv(CHECKPOINT_CSV)
+        if "greedy_mean_steps" in checkpoint_df.columns:
+            checkpoint_df = checkpoint_df[checkpoint_df["greedy_mean_steps"].notna()].copy()
+            checkpoint_rows = checkpoint_df.to_dict("records")
 
     candidates = [
         candidate
         for candidate in candidates_all
-        if candidate_key(base_row(candidate, primary_device)) not in completed
+        if candidate_key(base_row(candidate, primary_device, batch_size=batch_size)) not in completed
     ]
 
     print(f"Candidates to run: {len(candidates)}")
@@ -671,7 +708,8 @@ def run_grid_search():
             if progress:
                 outer.set_postfix(
                     {
-                        "mean_steps": row["solver_mean_steps"],
+                        "greedy_steps": row["greedy_mean_steps"],
+                        "solver_steps": row["solver_mean_steps"],
                         "status": row["status"],
                     }
                 )
@@ -739,7 +777,8 @@ def run_grid_search():
                         if progress:
                             progress_bar.set_postfix(
                                 {
-                                    "mean_steps": row["solver_mean_steps"],
+                                    "greedy_steps": row["greedy_mean_steps"],
+                                    "solver_steps": row["solver_mean_steps"],
                                     "status": row["status"],
                                 }
                             )

@@ -59,6 +59,7 @@ class FinalParametrizedSolver:
         theta_include_beta_cov=False,
         beta_update="fogas_full",
         d_theta_scale=1.0,
+        batch_size=None,
         print_params=False,
         dataset_verbose=False,
         seed=42,
@@ -133,6 +134,7 @@ class FinalParametrizedSolver:
         )
         self.beta_update = self._canonical_beta_update(beta_update)
         self.d_theta_scale = self._canonical_positive_float(d_theta_scale, "d_theta_scale")
+        self.batch_size = self._canonical_optional_positive_int(batch_size, "batch_size")
 
         self.dataset = FOGASDataset(csv_path=csv_path, verbose=dataset_verbose)
         self.Xs = self.dataset.X.to(self.device).long()
@@ -451,6 +453,12 @@ class FinalParametrizedSolver:
             raise ValueError(f"{name} must be positive")
         return value
 
+    @classmethod
+    def _canonical_optional_positive_int(cls, value, name):
+        if value is None:
+            return None
+        return cls._canonical_positive_int(value, name)
+
     @staticmethod
     def _canonical_bool(value, name):
         if isinstance(value, bool):
@@ -474,11 +482,32 @@ class FinalParametrizedSolver:
         q_flat = self.q_param.q(self.flat_state_grid, self.flat_action_grid)
         return q_flat.reshape(self.N, self.A)
 
-    def _q_sample(self):
-        return self.q_param.q(self.Xs, self.As)
+    def _sample_batch(self):
+        full = self.batch_size is None or self.batch_size >= self.n
+        if full:
+            indices = torch.arange(self.n, dtype=torch.long, device=self.device)
+        else:
+            indices = torch.randint(self.n, (int(self.batch_size),), device=self.device)
+        batch = {
+            "indices": indices,
+            "n": int(indices.numel()),
+            "full": bool(full),
+            "Xs": self.Xs[indices],
+            "As": self.As[indices],
+            "Rs": self.Rs[indices],
+            "X_nexts": self.X_nexts[indices],
+        }
+        if self.u_is_linear:
+            batch["U_sample"] = self.U_sample[indices]
+        if self.q_is_linear:
+            batch["Q_sample"] = self.Q_sample[indices]
+        return batch
 
-    def _u_sample_values(self):
-        return self.u_param.u(self.Xs, self.As)
+    def _q_sample(self, batch):
+        return self.q_param.q(batch["Xs"], batch["As"])
+
+    def _u_sample_values(self, batch):
+        return self.u_param.u(batch["Xs"], batch["As"])
 
     def _prepare_module_init(self, module, init, initial_flat, name):
         if init is None:
@@ -605,24 +634,24 @@ class FinalParametrizedSolver:
         self._set_module_flat_params(self.q_param, theta_t)
         return theta_t, lambda_theta, q_objective, theta_grad_norm, theta_lr_used
 
-    def _theta_loss_nonlinear(self, coeff, pi_mat):
+    def _theta_loss_nonlinear(self, coeff, pi_mat, batch):
         q_all = self._q_matrix()
         dtype = q_all.dtype
         coeff = coeff.detach().to(dtype=dtype)
         pi = pi_mat.detach().to(dtype=dtype)
         e_q_pi = (pi * q_all).sum(dim=1)
-        q_sample = self._q_sample().to(dtype=dtype)
+        q_sample = self._q_sample(batch).to(dtype=dtype)
         return (
             (1.0 - self.gamma) * e_q_pi[self.x0]
-            + (self.gamma / self.n) * (coeff * e_q_pi[self.X_nexts]).sum()
+            + (self.gamma / batch["n"]) * (coeff * e_q_pi[batch["X_nexts"]]).sum()
             - (coeff * q_sample).mean()
         )
 
-    def _nonlinear_theta_lambda(self, coeff, pi_mat, effective_D_theta):
+    def _nonlinear_theta_lambda(self, coeff, pi_mat, batch, effective_D_theta):
         lambda_theta = None
         if self.theta_mode == "reg_adaptive":
             params = self._trainable_params(self.q_param)
-            loss = self._theta_loss_nonlinear(coeff, pi_mat)
+            loss = self._theta_loss_nonlinear(coeff, pi_mat, batch)
             grad = self._flat_grads(loss, params)
             lambda_theta = max(float(torch.linalg.norm(grad).detach().cpu().item()) / effective_D_theta, self._EPS)
         elif self.theta_mode == "reg_fixed":
@@ -631,7 +660,7 @@ class FinalParametrizedSolver:
             lambda_theta = self.theta_lambda
         return lambda_theta
 
-    def _compute_nonlinear_theta_update(self, coeff, pi_mat, effective_D_theta):
+    def _compute_nonlinear_theta_update(self, coeff, pi_mat, batch, effective_D_theta):
         if self.theta_include_beta_cov:
             raise ValueError("theta_include_beta_cov=True is only supported by linear parametrizations")
 
@@ -639,14 +668,14 @@ class FinalParametrizedSolver:
             self._set_module_flat_params(self.q_param, self._initial_q_flat)
 
         params = self._trainable_params(self.q_param)
-        lambda_theta = self._nonlinear_theta_lambda(coeff, pi_mat, effective_D_theta)
+        lambda_theta = self._nonlinear_theta_lambda(coeff, pi_mat, batch, effective_D_theta)
         theta_lr_used = self._default_theta_lr(lambda_theta, self.theta_optimizer)
         optimizer_cls = torch.optim.SGD if self.theta_optimizer == "sgd" else torch.optim.Adam
         optimizer = optimizer_cls(params, lr=theta_lr_used)
 
         for _ in range(self.theta_inner_steps):
             optimizer.zero_grad(set_to_none=True)
-            objective = self._theta_loss_nonlinear(coeff, pi_mat)
+            objective = self._theta_loss_nonlinear(coeff, pi_mat, batch)
             if lambda_theta is not None:
                 flat = torch.cat([p.reshape(-1) for p in params])
                 objective = objective + 0.5 * lambda_theta * torch.dot(flat, flat)
@@ -655,7 +684,7 @@ class FinalParametrizedSolver:
             if self.theta_mode == "projection":
                 self._project_module_params(self.q_param, effective_D_theta)
 
-        objective = self._theta_loss_nonlinear(coeff, pi_mat)
+        objective = self._theta_loss_nonlinear(coeff, pi_mat, batch)
         if lambda_theta is not None:
             flat_live = torch.cat([p.reshape(-1) for p in params])
             objective_for_grad = objective + 0.5 * lambda_theta * torch.dot(flat_live, flat_live)
@@ -686,6 +715,7 @@ class FinalParametrizedSolver:
         pi_mat,
         q_all,
         coeff,
+        batch,
         policy_state_weights,
         state_weight_update,
         reinforce_samples,
@@ -694,13 +724,13 @@ class FinalParametrizedSolver:
             states = torch.cat(
                 (
                     torch.tensor([self.x0], dtype=torch.long, device=self.device),
-                    self.X_nexts,
+                    batch["X_nexts"],
                 )
             )
             weights = torch.cat(
                 (
                     torch.tensor([1.0 - self.gamma], dtype=pi_mat.dtype, device=self.device),
-                    (self.gamma / self.n) * coeff.to(dtype=pi_mat.dtype),
+                    (self.gamma / batch["n"]) * coeff.to(dtype=pi_mat.dtype),
                 )
             )
         else:
@@ -747,6 +777,7 @@ class FinalParametrizedSolver:
         self,
         q_all,
         coeff,
+        batch,
         policy_state_weights,
         state_weight_update,
         reinforce_samples,
@@ -755,13 +786,13 @@ class FinalParametrizedSolver:
             states = torch.cat(
                 (
                     torch.tensor([self.x0], dtype=torch.long, device=self.device),
-                    self.X_nexts,
+                    batch["X_nexts"],
                 )
             )
             weights = torch.cat(
                 (
                     torch.tensor([1.0 - self.gamma], dtype=torch.float64, device=self.device),
-                    (self.gamma / self.n) * coeff.to(dtype=torch.float64),
+                    (self.gamma / batch["n"]) * coeff.to(dtype=torch.float64),
                 )
             )
         else:
@@ -879,27 +910,46 @@ class FinalParametrizedSolver:
         }
         return x, diagnostics
 
-    def _policy_update_state_indices(self, state_weight_update):
+    def _policy_update_state_indices(self, state_weight_update, batch):
         if state_weight_update == "normal":
             return torch.cat(
                 (
                     torch.tensor([self.x0], dtype=torch.long, device=self.device),
-                    self.X_nexts,
+                    batch["X_nexts"],
                 )
             )
         return self.state_indices
 
-    def _compute_linear_beta_update_direction(self, beta_grad):
+    def _compute_linear_beta_update_direction(self, beta_grad, batch):
         if self.beta_update == "fogas_full":
-            direction = self.H_inv @ beta_grad
+            if batch["full"]:
+                H = self.H
+                direction = self.H_inv @ beta_grad
+                diag_min = None
+                diag_max = None
+            else:
+                U_sample = batch["U_sample"]
+                H = (U_sample.T @ U_sample) / batch["n"]
+                H = H + self.beta_reg * torch.eye(
+                    self.d,
+                    dtype=U_sample.dtype,
+                    device=self.device,
+                )
+                direction = torch.linalg.solve(H, beta_grad.to(dtype=H.dtype))
+                diag_min = float(torch.diagonal(H).min().detach().cpu().item())
+                diag_max = float(torch.diagonal(H).max().detach().cpu().item())
             diagnostics = {
                 "beta_update": self.beta_update,
-                "beta_diag_min": None,
-                "beta_diag_max": None,
+                "beta_diag_min": diag_min,
+                "beta_diag_max": diag_max,
             }
             return direction, diagnostics
 
-        diag_h = torch.diagonal(self.H).clamp_min(self._EPS)
+        if batch["full"]:
+            diag_h = torch.diagonal(self.H).clamp_min(self._EPS)
+        else:
+            diag_h = (batch["U_sample"] * batch["U_sample"]).mean(dim=0) + self.beta_reg
+            diag_h = diag_h.clamp_min(self._EPS)
         direction = beta_grad / diag_h
         diagnostics = {
             "beta_update": self.beta_update,
@@ -930,15 +980,15 @@ class FinalParametrizedSolver:
             rows.append(torch.cat(row))
         return torch.stack(rows, dim=0)
 
-    def _u_sample_jacobian(self):
+    def _u_sample_jacobian(self, batch):
         params = self._trainable_params(self.u_param)
         if not params:
-            return torch.empty(self.n, 0, dtype=torch.float64, device=self.device)
+            return torch.empty(batch["n"], 0, dtype=torch.float64, device=self.device)
 
         try:
             from torch.func import functional_call, grad, vmap
         except ImportError:
-            outputs = self._u_sample_values()
+            outputs = self._u_sample_values(batch)
             return self._jacobian_outputs(outputs, params)
 
         named_params = {
@@ -961,22 +1011,22 @@ class FinalParametrizedSolver:
             grads = vmap(
                 grad(single_u),
                 in_dims=(None, None, 0, 0),
-            )(named_params, buffers, self.Xs, self.As)
+            )(named_params, buffers, batch["Xs"], batch["As"])
             return torch.cat(
-                [grads[name].reshape(self.n, -1) for name in param_names],
+                [grads[name].reshape(batch["n"], -1) for name in param_names],
                 dim=1,
             )
         except Exception:
-            outputs = self._u_sample_values()
+            outputs = self._u_sample_values(batch)
             return self._jacobian_outputs(outputs, params)
 
-    def _compute_nonlinear_beta_update_direction(self, td_error):
-        jacobian = self._u_sample_jacobian().detach()
+    def _compute_nonlinear_beta_update_direction(self, td_error, batch):
+        jacobian = self._u_sample_jacobian(batch).detach()
         td = td_error.detach().to(dtype=jacobian.dtype)
-        beta_grad = (jacobian.T @ td) / self.n
+        beta_grad = (jacobian.T @ td) / batch["n"]
 
         if self.beta_update == "fogas_full":
-            H = (jacobian.T @ jacobian) / self.n
+            H = (jacobian.T @ jacobian) / batch["n"]
             H = H + self.beta_reg * torch.eye(
                 H.shape[0],
                 dtype=H.dtype,
@@ -1176,24 +1226,25 @@ class FinalParametrizedSolver:
         final_theta = self._module_flat_params(self.q_param).detach().clone().to(dtype=torch.float64)
 
         for t in iterator:
+            batch = self._sample_batch()
             if self.policy_is_linear:
                 psi_t = self._module_flat_params(self.policy_param).detach().clone()
                 pi_mat = self._linear_policy_matrix(psi_t)
             else:
                 pi_mat = self._policy_matrix()
 
-            coeff = self._u_sample_values().detach().to(dtype=torch.float64)
+            coeff = self._u_sample_values(batch).detach().to(dtype=torch.float64)
 
             if self.q_is_linear:
                 E_q_pi = (pi_mat.to(dtype=self.Q_XA.dtype)[..., None] * self.Q_XA).sum(dim=1)
                 beta_for_theta = self._module_flat_params(self.u_param).to(dtype=self.Q_XA.dtype)
                 coeff_q = coeff.to(dtype=self.Q_XA.dtype)
                 theta_mismatch = (1.0 - self.gamma) * E_q_pi[self.x0]
-                theta_mismatch = theta_mismatch + (self.gamma / self.n) * (
-                    coeff_q[:, None] * E_q_pi[self.X_nexts]
+                theta_mismatch = theta_mismatch + (self.gamma / batch["n"]) * (
+                    coeff_q[:, None] * E_q_pi[batch["X_nexts"]]
                 ).sum(dim=0)
                 theta_mismatch = theta_mismatch - (
-                    self.Q_sample * coeff_q[:, None]
+                    batch["Q_sample"] * coeff_q[:, None]
                 ).mean(dim=0)
 
                 theta_init = (
@@ -1215,6 +1266,7 @@ class FinalParametrizedSolver:
                     self._compute_nonlinear_theta_update(
                         coeff=coeff,
                         pi_mat=pi_mat,
+                        batch=batch,
                         effective_D_theta=effective_D_theta,
                     )
                 )
@@ -1222,18 +1274,19 @@ class FinalParametrizedSolver:
 
             q_all = self._q_matrix().to(dtype=torch.float64)
             pi_eval = self._policy_matrix().detach().to(dtype=torch.float64)
-            q_next = q_all[self.X_nexts]
-            v = (pi_eval[self.X_nexts] * q_next).sum(dim=1)
-            q_current = self._q_sample().to(dtype=torch.float64)
+            q_next = q_all[batch["X_nexts"]]
+            v = (pi_eval[batch["X_nexts"]] * q_next).sum(dim=1)
+            q_current = self._q_sample(batch).to(dtype=torch.float64)
             v_x0 = (pi_eval[self.x0] * q_all[self.x0]).sum()
-            td_error = self.Rs + self.gamma * v - q_current
+            td_error = batch["Rs"] + self.gamma * v - q_current
             beta_objective = (coeff * td_error).mean()
             total_loss = (1.0 - self.gamma) * v_x0 + beta_objective
 
             if self.u_is_linear:
-                beta_grad = (self.U_sample.T @ td_error.to(dtype=self.U_sample.dtype)) / self.n
+                beta_grad = (batch["U_sample"].T @ td_error.to(dtype=batch["U_sample"].dtype)) / batch["n"]
                 beta_update_direction, beta_diagnostics = self._compute_linear_beta_update_direction(
-                    beta_grad
+                    beta_grad,
+                    batch,
                 )
                 beta_t = (1.0 / (1.0 + rho * eta)) * (
                     self._module_flat_params(self.u_param).to(dtype=beta_update_direction.dtype)
@@ -1242,7 +1295,7 @@ class FinalParametrizedSolver:
                 self._set_module_flat_params(self.u_param, beta_t)
             else:
                 beta_update_direction, beta_grad, beta_diagnostics = (
-                    self._compute_nonlinear_beta_update_direction(td_error)
+                    self._compute_nonlinear_beta_update_direction(td_error, batch)
                 )
                 beta_t = (1.0 / (1.0 + rho * eta)) * (
                     self._module_flat_params(self.u_param).to(dtype=beta_update_direction.dtype)
@@ -1251,8 +1304,8 @@ class FinalParametrizedSolver:
                 self._set_module_flat_params(self.u_param, beta_t)
 
             state_weight_sums = torch.zeros(self.N, dtype=torch.float64, device=self.device)
-            state_weight_sums.index_add_(0, self.X_nexts, coeff)
-            state_weights = (self.gamma / self.n) * state_weight_sums
+            state_weight_sums.index_add_(0, batch["X_nexts"], coeff)
+            state_weights = (self.gamma / batch["n"]) * state_weight_sums
             state_weights[self.x0] = state_weights[self.x0] + (1.0 - self.gamma)
             if state_weight_update == "normal":
                 policy_state_weights = state_weights
@@ -1272,6 +1325,7 @@ class FinalParametrizedSolver:
                         pi_for_policy,
                         q_all,
                         coeff,
+                        batch,
                         policy_state_weights,
                         state_weight_update,
                         reinforce_samples,
@@ -1285,6 +1339,7 @@ class FinalParametrizedSolver:
                 policy_grad, policy_objective = self._reinforce_policy_gradient_nonlinear(
                     q_all,
                     coeff,
+                    batch,
                     policy_state_weights,
                     state_weight_update,
                     reinforce_samples,
@@ -1311,7 +1366,7 @@ class FinalParametrizedSolver:
                 policy_direction_kind = "adam_gradient"
                 policy_diagnostics = {}
             else:
-                policy_state_indices = self._policy_update_state_indices(state_weight_update)
+                policy_state_indices = self._policy_update_state_indices(state_weight_update, batch)
                 policy_direction, policy_diagnostics = self._conjugate_gradient_policy_direction(
                     policy_grad=policy_grad,
                     psi_t=psi_t,

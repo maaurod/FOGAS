@@ -75,7 +75,7 @@ CHECKPOINT_CSV = RESULTS_DIR / "continuous_fogas_nn_batches_eval_checkpoints.csv
 
 T_FIXED = 20_000
 THETA_INNER_STEPS = 10
-HIDDEN_SIZES = (32, 32)
+HIDDEN_SIZES = (16, 16)
 BETA_REG = None
 POLICY_GRADIENT = "exact"
 POLICY_OPTIMIZER = "adam"
@@ -114,12 +114,11 @@ def parse_args():
     parser.add_argument("--eval-max-steps", type=int, default=EVAL_MAX_STEPS)
     parser.add_argument(
         "--batch-sizes",
+        dest="batch_sizes",
         type=str,
         default=",".join(str(size) for size in BATCH_SIZE_GRID),
-        help="Comma-separated mini-batch sizes to include in the grid.",
+        help="Comma-separated true mini-batch sizes to include in the grid.",
     )
-    parser.add_argument("--u-jacobian-batch-size", type=int, default=None)
-    parser.add_argument("--value-batch-size", type=int, default=None)
     return parser.parse_args()
 
 
@@ -512,8 +511,6 @@ def run_candidate(
     device,
     eval_trajectories,
     eval_max_steps,
-    u_jacobian_batch_size,
-    value_batch_size,
 ):
     alpha, eta, rho, theta_lr, theta_lambda, batch_size = params
     start = time.perf_counter()
@@ -527,8 +524,8 @@ def run_candidate(
             theta_lr=theta_lr,
             theta_lambda=theta_lambda,
             batch_size=batch_size,
-            u_jacobian_batch_size=u_jacobian_batch_size,
-            value_batch_size=value_batch_size,
+            u_jacobian_batch_size=None,
+            value_batch_size=None,
         )
         checkpoint_set = set(EVAL_CHECKPOINTS)
 
@@ -591,8 +588,6 @@ def run_candidate_worker(
     torch_threads,
     eval_trajectories,
     eval_max_steps,
-    u_jacobian_batch_size,
-    value_batch_size,
 ):
     start = time.perf_counter()
     device = torch.device(device_name)
@@ -606,8 +601,6 @@ def run_candidate_worker(
             device=device,
             eval_trajectories=eval_trajectories,
             eval_max_steps=eval_max_steps,
-            u_jacobian_batch_size=u_jacobian_batch_size,
-            value_batch_size=value_batch_size,
         )
     except Exception as exc:
         row = base_row(params, device, status="failed", error=repr(exc))
@@ -634,23 +627,7 @@ def run_grid_search():
     print(f"Fixed NN seed: {NN_SEED}")
     batch_sizes = parse_batch_sizes(args.batch_sizes)
     print(f"Total grid size: {total_grid_size(batch_sizes=batch_sizes)}")
-    u_jacobian_batch_size = (
-        None
-        if args.u_jacobian_batch_size is None
-        else max(1, int(args.u_jacobian_batch_size))
-    )
-    value_batch_size = (
-        None if args.value_batch_size is None else max(1, int(args.value_batch_size))
-    )
-    print(f"Batch size grid: {batch_sizes}")
-    print(
-        "U Jacobian batch size: "
-        f"{'candidate batch size' if u_jacobian_batch_size is None else u_jacobian_batch_size}"
-    )
-    print(
-        "Value batch size: "
-        f"{'candidate batch size' if value_batch_size is None else value_batch_size}"
-    )
+    print(f"Mini-batch size grid: {batch_sizes}")
 
     candidates_all = all_candidates(batch_sizes=batch_sizes)
     if args.max_runs is not None:
@@ -704,8 +681,6 @@ def run_grid_search():
                 device=device,
                 eval_trajectories=max(1, int(args.eval_trajectories)),
                 eval_max_steps=max(1, int(args.eval_max_steps)),
-                u_jacobian_batch_size=u_jacobian_batch_size,
-                value_batch_size=value_batch_size,
             )
             row["run_idx"] = int(run_idx)
             for cp_row in cp_rows:
@@ -752,8 +727,6 @@ def run_grid_search():
                     max(1, int(args.torch_threads)),
                     max(1, int(args.eval_trajectories)),
                     max(1, int(args.eval_max_steps)),
-                    u_jacobian_batch_size,
-                    value_batch_size,
                 )
                 future_to_candidate[future] = (submit_idx, params, device_name)
                 next_submit_idx += 1

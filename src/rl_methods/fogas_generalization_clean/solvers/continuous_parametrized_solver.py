@@ -52,7 +52,7 @@ class ContinuousFinalParametrizedSolver:
         theta_start_mode="warm",
         beta_update="fogas_diag",
         beta_reg=1e-3,
-        batch_size=4096,
+        batch_size=None,
         u_jacobian_batch_size=None,
         value_batch_size=None,
         dataset_verbose=False,
@@ -148,13 +148,13 @@ class ContinuousFinalParametrizedSolver:
         self.beta_reg = 1.0 if beta_reg is None else float(beta_reg)
         if self.beta_reg < 0.0:
             raise ValueError("beta_reg must be non-negative")
-        self.batch_size = self._canonical_positive_int(batch_size, "batch_size")
-        self.u_jacobian_batch_size = self._canonical_positive_int(
-            self.batch_size if u_jacobian_batch_size is None else u_jacobian_batch_size,
+        self.batch_size = self._canonical_optional_positive_int(batch_size, "batch_size")
+        self.u_jacobian_batch_size = self._canonical_optional_positive_int(
+            u_jacobian_batch_size,
             "u_jacobian_batch_size",
         )
-        self.value_batch_size = self._canonical_positive_int(
-            self.batch_size if value_batch_size is None else value_batch_size,
+        self.value_batch_size = self._canonical_optional_positive_int(
+            value_batch_size,
             "value_batch_size",
         )
 
@@ -229,6 +229,12 @@ class ContinuousFinalParametrizedSolver:
         if value <= 0:
             raise ValueError(f"{name} must be positive")
         return value
+
+    @classmethod
+    def _canonical_optional_positive_int(cls, value, name):
+        if value is None:
+            return None
+        return cls._canonical_positive_int(value, name)
 
     @staticmethod
     def _canonical_positive_float(value, name):
@@ -379,16 +385,35 @@ class ContinuousFinalParametrizedSolver:
         for start in range(0, int(n), int(batch_size)):
             yield start, min(start + int(batch_size), int(n))
 
-    def _q_sample(self):
+    @staticmethod
+    def _effective_chunk_size(chunk_size, n):
+        return int(n) if chunk_size is None else min(int(chunk_size), int(n))
+
+    def _sample_batch(self):
+        if self.batch_size is None or self.batch_size >= self.n:
+            indices = torch.arange(self.n, dtype=torch.long, device=self.device)
+        else:
+            indices = torch.randint(self.n, (int(self.batch_size),), device=self.device)
+        return {
+            "indices": indices,
+            "n": int(indices.numel()),
+            "Xs": self.Xs[indices],
+            "As": self.As[indices],
+            "Rs": self.Rs[indices],
+            "X_nexts": self.X_nexts[indices],
+            "Ds": self.Ds[indices],
+        }
+
+    def _q_sample(self, batch):
         return self.q_param.q(
-            self.Xs.to(dtype=self._param_dtype(self.q_param)),
-            self._action_tensor(self.As, dtype=self._param_dtype(self.q_param)),
+            batch["Xs"].to(dtype=self._param_dtype(self.q_param)),
+            self._action_tensor(batch["As"], dtype=self._param_dtype(self.q_param)),
         )
 
-    def _u_sample_values(self):
+    def _u_sample_values(self, batch):
         return self.u_param.u(
-            self.Xs.to(dtype=self._param_dtype(self.u_param)),
-            self._action_tensor(self.As, dtype=self._param_dtype(self.u_param)),
+            batch["Xs"].to(dtype=self._param_dtype(self.u_param)),
+            self._action_tensor(batch["As"], dtype=self._param_dtype(self.u_param)),
         )
 
     def _expected_q_discrete(self, observations, detach_policy):
@@ -396,7 +421,7 @@ class ContinuousFinalParametrizedSolver:
         obs = self._obs_tensor(observations, self.q_param).to(dtype=dtype)
         n = obs.shape[0]
         values = []
-        for start, end in self._batched_ranges(n, self.value_batch_size):
+        for start, end in self._batched_ranges(n, self._effective_chunk_size(self.value_batch_size, n)):
             obs_batch = obs[start:end]
             batch_n = obs_batch.shape[0]
             repeated_obs = (
@@ -422,7 +447,8 @@ class ContinuousFinalParametrizedSolver:
         obs = self._obs_tensor(observations, self.q_param).to(dtype=dtype)
         sample_count = self.action_samples_per_obs if sample_count is None else int(sample_count)
         values = []
-        for start, end in self._batched_ranges(obs.shape[0], self.value_batch_size):
+        n = obs.shape[0]
+        for start, end in self._batched_ranges(n, self._effective_chunk_size(self.value_batch_size, n)):
             obs_batch = obs[start:end]
             batch_n = obs_batch.shape[0]
             repeated_obs = (
@@ -452,19 +478,19 @@ class ContinuousFinalParametrizedSolver:
             sample_count=sample_count,
         )
 
-    def _theta_loss(self, coeff):
+    def _theta_loss(self, coeff, batch):
         coeff = coeff.detach().to(dtype=self._param_dtype(self.q_param))
         x0_term = self._expected_q(self.x0_obs, detach_policy=True).squeeze(0)
-        next_term = self._expected_q(self.X_nexts, detach_policy=True)
-        q_sample = self._q_sample().to(dtype=next_term.dtype)
-        not_done = (~self.Ds).to(dtype=next_term.dtype)
+        next_term = self._expected_q(batch["X_nexts"], detach_policy=True)
+        q_sample = self._q_sample(batch).to(dtype=next_term.dtype)
+        not_done = (~batch["Ds"]).to(dtype=next_term.dtype)
         return (
             (1.0 - self.gamma) * x0_term
-            + (self.gamma / self.n) * (coeff * not_done * next_term).sum()
+            + (self.gamma / batch["n"]) * (coeff * not_done * next_term).sum()
             - (coeff * q_sample).mean()
         )
 
-    def _theta_lambda(self, coeff, effective_D_theta):
+    def _theta_lambda(self, coeff, batch, effective_D_theta):
         if self.theta_mode == "reg_fixed":
             if self.theta_lambda is None:
                 raise ValueError("theta_lambda must be provided when theta_mode='reg_fixed'")
@@ -472,7 +498,7 @@ class ContinuousFinalParametrizedSolver:
         if self.theta_mode == "projection":
             return None
         params = self._trainable_params(self.q_param)
-        loss = self._theta_loss(coeff)
+        loss = self._theta_loss(coeff, batch)
         grad = self._flat_grads(loss, params)
         return max(float(torch.linalg.norm(grad).detach().cpu().item()) / effective_D_theta, self._EPS)
 
@@ -486,12 +512,12 @@ class ContinuousFinalParametrizedSolver:
     def _project_module_params(self, module, radius):
         self._set_module_flat_params(module, self._project_tensor(self._module_flat_params(module), radius))
 
-    def _compute_theta_update(self, coeff, effective_D_theta):
+    def _compute_theta_update(self, coeff, batch, effective_D_theta):
         if self.theta_start_mode == "zero":
             self._set_module_flat_params(self.q_param, self._initial_q_flat)
 
         params = self._trainable_params(self.q_param)
-        lambda_theta = self._theta_lambda(coeff, effective_D_theta)
+        lambda_theta = self._theta_lambda(coeff, batch, effective_D_theta)
         theta_lr = 1e-2 if self.theta_lr is None and self.theta_optimizer == "adam" else self.theta_lr
         if theta_lr is None:
             theta_lr = 1.0 / max(lambda_theta if lambda_theta is not None else 1.0, self._EPS)
@@ -500,7 +526,7 @@ class ContinuousFinalParametrizedSolver:
         optimizer = optimizer_cls(params, lr=theta_lr)
         for _ in range(self.theta_inner_steps):
             optimizer.zero_grad(set_to_none=True)
-            objective = self._theta_loss(coeff)
+            objective = self._theta_loss(coeff, batch)
             if lambda_theta is not None:
                 flat = torch.cat([p.reshape(-1) for p in params])
                 objective = objective + 0.5 * lambda_theta * torch.dot(flat, flat)
@@ -509,7 +535,7 @@ class ContinuousFinalParametrizedSolver:
             if self.theta_mode == "projection":
                 self._project_module_params(self.q_param, effective_D_theta)
 
-        objective = self._theta_loss(coeff)
+        objective = self._theta_loss(coeff, batch)
         if lambda_theta is not None:
             flat = torch.cat([p.reshape(-1) for p in params])
             objective_for_grad = objective + 0.5 * lambda_theta * torch.dot(flat, flat)
@@ -538,20 +564,20 @@ class ContinuousFinalParametrizedSolver:
             rows.append(torch.cat(row))
         return torch.stack(rows, dim=0)
 
-    def _u_sample_jacobian_batches(self):
+    def _u_sample_jacobian_batches(self, batch):
         params = self._trainable_params(self.u_param)
         if not params:
             return
 
         dtype = self._param_dtype(self.u_param)
-        observations = self.Xs.to(dtype=dtype)
-        actions = self._action_tensor(self.As, dtype=dtype)
-        batch_size = min(self.u_jacobian_batch_size, self.n)
+        observations = batch["Xs"].to(dtype=dtype)
+        actions = self._action_tensor(batch["As"], dtype=dtype)
+        batch_size = self._effective_chunk_size(self.u_jacobian_batch_size, batch["n"])
 
         try:
             from torch.func import functional_call, grad, vmap
         except ImportError:
-            for start, end in self._batched_ranges(self.n, batch_size):
+            for start, end in self._batched_ranges(batch["n"], batch_size):
                 outputs = self.u_param.u(observations[start:end], actions[start:end])
                 yield self._jacobian_outputs(outputs, params)
             return
@@ -577,7 +603,7 @@ class ContinuousFinalParametrizedSolver:
             in_dims=(None, None, 0, 0),
         )
 
-        for start, end in self._batched_ranges(self.n, batch_size):
+        for start, end in self._batched_ranges(batch["n"], batch_size):
             grads = per_sample_grad(
                 named_params,
                 buffers,
@@ -589,13 +615,13 @@ class ContinuousFinalParametrizedSolver:
                 dim=1,
             )
 
-    def _u_sample_jacobian(self):
-        chunks = list(self._u_sample_jacobian_batches())
+    def _u_sample_jacobian(self, batch):
+        chunks = list(self._u_sample_jacobian_batches(batch))
         if not chunks:
             return torch.empty(0, 0, dtype=torch.float64, device=self.device)
         return torch.cat(chunks, dim=0)
 
-    def _compute_beta_update_direction(self, td_error):
+    def _compute_beta_update_direction(self, td_error, batch):
         param_count = self.d
         beta_grad = None
         h_acc = None
@@ -604,7 +630,7 @@ class ContinuousFinalParametrizedSolver:
 
         if self.beta_update == "fogas_full":
             start = 0
-            for jacobian in self._u_sample_jacobian_batches():
+            for jacobian in self._u_sample_jacobian_batches(batch):
                 jacobian = jacobian.detach()
                 end = start + jacobian.shape[0]
                 td = td_error[start:end].to(dtype=jacobian.dtype)
@@ -620,8 +646,8 @@ class ContinuousFinalParametrizedSolver:
                 h_acc = h_acc + jacobian.T @ jacobian
                 start = end
 
-            beta_grad = beta_grad / self.n
-            H = h_acc / self.n
+            beta_grad = beta_grad / batch["n"]
+            H = h_acc / batch["n"]
             H = H + self.beta_reg * torch.eye(H.shape[0], dtype=H.dtype, device=H.device)
             direction = torch.linalg.solve(H, beta_grad.to(dtype=H.dtype))
             diagnostics = {
@@ -631,7 +657,7 @@ class ContinuousFinalParametrizedSolver:
             }
         else:
             start = 0
-            for jacobian in self._u_sample_jacobian_batches():
+            for jacobian in self._u_sample_jacobian_batches(batch):
                 jacobian = jacobian.detach()
                 end = start + jacobian.shape[0]
                 td = td_error[start:end].to(dtype=jacobian.dtype)
@@ -642,8 +668,8 @@ class ContinuousFinalParametrizedSolver:
                 diag_acc = diag_acc + (jacobian * jacobian).sum(dim=0)
                 start = end
 
-            beta_grad = beta_grad / self.n
-            diag_h = diag_acc / self.n + self.beta_reg
+            beta_grad = beta_grad / batch["n"]
+            diag_h = diag_acc / batch["n"] + self.beta_reg
             diag_h = diag_h.clamp_min(self._EPS)
             direction = beta_grad.to(dtype=diag_h.dtype) / diag_h
             diagnostics = {
@@ -653,30 +679,30 @@ class ContinuousFinalParametrizedSolver:
             }
         return direction.detach(), beta_grad.detach(), diagnostics
 
-    def _policy_support(self, coeff):
+    def _policy_support(self, coeff, batch):
         x0 = self.x0_obs.to(dtype=self._param_dtype(self.policy_param))
-        next_obs = self.X_nexts.to(dtype=self._param_dtype(self.policy_param))
+        next_obs = batch["X_nexts"].to(dtype=self._param_dtype(self.policy_param))
         observations = torch.cat([x0, next_obs], dim=0)
         weights = torch.cat(
             [
                 torch.tensor([1.0 - self.gamma], dtype=torch.float64, device=self.device),
-                (self.gamma / self.n)
+                (self.gamma / batch["n"])
                 * coeff.detach().to(dtype=torch.float64)
-                * (~self.Ds).to(dtype=torch.float64),
+                * (~batch["Ds"]).to(dtype=torch.float64),
             ]
         )
         return observations, weights
 
-    def _exact_policy_gradient_discrete(self, coeff):
-        observations, weights = self._policy_support(coeff)
+    def _exact_policy_gradient_discrete(self, coeff, batch):
+        observations, weights = self._policy_support(coeff, batch)
         q_expected = self._expected_q_discrete(observations, detach_policy=False)
         objective = (weights.to(dtype=q_expected.dtype) * q_expected).sum()
         params = self._trainable_params(self.policy_param)
         grad = self._flat_grads(objective, params)
         return grad.detach(), objective.detach()
 
-    def _reinforce_policy_gradient(self, coeff, reinforce_samples):
-        observations, weights = self._policy_support(coeff)
+    def _reinforce_policy_gradient(self, coeff, batch, reinforce_samples):
+        observations, weights = self._policy_support(coeff, batch)
         sample_count = self._canonical_positive_int(reinforce_samples, "reinforce_samples")
         params = self._trainable_params(self.policy_param)
 
@@ -861,21 +887,23 @@ class ContinuousFinalParametrizedSolver:
         final_theta = self._module_flat_params(self.q_param).detach().clone().to(dtype=torch.float64)
 
         for t in iterator:
-            coeff = self._u_sample_values().detach().to(dtype=torch.float64)
+            batch = self._sample_batch()
+            coeff = self._u_sample_values(batch).detach().to(dtype=torch.float64)
             theta_t, lambda_theta, q_objective, theta_grad_norm, theta_lr_used = self._compute_theta_update(
                 coeff=coeff,
+                batch=batch,
                 effective_D_theta=D_theta,
             )
             final_theta = theta_t.detach().clone().to(dtype=torch.float64)
 
-            q_current = self._q_sample().to(dtype=torch.float64)
-            v_next = self._expected_q(self.X_nexts, detach_policy=True).detach().to(dtype=torch.float64)
+            q_current = self._q_sample(batch).to(dtype=torch.float64)
+            v_next = self._expected_q(batch["X_nexts"], detach_policy=True).detach().to(dtype=torch.float64)
             v_x0 = self._expected_q(self.x0_obs, detach_policy=True).squeeze(0).detach().to(dtype=torch.float64)
-            td_error = self.Rs + self.gamma * (~self.Ds).to(dtype=torch.float64) * v_next - q_current
+            td_error = batch["Rs"] + self.gamma * (~batch["Ds"]).to(dtype=torch.float64) * v_next - q_current
             beta_objective = (coeff * td_error).mean()
             total_loss = (1.0 - self.gamma) * v_x0 + beta_objective
 
-            beta_update_direction, beta_grad, beta_diagnostics = self._compute_beta_update_direction(td_error)
+            beta_update_direction, beta_grad, beta_diagnostics = self._compute_beta_update_direction(td_error, batch)
             beta_t = (1.0 / (1.0 + rho * eta)) * (
                 self._module_flat_params(self.u_param).to(dtype=beta_update_direction.dtype)
                 + eta * beta_update_direction
@@ -883,9 +911,9 @@ class ContinuousFinalParametrizedSolver:
             self._set_module_flat_params(self.u_param, beta_t)
 
             if policy_gradient == "exact":
-                policy_grad, policy_objective = self._exact_policy_gradient_discrete(coeff)
+                policy_grad, policy_objective = self._exact_policy_gradient_discrete(coeff, batch)
             else:
-                policy_grad, policy_objective = self._reinforce_policy_gradient(coeff, reinforce_samples)
+                policy_grad, policy_objective = self._reinforce_policy_gradient(coeff, batch, reinforce_samples)
 
             if policy_optimizer == "sgd":
                 policy_direction = policy_grad

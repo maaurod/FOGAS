@@ -76,6 +76,7 @@ THETA_INNER_STEPS = 10
 BETA_REG = None
 POLICY_GRADIENT = "exact"
 POLICY_OPTIMIZER = "adam"
+MINIBATCH_GRID = False
 BATCH_SIZE_GRID = [4_000, 8_000]
 RBF_BINS = np.array([15, 15], dtype=np.int64)
 VARIANCE_SCALE = 0.05
@@ -126,14 +127,13 @@ def parse_args():
     parser.add_argument("--dataset-path", type=Path, default=DATASET_PATH)
     parser.add_argument("--eval-trajectories", type=int, default=EVAL_TRAJECTORIES)
     parser.add_argument("--eval-max-steps", type=int, default=EVAL_MAX_STEPS)
-    parser.add_argument(
-        "--batch-sizes",
-        type=str,
-        default=",".join(str(size) for size in BATCH_SIZE_GRID),
-        help="Comma-separated mini-batch sizes to include in the grid.",
-    )
-    parser.add_argument("--u-jacobian-batch-size", type=int, default=None)
-    parser.add_argument("--value-batch-size", type=int, default=None)
+    if MINIBATCH_GRID:
+        parser.add_argument(
+            "--batch-sizes",
+            type=str,
+            default=",".join(str(size) for size in BATCH_SIZE_GRID),
+            help="Comma-separated true mini-batch sizes to include in the grid.",
+        )
     return parser.parse_args()
 
 
@@ -256,9 +256,6 @@ class ContinuousRBFStateActionFeatures(torch.nn.Module):
             actions = actions.expand(state_features.shape[0])
         elif state_features.shape[0] != actions.numel():
             raise ValueError("observations and actions must have compatible batch sizes")
-        if torch.any((actions < 0) | (actions >= self.n_actions)):
-            raise ValueError(f"actions must be in [0, {self.n_actions})")
-
         action_features = torch.nn.functional.one_hot(
             actions,
             num_classes=self.n_actions,
@@ -337,14 +334,16 @@ class ContinuousSoftmaxLinearRBFPolicyParam(torch.nn.Module):
 
 
 def candidate_key(row):
-    return (
+    key = (
         float(row["alpha"]),
         float(row["eta"]),
         float(row["rho"]),
         float(row["theta_lr"]),
         float(row["theta_lambda"]),
-        int(row["batch_size"]),
     )
+    if MINIBATCH_GRID:
+        key = key + (int(row["batch_size"]),)
+    return key
 
 
 def parse_batch_sizes(value):
@@ -357,8 +356,20 @@ def parse_batch_sizes(value):
 
 
 def all_candidates(batch_sizes=None):
-    if batch_sizes is None:
-        batch_sizes = BATCH_SIZE_GRID
+    if MINIBATCH_GRID:
+        if batch_sizes is None:
+            batch_sizes = BATCH_SIZE_GRID
+        return [
+            tuple(candidate)
+            for candidate in itertools.product(
+                ALPHA_GRID,
+                ETA_GRID,
+                RHO_GRID,
+                THETA_LR_GRID,
+                THETA_LAMBDA_GRID,
+                batch_sizes,
+            )
+        ]
     return [
         tuple(candidate)
         for candidate in itertools.product(
@@ -367,7 +378,6 @@ def all_candidates(batch_sizes=None):
             RHO_GRID,
             THETA_LR_GRID,
             THETA_LAMBDA_GRID,
-            batch_sizes,
         )
     ]
 
@@ -376,11 +386,29 @@ def total_grid_size(batch_sizes=None):
     return len(all_candidates(batch_sizes=batch_sizes))
 
 
+def candidate_batch_size(params):
+    if MINIBATCH_GRID:
+        return int(params[5])
+    return None
+
+
+def base_params(params):
+    if MINIBATCH_GRID:
+        return params[:5]
+    return params
+
+
+def batch_size_label(batch_size):
+    return "" if batch_size is None else int(batch_size)
+
+
 def load_existing_results(resume, output_csv):
     if not resume or not output_csv.exists():
         return [], set()
     df = pd.read_csv(output_csv)
-    if "greedy_mean_steps" not in df.columns or "batch_size" not in df.columns:
+    if "greedy_mean_steps" not in df.columns:
+        return [], set()
+    if MINIBATCH_GRID and "batch_size" not in df.columns:
         return [], set()
     df = df[df["greedy_mean_steps"].notna()].copy()
     rows = df.to_dict("records")
@@ -445,7 +473,8 @@ def blank_metrics():
 
 
 def base_row(params, device, status="ok", error=""):
-    alpha, eta, rho, theta_lr, theta_lambda, batch_size = params
+    alpha, eta, rho, theta_lr, theta_lambda = base_params(params)
+    batch_size = candidate_batch_size(params)
     row = {
         "alpha": float(alpha),
         "eta": float(eta),
@@ -454,7 +483,7 @@ def base_row(params, device, status="ok", error=""):
         "theta_lr": float(theta_lr),
         "theta_inner_steps": int(THETA_INNER_STEPS),
         "theta_lambda": float(theta_lambda),
-        "batch_size": int(batch_size),
+        "batch_size": batch_size_label(batch_size),
         "feature_type": "rbf",
         "rbf_bins": "x".join(str(int(size)) for size in RBF_BINS),
         "rbf_centers": int(K_CENTERS),
@@ -656,7 +685,8 @@ def run_candidate(
     u_jacobian_batch_size,
     value_batch_size,
 ):
-    alpha, eta, rho, theta_lr, theta_lambda, batch_size = params
+    alpha, eta, rho, theta_lr, theta_lambda = base_params(params)
+    batch_size = candidate_batch_size(params)
     start = time.perf_counter()
     row = base_row(params, device)
     checkpoint_rows = []
@@ -775,25 +805,14 @@ def run_grid_search():
     print(f"Number of RBF centers (k): {K_CENTERS}")
     print(f"Total feature dimension (d): {D_RBF}")
     print(f"Fixed parameter seed: {PARAM_SEED}")
-    batch_sizes = parse_batch_sizes(args.batch_sizes)
+    batch_sizes = parse_batch_sizes(args.batch_sizes) if MINIBATCH_GRID else None
     print(f"Total grid size: {total_grid_size(batch_sizes=batch_sizes)}")
-    u_jacobian_batch_size = (
-        None
-        if args.u_jacobian_batch_size is None
-        else max(1, int(args.u_jacobian_batch_size))
-    )
-    value_batch_size = (
-        None if args.value_batch_size is None else max(1, int(args.value_batch_size))
-    )
-    print(f"Batch size grid: {batch_sizes}")
-    print(
-        "U Jacobian batch size: "
-        f"{'candidate batch size' if u_jacobian_batch_size is None else u_jacobian_batch_size}"
-    )
-    print(
-        "Value batch size: "
-        f"{'candidate batch size' if value_batch_size is None else value_batch_size}"
-    )
+    if MINIBATCH_GRID:
+        print(f"Mini-batch size grid: {batch_sizes}")
+    else:
+        print("Mini-batch size: full dataset")
+    u_jacobian_batch_size = None
+    value_batch_size = None
 
     candidates_all = all_candidates(batch_sizes=batch_sizes)
     if args.max_runs is not None:

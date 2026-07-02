@@ -429,6 +429,7 @@ def run_config(config: Dict[str, Any]) -> Dict[str, Any]:
 def build_configs(args: argparse.Namespace) -> List[Dict[str, Any]]:
     configs: List[Dict[str, Any]] = []
     run_id = 0
+    devices = list(args.devices)
     for dataset_id, dataset_path in enumerate(args.dataset_paths):
         dataset_path = Path(dataset_path)
         dataset_name = dataset_path.stem
@@ -451,7 +452,7 @@ def build_configs(args: argparse.Namespace) -> List[Dict[str, Any]]:
                     "lr_rho": lr_rho,
                     "lr_policy": lr_policy,
                     "seed": args.seed,
-                    "device": args.device,
+                    "device": devices[(run_id - 1) % len(devices)],
                     "torch_threads": args.torch_threads,
                     "steps": steps,
                 }
@@ -469,6 +470,13 @@ def parse_int_list(value: str) -> List[int]:
 
 def parse_path_list(value: str) -> List[Path]:
     return [Path(item.strip()) for item in value.split(",") if item.strip()]
+
+
+def parse_devices(value: str) -> List[str]:
+    devices = [item.strip() for item in value.split(",") if item.strip()]
+    if not devices:
+        raise argparse.ArgumentTypeError("At least one device is required.")
+    return devices
 
 
 def completed_run_ids(output_csv: Path) -> set[int]:
@@ -557,6 +565,15 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 2) - 1))
     parser.add_argument("--device", type=str, default="cpu")
+    parser.add_argument(
+        "--devices",
+        type=parse_devices,
+        default=None,
+        help=(
+            "Comma-separated devices assigned round-robin, e.g. cpu or cuda:0,cuda:1. "
+            "When omitted, --device is used for every worker."
+        ),
+    )
     parser.add_argument("--torch-threads", type=int, default=1)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
@@ -577,6 +594,8 @@ def main() -> None:
     args = parse_args()
     if "--dataset-paths" not in sys.argv and "--dataset-path" in sys.argv:
         args.dataset_paths = [args.dataset_path]
+    if args.devices is None:
+        args.devices = parse_devices(args.device)
 
     configs = build_configs(args)
     output_csv = Path(args.output_csv)
@@ -601,6 +620,7 @@ def main() -> None:
     print(f"Output CSV : {output_csv.resolve()}")
     print(f"Configs    : {len(configs)}")
     print(f"Workers    : {args.workers}")
+    print(f"Devices    : {', '.join(args.devices)}")
     print(f"Step grid  : {args.step_grid}")
     print(f"Eval       : {N_EVAL_EPISODES} greedy stochastic rollouts, horizon {MAX_EVAL_STEPS}")
     print("Ranking    : greedy_success desc, eval_success_rate desc, eval_return_mean desc")

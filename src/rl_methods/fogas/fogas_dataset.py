@@ -2,32 +2,57 @@
 FOGASDataset
 ------------
 
-Utility for loading and validating offline RL datasets for LinearMDPs.
+Utility for loading and validating offline RL datasets for discrete MDPs.
 Expected CSV columns:
     state, action, reward, next_state
 """
 
+import csv
+
 import torch
-import pandas as pd
 from typing import Union, List, Tuple, Optional
+
+try:
+    import pandas as pd
+except ModuleNotFoundError:  # pragma: no cover - exercised only in minimal envs
+    pd = None
 
 
 class FOGASDataset:
     def __init__(self, csv_path, verbose=False):
         self.csv_path = csv_path
-        self.df = pd.read_csv(csv_path)
-
         required = ["state", "action", "reward", "next_state"]
-        for col in required:
-            if col not in self.df.columns:
-                raise ValueError(f"Missing required column: {col}")
+
+        if pd is not None:
+            self.df = pd.read_csv(csv_path)
+            for col in required:
+                if col not in self.df.columns:
+                    raise ValueError(f"Missing required column: {col}")
+
+            states = self.df["state"].to_numpy(dtype='int64')
+            actions = self.df["action"].to_numpy(dtype='int64')
+            rewards = self.df["reward"].to_numpy(dtype='float64')
+            next_states = self.df["next_state"].to_numpy(dtype='int64')
+        else:
+            with open(csv_path, newline="", encoding="utf-8") as f:
+                rows = list(csv.DictReader(f))
+            if not rows:
+                raise ValueError("Dataset CSV is empty")
+            missing = [col for col in required if col not in rows[0]]
+            if missing:
+                raise ValueError(f"Missing required column(s): {missing}")
+            self.df = rows
+            states = [int(row["state"]) for row in rows]
+            actions = [int(row["action"]) for row in rows]
+            rewards = [float(row["reward"]) for row in rows]
+            next_states = [int(row["next_state"]) for row in rows]
 
         # Ensure action column is numeric if it's supposed to be loaded into torch
         # If it's strings, we might need a mapping before converting to tensor
-        self.X = torch.from_numpy(self.df["state"].to_numpy(dtype='int64'))
-        self.A = torch.from_numpy(self.df["action"].to_numpy(dtype='int64'))
-        self.R = torch.from_numpy(self.df["reward"].to_numpy(dtype='float64'))
-        self.X_next = torch.from_numpy(self.df["next_state"].to_numpy(dtype='int64'))
+        self.X = torch.as_tensor(states, dtype=torch.int64)
+        self.A = torch.as_tensor(actions, dtype=torch.int64)
+        self.R = torch.as_tensor(rewards, dtype=torch.float64)
+        self.X_next = torch.as_tensor(next_states, dtype=torch.int64)
 
         self.n = len(self.df)
 

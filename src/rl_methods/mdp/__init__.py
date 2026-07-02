@@ -1,19 +1,15 @@
-from .linear_mdp import LinearMDP
-from .policy_solver import PolicySolver
-from .abstract_mdp import (
-    BoxActionDiscretizer,
-    BoxStateDiscretizer,
-    DiscreteActionDiscretizer,
-    DiscretizedLinearMDP,
-    TabularFeatureMap,
-)
+"""Discrete MDP and planning utilities."""
+
+from .discrete_mdp import DiscreteMDP
+from .features_mdp import FeaturesMDP, TabularFeatureMap
+from .planner import Planner
+from .continuous import ActionDiscretizer, StateDiscretizer
 
 __all__ = [
-    "LinearMDP",
-    "PolicySolver",
-    "BoxStateDiscretizer",
-    "DiscreteActionDiscretizer",
-    "BoxActionDiscretizer",
+    "DiscreteMDP",
+    "FeaturesMDP",
     "TabularFeatureMap",
-    "DiscretizedLinearMDP",
+    "Planner",
+    "StateDiscretizer",
+    "ActionDiscretizer",
 ]

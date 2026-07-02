@@ -9,32 +9,35 @@ from tqdm import trange
 
 class FOGASSolver:
     """
-    FOGAS implementation: runs the optimization algorithm, stores θ̄-history and final π.
-    Evaluation utilities are moved to FOGASEvaluator.
-    Supports CUDA acceleration.
+    FOGAS implementation: precomputes PHI tensors and runs the
+    core loop with batch operations. Supports CUDA acceleration.
     """
 
     def __init__(
         self,
         mdp,
+        phi,
         csv_path,
-        csv_path_omega=None,
         delta=0.05,
         T=None,
         alpha=None,
         eta=None,
         rho=None,
         D_theta=None,
+        beta=None,
         print_params=False,
         dataset_verbose=False,
         seed=42,
         device=None,
+        csv_path_omega=None,
+        beta_omega=None,
     ):
         self.mdp = mdp
-        self.csv_path = csv_path
-        self.csv_path_omega = csv_path_omega if csv_path_omega is not None else csv_path
         self.delta = delta
         self.seed = seed
+        self.csv_path = csv_path
+        self.csv_path_omega = csv_path_omega if csv_path_omega is not None else csv_path
+        self.phi = phi
 
         # Set device (CUDA if available)
         if device is None:
@@ -70,19 +73,12 @@ class FOGASSolver:
         # ------------------------------
         self.N = mdp.N
         self.A = mdp.A
-        self.d = mdp.d
         self.gamma = mdp.gamma
-        self.R = mdp.R
-        self.phi = mdp.phi
-        
-        # Handle omega: use from MDP if available, otherwise estimate from dataset
-        if mdp.omega is not None:
-            self.omega = mdp.omega.to(self.device) if isinstance(mdp.omega, torch.Tensor) else torch.tensor(mdp.omega, dtype=torch.float64, device=self.device)
-        else:
-            if print_params:
-                print("MDP omega not provided. Estimating from dataset...")
-            self.omega = None
         self.x0 = mdp.x0
+        self._beta_omega = beta_omega
+
+        # Precompute feature tensors before parameters: d and R are solver-owned.
+        self._build_feature_tensors()
 
         # ------------------------------
         # Theoretical parameters
@@ -92,7 +88,11 @@ class FOGASSolver:
             print(f"Dataset: {csv_path} (n={self.n})")
 
         self.params = FOGASParameters(
-            mdp=mdp,
+            N=self.N,
+            A=self.A,
+            gamma=self.gamma,
+            d=self.d,
+            R=self.R,
             n=self.n,
             delta=delta,
             T=T,
@@ -100,6 +100,7 @@ class FOGASSolver:
             eta=eta,
             rho=rho,
             D_theta=D_theta,
+            beta=beta,
             print_params=print_params,
         )
 
@@ -111,12 +112,22 @@ class FOGASSolver:
         self.beta = self.params.beta
         self.D_pi = self.params.D_pi
 
-        # Build covariance matrices
+        # Precompute empirical covariance
         self._build_covariances()
 
-        # Estimate omega if needed
-        if self.omega is None:
-            self._estimate_omega()
+        # ------------------------------------------------------------------
+        # Omega resolution
+        # ------------------------------------------------------------------
+        # • mdp.has_omega and beta_omega is None → use known reward weights
+        # • otherwise                           → estimate omega from data
+        # ------------------------------------------------------------------
+        has_known_omega = bool(getattr(mdp, "has_omega", getattr(mdp, "omega", None) is not None))
+        if has_known_omega and self._beta_omega is None:
+            self.omega = self._coerce_omega(mdp.omega)
+        else:
+            if print_params:
+                print("Known omega not provided. Estimating from dataset...")
+            self._estimate_omega(beta_omega=self._beta_omega)
             if print_params:
                 print(f"Estimated omega (first 5 components): {self.omega[:5]}")
 
@@ -127,86 +138,103 @@ class FOGASSolver:
         self.lambda_T = None
 
     # ------------------------------------------------------------------
+    # Feature tensors
+    # ------------------------------------------------------------------
+    def _build_feature_tensors(self):
+        # PHI_XA[x, a] = phi(x, a)
+        PHI_XA = torch.stack(
+            [torch.stack([self.phi(x, a) for a in range(self.A)]) for x in range(self.N)],
+            dim=0,
+        ).to(dtype=torch.float64, device=self.device)
+
+        Phi = PHI_XA.reshape(self.N * self.A, -1)
+        Phi_data = PHI_XA[self.Xs.long(), self.As.long()]
+
+        self.PHI_XA = PHI_XA
+        self.Phi = Phi
+        self.Phi_data = Phi_data
+        self.d = int(Phi.shape[1])
+        self.R = float(torch.linalg.norm(Phi, dim=1).max().item())
+
+    def _coerce_omega(self, omega):
+        if omega is None:
+            raise ValueError("mdp.has_omega is true but mdp.omega is None")
+        out = omega.to(dtype=torch.float64, device=self.device) if isinstance(omega, torch.Tensor) else torch.tensor(omega, dtype=torch.float64, device=self.device)
+        out = out.reshape(-1)
+        if out.shape != (self.d,):
+            raise ValueError(f"mdp.omega must have shape ({self.d},), got {tuple(out.shape)}")
+        return out
+
+    # ------------------------------------------------------------------
     # Covariance
     # ------------------------------------------------------------------
     def _build_covariances(self):
         n = self.n
         d = self.d
         beta = self.beta
-        phi = self.phi
-        Xs = self.Xs
-        As = self.As
+        Phi = self.Phi_data
 
-        Phi_list = [phi(int(x.item()), int(a.item())).to(dtype=torch.float64, device=self.device) 
-                    for x, a in zip(Xs, As)]
-        Phi = torch.vstack(Phi_list)
         Cov_emp = beta * torch.eye(d, dtype=torch.float64, device=self.device) + (Phi.T @ Phi) / n
         Cov_emp_inv = torch.linalg.inv(Cov_emp)
 
-        self.Phi = Phi
         self.Cov_emp = Cov_emp
         self.Cov_emp_inv = Cov_emp_inv
 
     # ------------------------------------------------------------------
     # Estimate omega from dataset
     # ------------------------------------------------------------------
-    def _estimate_omega(self):
+    def _estimate_omega(self, beta_omega=None):
         """
-        Estimate omega from the omega dataset using regularized least squares.
+        Estimate omega via ridge regression on the dataset:
+            omega_hat = (Phi^T Phi + beta_omega * n * I)^{-1} Phi^T r
+
+        Parameters
+        ----------
+        beta_omega : float or None
+            Regularization for the regression. If None, uses the theoretical
+            beta = R^2 / (d * T) from FOGASParameters.
         """
-        # If the paths are the same, use precomputed tensors to save time
+        reg = self.beta if beta_omega is None else beta_omega
+
         if self.csv_path_omega == self.csv_path:
             n = self.n
-            Phi = self.Phi
+            Phi = self.Phi_data
             R = self.Rs
-            Cov_inv = self.Cov_emp_inv
         else:
-            # Load the second dataset
             ds_omega = FOGASDataset(csv_path=self.csv_path_omega, verbose=False)
-            Xs_o = ds_omega.X.to(self.device)
-            As_o = ds_omega.A.to(self.device)
+            X_o = ds_omega.X.to(self.device).long()
+            A_o = ds_omega.A.to(self.device).long()
             R = ds_omega.R.to(self.device)
             n = ds_omega.n
-            
-            # Compute features for this dataset
-            Phi_list = [self.phi(int(x.item()), int(a.item())).to(dtype=torch.float64, device=self.device) 
-                        for x, a in zip(Xs_o, As_o)]
-            Phi = torch.vstack(Phi_list)
-            
-            # Compute local covariance for estimation
-            Cov = self.beta * torch.eye(self.d, dtype=torch.float64, device=self.device) + (Phi.T @ Phi) / n
-            Cov_inv = torch.linalg.inv(Cov)
-        
-        # omega_hat = Cov_inv @ (Phi^T @ R / n)
-        sum_phi_r = (Phi.T @ R) / n
-        self.omega = Cov_inv @ sum_phi_r
+            Phi = self.PHI_XA[X_o, A_o]
+
+        Cov = reg * torch.eye(self.d, dtype=torch.float64, device=self.device) + (Phi.T @ Phi) / n
+        Cov_inv = torch.linalg.inv(Cov)
+        self.omega = Cov_inv @ (Phi.T @ R / n)
+        print(f"[FOGASSolver] omega estimated via regression "
+              f"(beta_omega={reg:.2e}, n={n})")
+
 
     # ------------------------------------------------------------------
-    # Softmax policy
+    # Softmax policy (matrix)
     # ------------------------------------------------------------------
-    def softmax_policy(self, theta_bar, alpha, return_matrix=False):
-        phi = self.phi
-        A = self.A
-        N = self.N
+    @staticmethod
+    def _row_softmax(logits):
+        z = logits - logits.max(dim=1, keepdim=True).values
+        ez = torch.exp(z)
+        return ez / ez.sum(dim=1, keepdim=True)
 
-        def compute_probs(x):
-            logits = []
-            for a in range(A):
-                phi_val = phi(x, a).to(dtype=torch.float64)
-                logits.append(alpha * torch.dot(phi_val, theta_bar))
-            logits = torch.stack(logits)
-            exp_logits = torch.exp(logits - torch.max(logits))
-            return exp_logits / exp_logits.sum()
+    def softmax_policy(self, theta_bar, alpha, return_matrix=True):
+        theta_bar = theta_bar.to(dtype=torch.float64, device=self.device)
+        logits = alpha * torch.tensordot(self.PHI_XA, theta_bar, dims=([2], [0]))
+        pi_mat = self._row_softmax(logits)
+        if return_matrix:
+            return pi_mat
 
-        if not return_matrix:
-            def pi(x):
-                return compute_probs(x)
-            return pi
-        else:
-            out = torch.zeros((N, A), dtype=torch.float64, device=self.device)
-            for x in range(N):
-                out[x] = compute_probs(x)
-            return out
+        def pi(x):
+            return pi_mat[int(x)]
+
+        return pi
 
     # ------------------------------------------------------------------
     # RUN FOGAS
@@ -217,12 +245,13 @@ class FOGASSolver:
         alpha=None,
         eta=None,
         rho=None,
+        gamma=None,
         D_theta=None,
         lambda_init=None,
         theta_bar_init=None,
         print_policies=False,
         verbose=False,
-        tqdm_print=False
+        tqdm_print=False,
     ):
         # -------------------------
         # Override parameters
@@ -231,29 +260,30 @@ class FOGASSolver:
         alpha = self.params.alpha if alpha is None else alpha
         eta = self.params.eta if eta is None else eta
         rho = self.params.rho if rho is None else rho
+        gamma = self.gamma if gamma is None else gamma
         D_theta = self.params.D_theta if D_theta is None else D_theta
 
         self.mod_alpha = alpha  # store alpha used
 
-        Cov_emp, Cov_emp_inv = self.Cov_emp, self.Cov_emp_inv
-        Phi = self.Phi
-        phi = self.phi
-        gamma = self.gamma
-        omega = self.omega
-        x0 = self.x0
+        N, A, d = self.N, self.A, self.d
         n = self.n
-        d = self.d
-        A = self.A
-        X_nexts = self.X_nexts
+        PHI_XA = self.PHI_XA
+        Phi_data = self.Phi_data
+        Xn = self.X_nexts.long()
+        x0 = int(self.x0)
+
+        Cov = self.Cov_emp
+        Cov_inv = self.Cov_emp_inv
+        omega = self.omega
+
+        device = self.device
 
         # -------------------------
         # Initialization
         # -------------------------
-        device = self.device
         lambda_t = torch.zeros(d, dtype=torch.float64, device=device) if lambda_init is None else lambda_init.clone().to(device)
         theta_bar_t = torch.zeros(d, dtype=torch.float64, device=device) if theta_bar_init is None else theta_bar_init.clone().to(device)
         theta_bar_history = []
-        pi_t = lambda x: torch.ones(A, dtype=torch.float64, device=device) / A  # start uniform
 
         # -------------------------
         # Main loop
@@ -262,64 +292,44 @@ class FOGASSolver:
         iterator = trange(T, desc="FOGAS", disable=not use_tqdm)
 
         for t in iterator:
+            # ---------- Policy matrix π_t (N,A) ----------
+            logits = alpha * torch.tensordot(PHI_XA, theta_bar_t, dims=([2], [0]))
+            pi_mat = self._row_softmax(logits)
 
-            # ---------------------------
-            # μ̂ term
-            # ---------------------------
-            lambda_emp_sum1 = (1 - gamma) * sum(
-                pi_t(x0)[a] * phi(x0, a).to(dtype=torch.float64, device=device) for a in range(A)
-            )
+            # E_phi_pi[x] = sum_a pi(x,a) * phi(x,a)
+            E_phi_pi = (pi_mat[..., None] * PHI_XA).sum(dim=1)
 
-            Lambda_term = Cov_emp_inv @ lambda_t
-            lambda_emp_sum2 = torch.zeros(d, dtype=torch.float64)
+            # ---------- μ̂ term ----------
+            lambda_emp_sum1 = (1.0 - gamma) * E_phi_pi[x0]
 
-            for i in range(n):
-                coeff = Phi[i] @ Lambda_term
-                inner = sum(pi_t(int(X_nexts[i].item()))[a] * phi(int(X_nexts[i].item()), a).to(dtype=torch.float64, device=device)
-                            for a in range(A))
-                lambda_emp_sum2 += coeff * inner
-            lambda_emp_sum2 *= gamma / n
-
+            Lambda_term = Cov_inv @ lambda_t
+            coeff = Phi_data @ Lambda_term
+            inner = E_phi_pi[Xn]
+            lambda_emp_sum2 = (gamma / n) * (coeff[:, None] * inner).sum(dim=0)
             emp_feature_occupancy = lambda_emp_sum1 + lambda_emp_sum2
 
-            # ---------------------------
-            # θ_t update
-            # ---------------------------
+            # ---------- θ_t update ----------
             c_t = emp_feature_occupancy - lambda_t
             norm_c = torch.linalg.norm(c_t)
             theta_t = torch.zeros_like(c_t) if norm_c < 1e-12 else -D_theta * c_t / norm_c
 
-            # ---------------------------
-            # Ψ̂ v term
-            # ---------------------------
-            sum_term = torch.zeros(d, dtype=torch.float64)
-            for i in range(n):
-                probs = pi_t(int(X_nexts[i].item()))
-                v = sum(
-                    probs[a] * torch.dot(theta_t, phi(int(X_nexts[i].item()), a).to(dtype=torch.float64, device=device))
-                    for a in range(A)
-                )
-                sum_term += Phi[i] * v
+            # ---------- Ψ̂ v term ----------
+            q = torch.tensordot(PHI_XA[Xn], theta_t, dims=([2], [0]))
+            v = (pi_mat[Xn] * q).sum(dim=1)
+            sum_term = (Phi_data * v[:, None]).sum(dim=0)
+            Psi_hat_v = (Cov_inv @ sum_term) / n
 
-            Psi_hat_v = (1 / n) * (Cov_emp_inv @ sum_term)
-
-            # ---------------------------
-            # λ update
-            # ---------------------------
+            # ---------- λ update ----------
             g = omega + gamma * Psi_hat_v - theta_t
-            lambda_t = (1 / (1 + rho * eta)) * (lambda_t + eta * Cov_emp @ g)
+            lambda_t = (1.0 / (1.0 + rho * eta)) * (lambda_t + eta * (Cov @ g))
 
-            # ---------------------------
-            # Policy update
-            # ---------------------------
-            theta_bar_t += theta_t
+            # ---------- θ̄ update ----------
+            theta_bar_t = theta_bar_t + theta_t
             theta_bar_history.append(theta_bar_t.clone())
-            pi_t = self.softmax_policy(theta_bar_t, alpha)
 
             if print_policies and (t % max(1, T // 10) == 0):
                 print(f"\nIteration {t+1}")
-                pi_matrix = self.softmax_policy(theta_bar_t, alpha, return_matrix=True)
-                self.mdp.print_policy(pi_matrix)
+                self.mdp.print_policy(pi_mat.cpu())
 
             if verbose and (t % max(1, T // 10) == 0):
                 print(f"\n[FOGAS] Iter {t+1}/{T}")
@@ -328,9 +338,8 @@ class FOGASSolver:
                 print(f"  λ_t     = {lambda_t}")
                 print(f"  ||λ_t|| = {torch.linalg.norm(lambda_t).item():.3e}")
 
-    
         self.theta_bar_history = theta_bar_history
-        self.pi = self.softmax_policy(theta_bar_t, alpha, return_matrix=True)
+        self.pi = pi_mat
         self.lambda_T = lambda_t
 
-        return pi_t
+        return pi_mat

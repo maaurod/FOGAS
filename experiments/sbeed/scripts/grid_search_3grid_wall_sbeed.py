@@ -281,7 +281,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--dataset-path",
         type=Path,
-        default=REPO_ROOT / "data/datasets_clean/generalization/3grid_wall.csv",
+        default=REPO_ROOT / "data/datasets/generalization/3grid_wall.csv",
     )
     parser.add_argument(
         "--output-csv",

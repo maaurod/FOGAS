@@ -69,11 +69,11 @@ LR_VALUE_GRID = [1e-3, 3e-3, 1e-2]
 LR_RHO_GRID = [1e-3, 3e-3, 1e-2, 3e-2]
 LR_POLICY_GRID = [1e-4, 3e-4, 1e-3, 3e-3, 1e-2]
 DEFAULT_DATASET_PATH = (
-    REPO_ROOT / "data/datasets_clean/10grid_tabular.csv"
+    REPO_ROOT / "data/datasets/10grid_tabular.csv"
 )
 DEFAULT_DATASET_PATHS = (
-    REPO_ROOT / "data/datasets_clean/10grid_tabular.csv",
-    REPO_ROOT / "data/datasets_clean/10grid_tabular_prueba.csv",
+    REPO_ROOT / "data/datasets/10grid_tabular.csv",
+    REPO_ROOT / "data/datasets/10grid_tabular_prueba.csv",
 )
 
 CSV_FIELDS = [

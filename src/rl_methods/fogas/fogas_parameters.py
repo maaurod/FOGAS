@@ -23,18 +23,18 @@ import math
 
 
 class FOGASParameters:
-    def __init__(self, mdp, n, delta=0.05,
+    def __init__(self, N, A, gamma, d, R, n, delta=0.05,
                  T=None, alpha=None, eta=None, rho=None, D_theta=None,
                  beta=None, print_params=False):
 
         # Store core inputs
         self.delta = delta
         self.n = n
-        self.R = mdp.R
-        self.N = mdp.N
-        self.A = mdp.A
-        self.d = mdp.d
-        self.gamma = mdp.gamma
+        self.R = float(R)
+        self.N = int(N)
+        self.A = int(A)
+        self.d = int(d)
+        self.gamma = float(gamma)
 
         # Store overrides for summary printing
         self.overrides = {

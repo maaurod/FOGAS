@@ -22,12 +22,13 @@ ASSETS_DIR = PROJECT_ROOT / "experiments" / "shared" / "assets"
 if str(PROJECT_ROOT / "src") not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
-from rl_methods import PolicySolver, EnvDataCollector
+from rl_methods import EnvDataCollector
+from rl_methods.mdp import DiscreteMDP, Planner
 from rl_methods.fogas import (
-    FOGASSolverVectorized,
+    FOGASSolver,
     FOGASEvaluator,
 )
-from rl_methods.dataset_collection import DatasetAnalyzer
+from rl_methods.data_collection import DatasetAnalyzer
 
 # --- Setup Parameters ---
 seed = 42
@@ -91,10 +92,17 @@ def psi(xp):
                 v[int(x) * A + int(a)] = 1.0
     return v
 
-mdp = PolicySolver(
-    states=states, actions=actions, phi=phi, omega=omega,
-    gamma=gamma, x0=x_0, psi=psi
+mdp = DiscreteMDP(
+    states=states, actions=actions, omega=omega,
+    gamma=gamma, x0=x_0, psi=psi, phi=phi
 )
+planner = Planner(mdp)
+
+Phi = torch.vstack([
+    phi(int(s), int(a)).to(dtype=torch.float64)
+    for s in states
+    for a in actions
+])
 
 # --- Grid Search Config ---
 dataset_sizes = [4000, 8000, 12000, 16000, 20000]
@@ -127,12 +135,12 @@ FOGAS_PARAMS = {
 }
 
 # Precompute constants for exact suboptimality metrics
-_mu_star = mdp.mu_star.cpu()                           # shape (N*A,)
+_mu_star = planner.mu_star.cpu()                       # shape (N*A,)
 _mu_star_norm = _mu_star / (_mu_star.sum() + 1e-300)  # Total discounted occupancy
 _d_star = _mu_star_norm.reshape(N, A).sum(dim=1)       # State occupancy d_π*(s)
 
-_v_star = mdp.v_star.cpu()                              # shape (N,)
-_q_star_flat = mdp.q_star.cpu().reshape(-1)            # shape (N*A,)
+_v_star = planner.v_star.cpu()                         # shape (N,)
+_q_star_flat = planner.q_star.cpu().reshape(-1)        # shape (N*A,)
 
 beta_val = 1e-4
 temp_dir = "temp_grid_search"
@@ -152,7 +160,7 @@ print(f"   5. Q Optimal Gap (E_{{(x,a)~μ_π*}}[Q*(x,a) - Q^π(x,a)])\n")
 with tqdm(total=total_iters, desc="Grid Searching") as pbar:
     for reset_label, reset_probs in reset_configs.items():
         collector = EnvDataCollector(
-            mdp=mdp,
+            mdp=planner,
             env_name="10grid_wall",
             restricted_states=list(walls),
             terminal_states=(list(pits) + [goal]),
@@ -163,7 +171,7 @@ with tqdm(total=total_iters, desc="Grid Searching") as pbar:
         
         for prop_label, (props, prop_name) in proportion_configs.items():
             for eps in epsilon_values:
-                epsilon_policy = (mdp.pi_star, eps)
+                epsilon_policy = (planner.pi_star, eps)
                 
                 for n_steps in dataset_sizes:
                     fname = f"gs_{reset_label}_{prop_label}_eps{eps}_n{n_steps}.csv"
@@ -187,16 +195,20 @@ with tqdm(total=total_iters, desc="Grid Searching") as pbar:
                     # B. Analyze Feature Coverage
                     try:
                         analyzer = DatasetAnalyzer(save_path)
-                        coverage_ratio = analyzer.feature_coverage_ratio(
-                            mdp=mdp, beta=beta_val, use_optimal_policy=True, verbose=False
+                        coverage_ratio = analyzer.feature_coverage(
+                            phi=Phi,
+                            optimal_occupancy=planner.mu_star,
+                            beta=beta_val,
+                            n_states=mdp.N,
+                            n_actions=mdp.A,
                         )
                     except:
                         coverage_ratio = np.nan
                         
                     # C. Train FOGAS and Compute Metrics
                     try:
-                        temp_solver = FOGASSolverVectorized(
-                            mdp=mdp, csv_path=save_path, device=device, 
+                        temp_solver = FOGASSolver(
+                            mdp=mdp, phi=phi, csv_path=save_path, device=device, 
                             beta=beta_val, seed=seed
                         )
                         temp_solver.run(
@@ -207,22 +219,28 @@ with tqdm(total=total_iters, desc="Grid Searching") as pbar:
                             tqdm_print=False
                         )
                         
-                        temp_eval = FOGASEvaluator(temp_solver)
+                        temp_eval = FOGASEvaluator(temp_solver, planner=planner)
                         
                         # Metric 1: Convergence — does the greedy path reach state 99?
                         try:
                             traj = temp_eval.simulate_trajectory(
-                                pi=None, max_steps=200, seed=42, goal_state=99
+                                policy_mode="greedy", max_steps=200, seed=42, goal_state=99
                             )
                             convergence = int(traj[-1]['next_state'] == 99)
                         except Exception:
                             convergence = np.nan
                         
                         # Metric 2: Final Reward
-                        final_reward = temp_eval.final_reward()
+                        final_reward = temp_eval.average_return(
+                            policy_mode="solver",
+                            num_trajectories=10,
+                            max_steps=200,
+                            seed=42,
+                            goal_state=99,
+                        )["policy"]
                         
                         # Metric 3 & 4: Exact Suboptimality Gaps
-                        v_pi, q_pi = mdp.evaluate_policy(temp_solver.pi)
+                        v_pi, q_pi = planner.evaluate_policy(temp_solver.pi)
                         v_pi_cpu = v_pi.cpu()
                         q_pi_flat_cpu = q_pi.reshape(-1).cpu()
                         

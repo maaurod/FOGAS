@@ -39,8 +39,8 @@ PROJECT_ROOT = find_root(Path(__file__).resolve())
 if str(PROJECT_ROOT / "src") not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
-from rl_methods import PolicySolver
-from rl_methods.fogas import FOGASSolverVectorized, FOGASEvaluator
+from rl_methods.mdp import DiscreteMDP, Planner
+from rl_methods.fogas import FOGASSolver, FOGASEvaluator
 
 # ─────────────────────────────────────────────────────────────
 # Seeds & device
@@ -201,15 +201,15 @@ def phi_40_fixed(x, a):
 states_40  = torch.arange(size_40 * size_40, dtype=torch.int64)
 actions_40 = torch.arange(4,               dtype=torch.int64)
 
-mdp_40 = PolicySolver(
+mdp_40 = DiscreteMDP(
     states    = states_40,
     actions   = actions_40,
-    phi       = phi_40_fixed,
     reward_fn = mdp_data_40["reward_fn"],
     gamma     = mdp_data_40["gamma"],
     x0        = mdp_data_40["start"],
     P         = mdp_data_40["P"],
 )
+planner_40 = Planner(mdp_40)
 print("✅ MDP built.")
 
 # ─────────────────────────────────────────────────────────────
@@ -223,14 +223,15 @@ print(f"📂 Dataset: {DATASET_PATH}")
 # ─────────────────────────────────────────────────────────────
 # Initialise solver & evaluator (reused across all runs)
 # ─────────────────────────────────────────────────────────────
-solver = FOGASSolverVectorized(
+solver = FOGASSolver(
     mdp      = mdp_40,
+    phi      = phi_40_fixed,
     csv_path = str(DATASET_PATH),
     device   = device,
     beta     = 1e-7,
     seed     = seed,
 )
-evaluator = FOGASEvaluator(solver)
+evaluator = FOGASEvaluator(solver, planner=planner_40)
 
 # ─────────────────────────────────────────────────────────────
 # Grid search configuration
@@ -282,18 +283,28 @@ for run_idx, (alpha_val, eta_val) in enumerate(valid_pairs):
             tqdm_print  = True,
         )
 
-        # ── Convergence metric (distance to goal) ──────────────
+        # ── Convergence metric (greedy success rate) ───────────
         metric_fn  = evaluator.get_metric(
-            "convergence", goal_state=GOAL_STATE, max_steps=MAX_SIM_STEPS
+            "success_rate",
+            goal_state=GOAL_STATE,
+            num_trajectories=10,
+            max_steps=MAX_SIM_STEPS,
+            seed=seed,
         )
-        conv_dist  = metric_fn()
+        conv_dist  = -metric_fn()
 
-        # ── Final reward ────────────────────────────────────────
-        final_rew  = evaluator.final_reward()
+        # ── Final reward ───────────────────────────────────────
+        final_rew  = evaluator.average_return(
+            policy_mode="solver",
+            num_trajectories=10,
+            max_steps=MAX_SIM_STEPS,
+            seed=seed,
+            goal_state=GOAL_STATE,
+        )["policy"]
 
         # ── Simulate trajectory and save path ───────────────────
         trajectory  = evaluator.simulate_trajectory(
-            pi         = solver.pi,
+            policy_mode = "solver",
             max_steps  = MAX_SIM_STEPS,
             seed       = seed,
             goal_state = GOAL_STATE,

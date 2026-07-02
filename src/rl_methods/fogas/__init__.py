@@ -1,21 +1,19 @@
 """FOGAS algorithm exports."""
 
 from .fogas_solver import FOGASSolver
-from .fogas_solver_vectorized import FOGASSolverVectorized
 from .fogas_evaluator import FOGASEvaluator
 from .fogas_dataset import FOGASDataset
+from .continuous_fogas_dataset import ContinuousFOGASDataset
 from .fogas_parameters import FOGASParameters
 from .fogas_hyperoptimizer import FOGASHyperOptimizer
 from .fogas_oraclesolver import FOGASOracleSolver
-from .fogas_oraclesolver_vectorized import FOGASOracleSolverVectorized
 
 __all__ = [
     "FOGASSolver",
-    "FOGASSolverVectorized",
     "FOGASDataset",
+    "ContinuousFOGASDataset",
     "FOGASParameters",
     "FOGASEvaluator",
     "FOGASHyperOptimizer",
     "FOGASOracleSolver",
-    "FOGASOracleSolverVectorized",
 ]

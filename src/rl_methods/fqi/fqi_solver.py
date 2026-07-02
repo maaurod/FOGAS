@@ -32,17 +32,20 @@ class FQISolver:
     def __init__(
         self,
         mdp,
+        phi=None,
         csv_path=None,
         gamma=None,
         ridge=1.0,
         dataset_verbose=False,
         seed=42,
         device=None,
+        planner=None,
         augment_terminal_transitions=True,
         use_model_based_backup=False,
         use_optimal_target_backup=False,
     ):
         self.mdp = mdp
+        self.planner = planner
         self.gamma = gamma if gamma is not None else mdp.gamma
         self.ridge = ridge
         self.seed = seed
@@ -66,8 +69,8 @@ class FQISolver:
             self.mdp.to(self.device)
 
         self.A = mdp.A
-        self.d = mdp.d
-        self.phi = mdp.phi
+        self.phi = self._resolve_phi(phi)
+        self.d = self._resolve_feature_dim()
         self.N = getattr(mdp, 'N', None)
 
         if use_model_based_backup or use_optimal_target_backup:
@@ -86,7 +89,7 @@ class FQISolver:
         if self.N is None:
             self.N = len(self.mdp.states)
         # Phi: (N*A, d) in row order (s0,a0), (s0,a1), ..., (sN-1, aA-1)
-        Phi_full = self.mdp.Phi.to(dtype=torch.float64, device=self.device)
+        Phi_full = self._full_feature_matrix()
         r = self.mdp.get_reward().to(dtype=torch.float64, device=self.device)
         P = self.mdp.get_transition_matrix().to(dtype=torch.float64, device=self.device)
         if Phi_full.shape[0] != self.N * self.A or P.shape != (self.N * self.A, self.N):
@@ -102,6 +105,37 @@ class FQISolver:
         self.P_full = P
         self.n = self.N * self.A
         self._state_to_index = self._build_state_to_index()
+
+    def _resolve_phi(self, phi):
+        if phi is not None:
+            return phi
+        if hasattr(self.mdp, "phi"):
+            return self.mdp.phi
+        raise ValueError(
+            "FQISolver requires phi when using mdp.DiscreteMDP, "
+            "because this MDP implementation does not store feature functions."
+        )
+
+    def _resolve_feature_dim(self):
+        if hasattr(self.mdp, "d"):
+            return int(self.mdp.d)
+        state = self.mdp.states[0]
+        action = self.mdp.actions[0]
+        state = int(state.item()) if isinstance(state, torch.Tensor) else int(state)
+        action = int(action.item()) if isinstance(action, torch.Tensor) else int(action)
+        feat = self.phi(state, action)
+        return int(torch.as_tensor(feat).reshape(-1).numel())
+
+    def _full_feature_matrix(self):
+        if hasattr(self.mdp, "Phi"):
+            return self.mdp.Phi.to(dtype=torch.float64, device=self.device)
+        rows = []
+        for state in self.mdp.states:
+            x = int(state.item()) if isinstance(state, torch.Tensor) else int(state)
+            for action in self.mdp.actions:
+                a = int(action.item()) if isinstance(action, torch.Tensor) else int(action)
+                rows.append(self.phi(x, a).to(dtype=torch.float64, device=self.device))
+        return torch.vstack(rows)
 
     def _init_dataset_based(self, csv_path, dataset_verbose):
         """Standard FQI: load dataset and build regression from dataset samples."""
@@ -330,14 +364,20 @@ class FQISolver:
                 iterator.set_postfix(theta_norm=f"{torch.linalg.norm(theta).item():.4f}")
 
     def _run_optimal_target_based(self, theta, params_history, iterator, tau, verbose=False):
-        """Bellman backup using full P and r, but fixed V* from PolicySolver."""
-        if not hasattr(self.mdp, 'v_star'):
-             raise AttributeError("Optimal target backup requires mdp to have 'v_star' (e.g. PolicySolver).")
+        """Bellman backup using full P and r, but fixed V* from a planner/old PolicySolver."""
+        if self.planner is not None:
+            V_star = self.planner.v_star.to(dtype=torch.float64, device=self.device)
+        elif hasattr(self.mdp, 'v_star'):
+            V_star = self.mdp.v_star.to(dtype=torch.float64, device=self.device)
+        else:
+            raise AttributeError(
+                "Optimal target backup requires planner=Planner(mdp) with v_star, "
+                "or an old MDP exposing v_star."
+            )
         
         N, A = self.N, self.A
         r = self.r_full
         P = self.P_full
-        V_star = self.mdp.v_star.to(dtype=torch.float64, device=self.device)
         
         # target(s,a) = r(s,a) + gamma * sum_s' P(s'|s,a) V*(s')
         # This target is fixed!

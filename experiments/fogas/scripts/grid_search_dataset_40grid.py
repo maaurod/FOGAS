@@ -82,8 +82,9 @@ PROJECT_ROOT = find_root(Path(__file__).resolve())
 if str(PROJECT_ROOT / "src") not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
-from rl_methods import PolicySolver, EnvDataCollector
-from rl_methods.fogas import FOGASSolverVectorized, FOGASEvaluator
+from rl_methods import EnvDataCollector
+from rl_methods.mdp import DiscreteMDP, Planner
+from rl_methods.fogas import FOGASSolver, FOGASEvaluator
 
 # ─────────────────────────────────────────────────────────────
 # Seeds & device
@@ -227,11 +228,11 @@ def build_waypoint_policy(N, A, waypoints, grid_size=40):
     return torch.tensor(pi, dtype=torch.float64)
 
 
-def compute_optimal_path(mdp, start, goal, size, max_steps=500):
+def compute_optimal_path(planner, start, goal, size, max_steps=500):
     """Simulate the greedy policy from 'start' until 'goal' or max_steps."""
     s = int(start)
     visited = [s]
-    pi = mdp.pi_star.numpy()  # (N, A)
+    pi = planner.pi_star.numpy()  # (N, A)
     for _ in range(max_steps):
         if s == goal:
             break
@@ -284,15 +285,15 @@ def phi_40_fixed(x, a):
 states_40  = torch.arange(size_40 * size_40, dtype=torch.int64)
 actions_40 = torch.arange(4,                dtype=torch.int64)
 
-mdp_40 = PolicySolver(
+mdp_40 = DiscreteMDP(
     states    = states_40,
     actions   = actions_40,
-    phi       = phi_40_fixed,
     reward_fn = mdp_data_40["reward_fn"],
     gamma     = mdp_data_40["gamma"],
     x0        = mdp_data_40["start"],
     P         = mdp_data_40["P"],
 )
+planner_40 = Planner(mdp_40)
 print("✅ MDP built.")
 
 # ─────────────────────────────────────────────────────────────
@@ -316,7 +317,7 @@ new_path_waypoints = [
 ]
 parallel_pi_star = build_waypoint_policy(N_40, A_40, new_path_waypoints, grid_size=40)
 
-pi_fogas_40 = mdp_40.pi_star.clone()
+pi_fogas_40 = planner_40.pi_star.clone()
 
 # ─────────────────────────────────────────────────────────────
 # Pre-compute which (state, action) pairs are visited by the policies
@@ -426,8 +427,9 @@ def build_augmentation_rows(sa_subset):
 
 def run_fogas(csv_path: str):
     """Train FOGAS on csv_path and return metrics dict."""
-    solver = FOGASSolverVectorized(
+    solver = FOGASSolver(
         mdp     = mdp_40,
+        phi     = phi_40_fixed,
         csv_path = csv_path,
         device   = device,
         beta     = BETA_VAL,
@@ -440,12 +442,12 @@ def run_fogas(csv_path: str):
         T          = FOGAS_PARAMS["T"],
         tqdm_print = False,
     )
-    evaluator = FOGASEvaluator(solver)
+    evaluator = FOGASEvaluator(solver, planner=planner_40)
 
     # Convergence: did the greedy policy reach the goal?
     try:
         traj       = evaluator.simulate_trajectory(
-            pi=None, max_steps=MAX_SIM_STEPS, seed=seed, goal_state=GOAL
+            policy_mode="greedy", max_steps=MAX_SIM_STEPS, seed=seed, goal_state=GOAL
         )
         convergence = int(traj[-1]["next_state"] == GOAL)
         path_len    = len(traj)
@@ -455,20 +457,26 @@ def run_fogas(csv_path: str):
 
     # Final reward (expected reward under learned policy)
     try:
-        final_reward = evaluator.final_reward()
+        final_reward = evaluator.average_return(
+            policy_mode="solver",
+            num_trajectories=10,
+            max_steps=MAX_SIM_STEPS,
+            seed=seed,
+            goal_state=GOAL,
+        )["policy"]
     except Exception:
         final_reward = float("nan")
 
     # Sub-optimality gaps (v_gap, q_gap)
     try:
-        mu_star      = mdp_40.mu_star.cpu()
+        mu_star      = planner_40.mu_star.cpu()
         mu_star_norm = mu_star / (mu_star.sum() + 1e-300)
         d_star       = mu_star_norm.reshape(N_40, A_40).sum(dim=1)
 
-        v_star      = mdp_40.v_star.cpu()
-        q_star_flat = mdp_40.q_star.cpu().reshape(-1)
+        v_star      = planner_40.v_star.cpu()
+        q_star_flat = planner_40.q_star.cpu().reshape(-1)
 
-        v_pi, q_pi  = mdp_40.evaluate_policy(solver.pi)
+        v_pi, q_pi  = planner_40.evaluate_policy(solver.pi)
         v_pi_cpu    = v_pi.cpu()
         q_pi_flat   = q_pi.reshape(-1).cpu()
 
@@ -481,9 +489,13 @@ def run_fogas(csv_path: str):
     # Convergence distance metric
     try:
         metric_fn  = evaluator.get_metric(
-            "convergence", goal_state=GOAL, max_steps=MAX_SIM_STEPS
+            "success_rate",
+            goal_state=GOAL,
+            num_trajectories=10,
+            max_steps=MAX_SIM_STEPS,
+            seed=seed,
         )
-        conv_dist  = metric_fn()
+        conv_dist  = -metric_fn()
     except Exception:
         conv_dist = float("nan")
 
@@ -515,7 +527,7 @@ results_A = []
 total_A = len(n_uniform_values) * len(coverage_values)
 
 collector_base = EnvDataCollector(
-    mdp              = mdp_40,
+    mdp              = planner_40,
     env_name         = "40grid",
     restricted_states= mdp_data_40["walls"],
     reset_probs      = RESET_OPTS_40,
@@ -535,7 +547,7 @@ with tqdm(total=total_A, desc="[Family A] Augmentation Grid") as pbar:
 
             # 1. Collect base dataset (same as working notebook)
             try:
-                epsilon_policy_fogas    = (mdp_40.pi_star,    0.0)
+                epsilon_policy_fogas    = (planner_40.pi_star,    0.0)
                 epsilon_policy_waypoint = (parallel_pi_star,  0.0)
 
                 collector_base.collect_mixed_dataset_terminal_aware(
@@ -619,7 +631,7 @@ N_STEPS_B = 100_000
 
 # Collector for the two guided (epsilon-greedy) policies
 collector_eps = EnvDataCollector(
-    mdp              = mdp_40,
+    mdp              = planner_40,
     env_name         = "40grid",
     restricted_states= mdp_data_40["walls"],
     reset_probs      = RESET_OPTS_40,     # occupancy-based for the guided policies
@@ -652,7 +664,7 @@ with tqdm(total=total_B, desc="[Family B] Epsilon x Proportions") as pbar:
                 csv_rand = f.name
 
             try:
-                epsilon_policy_fogas    = (mdp_40.pi_star,   eps)
+                epsilon_policy_fogas    = (planner_40.pi_star,   eps)
                 epsilon_policy_waypoint = (parallel_pi_star, eps)
 
                 # Collect guided portion
@@ -750,7 +762,7 @@ def compute_props_C(p_rand):
     return p_opt, p_alt, p_rand
 
 collector_C_guided = EnvDataCollector(
-    mdp              = mdp_40,
+    mdp              = planner_40,
     env_name         = "40grid",
     restricted_states= mdp_data_40["walls"],
     reset_probs      = RESET_OPTS_40,
@@ -778,7 +790,7 @@ with tqdm(total=len(p_rand_values), desc="[Family C] Random-Start Coverage") as 
             csv_random = f.name
 
         try:
-            epsilon_policy_fogas    = (mdp_40.pi_star,   0.0)
+            epsilon_policy_fogas    = (planner_40.pi_star,   0.0)
             epsilon_policy_waypoint = (parallel_pi_star, 0.0)
 
             n_guided = int(N_STEPS_C * (p_opt + p_alt))

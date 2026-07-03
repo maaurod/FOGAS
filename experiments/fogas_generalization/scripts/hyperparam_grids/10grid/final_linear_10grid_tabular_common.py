@@ -54,7 +54,8 @@ from rl_methods.mdp import DiscreteMDP, Planner  # noqa: E402
 
 SEED = 42
 NUM_TRAJECTORIES = 100
-MAX_STEPS = 50
+MAX_STEPS = 100
+MAX_STEPS_LONG = 200
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 torch.set_default_dtype(torch.float64)
 
@@ -114,9 +115,6 @@ THETA_LAMBDA_GRID = [
     1e-4,
     1e-3,
 ]
-# Projection radii are centered around the 10x10 tabular default D_theta,
-# sqrt(400 / (1 - 0.9)) ~= 63.
-PROJECTION_D_THETA_GRID = [1e-1, 1.0, 10.0, 100.0, 1000.0]
 
 REINFORCE_SAMPLES = 4
 
@@ -404,10 +402,12 @@ def save_results(results, output_csv, best_csv):
 def blank_metrics():
     return {
         "solver_success_rate": np.nan,
+        "solver_success_rate_200": np.nan,
         "solver_avg_return": np.nan,
         "solver_v_x0": np.nan,
         "solver_v_gap": np.nan,
         "greedy_success_rate": np.nan,
+        "greedy_success_rate_200": np.nan,
         "greedy_avg_return": np.nan,
         "greedy_v_x0": np.nan,
         "greedy_v_gap": np.nan,
@@ -447,6 +447,7 @@ def base_row(params, problem_name, device, status="ok", error=""):
         "dataset_path": str(problem["dataset_path"]),
         "num_trajectories": int(NUM_TRAJECTORIES),
         "max_steps": int(MAX_STEPS),
+        "max_steps_long": int(MAX_STEPS_LONG),
         "seed": int(SEED),
         "device": str(device),
         "status": status,
@@ -472,6 +473,16 @@ def evaluate_policy(planner, evaluator, policy_mode, d_star, v_star):
                 policy_mode=policy_mode,
                 num_trajectories=NUM_TRAJECTORIES,
                 max_steps=MAX_STEPS,
+                seed=SEED,
+                terminal_states=TERMINAL_STATES,
+            )["policy"]
+        ),
+        f"{policy_mode}_success_rate_200": float(
+            evaluator.success_rate(
+                goal_state=GOAL_GRID,
+                policy_mode=policy_mode,
+                num_trajectories=NUM_TRAJECTORIES,
+                max_steps=MAX_STEPS_LONG,
                 seed=SEED,
                 terminal_states=TERMINAL_STATES,
             )["policy"]
@@ -584,9 +595,6 @@ def all_candidates():
     theta_candidates = [
         ("reg_fixed", theta_lambda, None)
         for theta_lambda in THETA_LAMBDA_GRID
-    ] + [
-        ("projection", None, D_theta)
-        for D_theta in PROJECTION_D_THETA_GRID
     ]
 
     return [
@@ -606,14 +614,11 @@ def all_candidates():
 
 
 def theta_grid_size():
-    return len(THETA_LAMBDA_GRID) + len(PROJECTION_D_THETA_GRID)
+    return len(THETA_LAMBDA_GRID)
 
 
 def theta_grid_description():
-    return (
-        f"{len(THETA_LAMBDA_GRID)} reg_fixed theta_lambda values + "
-        f"{len(PROJECTION_D_THETA_GRID)} projection D_theta values"
-    )
+    return f"{len(THETA_LAMBDA_GRID)} reg_fixed theta_lambda values"
 
 
 def total_grid_size():
@@ -723,7 +728,7 @@ def run_grid_search(problem_name):
                 outer.set_postfix(
                     {
                         "greedy_success": row["greedy_success_rate"],
-                        "greedy_return": row["greedy_avg_return"],
+                        "solver_success": row["solver_success_rate"],
                         "status": row["status"],
                     }
                 )
@@ -765,7 +770,7 @@ def run_grid_search(problem_name):
                     outer.set_postfix(
                         {
                             "greedy_success": row.get("greedy_success_rate", np.nan),
-                            "greedy_return": row.get("greedy_avg_return", np.nan),
+                            "solver_success": row.get("solver_success_rate", np.nan),
                             "status": row.get("status"),
                         }
                     )

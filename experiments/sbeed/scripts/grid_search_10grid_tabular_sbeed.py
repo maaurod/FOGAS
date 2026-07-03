@@ -61,7 +61,8 @@ TAU = 500.0
 ROLLOUT_LENGTH = 1
 BATCH_SIZE = None
 STEP_GRID = [3_000, 5_000, 10_000]
-MAX_EVAL_STEPS = 50
+MAX_EVAL_STEPS = 100
+MAX_EVAL_STEPS_LONG = 200
 N_EVAL_EPISODES = 100
 
 LAMBDA_GRID = [1e-2, 3e-3, 1e-3, 3e-4, 1e-4]
@@ -97,6 +98,7 @@ CSV_FIELDS = [
     "rollout_length",
     "batch_size",
     "max_eval_steps",
+    "max_eval_steps_long",
     "n_eval_episodes",
     "eval_return_mean",
     "eval_return_std",
@@ -106,6 +108,7 @@ CSV_FIELDS = [
     "eval_length_mean",
     "eval_done_rate",
     "eval_success_rate",
+    "eval_success_rate_200",
     "eval_pit_rate",
     "greedy_path",
     "greedy_actions",
@@ -325,6 +328,22 @@ def evaluate_greedy_policy(
     }
 
 
+def evaluate_greedy_success_rate(
+    pi: np.ndarray,
+    *,
+    seed: int,
+    n_episodes: int = N_EVAL_EPISODES,
+    max_steps: int,
+) -> float:
+    success_count = 0
+    for episode in range(n_episodes):
+        rollout = greedy_rollout(pi, seed=seed + episode, max_steps=max_steps)
+        path = json.loads(rollout["greedy_path"])
+        if int(path[-1]) == GOAL_GRID:
+            success_count += 1
+    return float(success_count / n_episodes)
+
+
 def tail_mean(values: List[float]) -> float:
     return float(np.mean(values[-100:])) if values else float("nan")
 
@@ -380,6 +399,7 @@ def run_config(config: Dict[str, Any]) -> Dict[str, Any]:
             "rollout_length": ROLLOUT_LENGTH,
             "batch_size": "" if BATCH_SIZE is None else BATCH_SIZE,
             "max_eval_steps": MAX_EVAL_STEPS,
+            "max_eval_steps_long": MAX_EVAL_STEPS_LONG,
             "n_eval_episodes": N_EVAL_EPISODES,
             "last_objective": float(last_stats.get("objective", np.nan)),
             "last_primal_mse": float(last_stats.get("primal_mse", np.nan)),
@@ -397,6 +417,11 @@ def run_config(config: Dict[str, Any]) -> Dict[str, Any]:
         }
         row.update(policy_summary(pi))
         row.update(evaluate_greedy_policy(pi, seed=int(config["seed"])))
+        row["eval_success_rate_200"] = evaluate_greedy_success_rate(
+            pi,
+            seed=int(config["seed"]),
+            max_steps=MAX_EVAL_STEPS_LONG,
+        )
         row.update(greedy_rollout(pi, seed=int(config["seed"])))
         return row
     except Exception as exc:  # noqa: BLE001
@@ -421,6 +446,7 @@ def run_config(config: Dict[str, Any]) -> Dict[str, Any]:
             "rollout_length": ROLLOUT_LENGTH,
             "batch_size": "" if BATCH_SIZE is None else BATCH_SIZE,
             "max_eval_steps": MAX_EVAL_STEPS,
+            "max_eval_steps_long": MAX_EVAL_STEPS_LONG,
             "n_eval_episodes": N_EVAL_EPISODES,
             "error": repr(exc),
         }
@@ -642,8 +668,7 @@ def main() -> None:
                 f"[{completed}/{len(configs)}] run_id={row.get('run_id')} {status} "
                 f"dataset={row.get('dataset_name')} "
                 f"greedy_success={row.get('greedy_success', '')}{goal_marker} "
-                f"success={row.get('eval_success_rate', '')} "
-                f"return={row.get('eval_return_mean', '')} "
+                f"eval_success={row.get('eval_success_rate', '')} "
                 f"seconds={float(row.get('seconds', 0.0)):.1f}"
             )
 

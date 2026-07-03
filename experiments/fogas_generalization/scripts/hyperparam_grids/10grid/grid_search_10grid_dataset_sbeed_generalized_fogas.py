@@ -75,7 +75,7 @@ from rl_methods.sbeed import (  # noqa: E402
 # ---------------------------------------------------------------------
 SEED = 42
 NUM_TRAJECTORIES = 100
-MAX_STEPS = 50
+MAX_STEPS = 100
 EXTRA_TERMINAL_STEPS = 3
 COVERAGE_BETA = 1e-7
 

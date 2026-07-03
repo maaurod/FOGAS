@@ -54,7 +54,8 @@ from rl_methods.mdp import DiscreteMDP, Planner  # noqa: E402
 
 SEED = 42
 NUM_TRAJECTORIES = 100
-MAX_STEPS = 50
+MAX_STEPS = 100
+MAX_STEPS_LONG = 200
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 torch.set_default_dtype(torch.float64)
 
@@ -109,7 +110,7 @@ BATCH_ACTOR_LR_GRID = [3e-4, 1e-3, 3e-3, 1e-2]
 BATCH_RIDGE_GRID = [1e-8, 1e-6, 1e-4, 1e-3]
 BATCH_T_GRID = [1000, 3000, 5000]
 BATCH_SIZE_GRID = [64, 128, 256, 512, 1024]
-CRITIC_LR_GRID = [1e-4, 3e-4, 1e-3, 3e-3, 1e-2]
+CRITIC_LR_GRID = [1e-4, 3e-4, 1e-3, 3e-3]
 CRITIC_INNER_STEPS_GRID = [10, 25, 50, 100]
 
 BATCH_SIZE_CENTER = 256
@@ -420,10 +421,12 @@ def save_results(results, output_csv, best_csv):
 def blank_metrics():
     return {
         "solver_success_rate": np.nan,
+        "solver_success_rate_200": np.nan,
         "solver_avg_return": np.nan,
         "solver_v_x0": np.nan,
         "solver_v_gap": np.nan,
         "greedy_success_rate": np.nan,
+        "greedy_success_rate_200": np.nan,
         "greedy_avg_return": np.nan,
         "greedy_v_x0": np.nan,
         "greedy_v_gap": np.nan,
@@ -457,6 +460,7 @@ def base_row(candidate, problem_name, device, status="ok", error=""):
         "dataset_path": str(problem["dataset_path"]),
         "num_trajectories": int(NUM_TRAJECTORIES),
         "max_steps": int(MAX_STEPS),
+        "max_steps_long": int(MAX_STEPS_LONG),
         "seed": int(SEED),
         "device": str(device),
         "status": status,
@@ -482,6 +486,16 @@ def evaluate_policy(planner, evaluator, policy_mode, d_star, v_star):
                 policy_mode=policy_mode,
                 num_trajectories=NUM_TRAJECTORIES,
                 max_steps=MAX_STEPS,
+                seed=SEED,
+                terminal_states=TERMINAL_STATES,
+            )["policy"]
+        ),
+        f"{policy_mode}_success_rate_200": float(
+            evaluator.success_rate(
+                goal_state=GOAL_GRID,
+                policy_mode=policy_mode,
+                num_trajectories=NUM_TRAJECTORIES,
+                max_steps=MAX_STEPS_LONG,
                 seed=SEED,
                 terminal_states=TERMINAL_STATES,
             )["policy"]
@@ -758,7 +772,7 @@ def run_grid_search(problem_name):
                 outer.set_postfix(
                     {
                         "greedy_success": row["greedy_success_rate"],
-                        "greedy_return": row["greedy_avg_return"],
+                        "solver_success": row["solver_success_rate"],
                         "status": row["status"],
                     }
                 )
@@ -800,7 +814,7 @@ def run_grid_search(problem_name):
                     outer.set_postfix(
                         {
                             "greedy_success": row.get("greedy_success_rate", np.nan),
-                            "greedy_return": row.get("greedy_avg_return", np.nan),
+                            "solver_success": row.get("solver_success_rate", np.nan),
                             "status": row.get("status"),
                         }
                     )

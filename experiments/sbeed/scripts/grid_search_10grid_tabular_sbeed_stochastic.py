@@ -13,7 +13,7 @@ import grid_search_10grid_tabular_sbeed as base
 
 
 DEFAULT_DATASET_PATH = (
-    base.REPO_ROOT / "data" / "datasets" / "generalization" / "10grid_tabular_stoch.csv"
+    base.REPO_ROOT / "data" / "datasets" / "generalization" / "10grid_stoch_new.csv"
 )
 DEFAULT_OUTPUT_CSV = (
     base.REPO_ROOT

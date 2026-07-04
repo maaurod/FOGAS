@@ -128,7 +128,7 @@ PROBLEMS = {
     },
     "stochastic": {
         "description": "stochastic 10x10 FinalLinearSolver tabular grid search",
-        "dataset_path": DATASETS_DIR / "10grid_tabular_stoch.csv",
+        "dataset_path": DATASETS_DIR / "10grid_stoch_new.csv",
         "output_csv": RESULTS_DIR / "final_linear_10grid_tabular_stochastic_grid_search.csv",
         "best_csv": RESULTS_DIR / "final_linear_10grid_tabular_stochastic_grid_search_best.csv",
         "intended_prob": 0.8,

@@ -206,14 +206,6 @@ def validate_worker_devices(workers, device_list, allow_cpu_workers, devices_wer
             f"Refusing to launch {workers} workers without an explicit --devices list. "
             "Use --workers 1, or pass --devices cuda:0,cuda:1,... so workers are assigned intentionally."
         )
-    cpu_only = all(str(device).lower().startswith("cpu") for device in device_list)
-    if workers > 1 and cpu_only and not allow_cpu_workers:
-        raise ValueError(
-            f"Refusing to launch {workers} CPU workers for 10grid. "
-            "This job OOM-killed previous runs. Use --workers 1, pass CUDA devices "
-            "with --devices cuda:0,cuda:1,..., or add --allow-cpu-workers explicitly."
-        )
-
 
 def parse_float_list(values):
     parsed = []

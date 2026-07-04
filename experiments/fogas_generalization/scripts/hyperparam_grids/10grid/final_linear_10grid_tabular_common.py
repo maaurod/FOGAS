@@ -133,6 +133,13 @@ PROBLEMS = {
         "best_csv": RESULTS_DIR / "final_linear_10grid_tabular_stochastic_grid_search_best.csv",
         "intended_prob": 0.8,
     },
+        "stochastic2": {
+        "description": "stochastic 10x10 FinalLinearSolver tabular grid search",
+        "dataset_path": DATASETS_DIR / "10grid_stoch_new2.csv",
+        "output_csv": RESULTS_DIR / "final_linear_10grid_tabular_stochastic_grid_search2.csv",
+        "best_csv": RESULTS_DIR / "final_linear_10grid_tabular_stochastic_grid_search_best2.csv",
+        "intended_prob": 0.8,
+    },
 }
 
 

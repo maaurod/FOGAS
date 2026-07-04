@@ -153,6 +153,16 @@ def parse_args():
         default=None,
         help="Comma-separated worker devices, e.g. cuda:0,cuda:1. Defaults to cuda if available else cpu.",
     )
+    parser.add_argument(
+        "--allow-cpu-workers",
+        action="store_true",
+        help="Allow --workers > 1 when no CUDA devices are selected. This can OOM on 10grid.",
+    )
+    parser.add_argument(
+        "--skip-curves",
+        action="store_true",
+        help="Only evaluate final solver/greedy policies; skip checkpoint curve rows.",
+    )
     parser.add_argument("--no-progress", action="store_true", help="Disable tqdm progress bars.")
     return parser.parse_args()
 
@@ -187,6 +197,21 @@ def parse_device_list(devices):
         if parsed:
             return parsed
     return [str(DEVICE)]
+
+
+def validate_worker_devices(workers, device_list, allow_cpu_workers, devices_were_explicit):
+    if workers > 1 and not devices_were_explicit:
+        raise ValueError(
+            f"Refusing to launch {workers} workers without an explicit --devices list. "
+            "Use --workers 1, or pass --devices cuda:0,cuda:1,... so workers are assigned intentionally."
+        )
+    cpu_only = all(str(device).lower().startswith("cpu") for device in device_list)
+    if workers > 1 and cpu_only and not allow_cpu_workers:
+        raise ValueError(
+            f"Refusing to launch {workers} CPU workers for 10grid. "
+            "This job OOM-killed previous runs. Use --workers 1, pass CUDA devices "
+            "with --devices cuda:0,cuda:1,..., or add --allow-cpu-workers explicitly."
+        )
 
 
 def state_to_pos(s):
@@ -618,7 +643,38 @@ def final_metrics_from_curve(curve_rows):
     }
 
 
-def run_candidate(candidate, mdp, planner, device, d_star, v_star):
+def final_metrics_from_policy(mdp, planner, solver, d_star, v_star):
+    solver_stats = evaluate_policy_tensor(mdp, planner, solver.pi, d_star, v_star, EVAL_SEED)
+    greedy_stats = evaluate_policy_tensor(mdp, planner, greedy_policy(solver.pi), d_star, v_star, EVAL_SEED)
+    row = {
+        "solver_success_rate": finite_float(solver_stats["success_rate"]),
+        "solver_avg_return": finite_float(solver_stats["avg_return"]),
+        "solver_v_x0": finite_float(solver_stats["v_x0"]),
+        "solver_v_gap": finite_float(solver_stats["v_gap"]),
+        "greedy_success_rate": finite_float(greedy_stats["success_rate"]),
+        "greedy_avg_return": finite_float(greedy_stats["avg_return"]),
+        "greedy_v_x0": finite_float(greedy_stats["v_x0"]),
+        "greedy_v_gap": finite_float(greedy_stats["v_gap"]),
+    }
+    diagnostics = solver.get_diagnostics() or []
+    if diagnostics:
+        final = diagnostics[-1]
+        row.update(
+            {
+                "final_total_loss": finite_float(final.get("total_loss")),
+                "final_policy_objective": finite_float(final.get("policy_objective")),
+                "final_beta_objective": finite_float(final.get("beta_objective")),
+                "final_q_objective": finite_float(final.get("q_objective")),
+                "final_theta_norm": finite_float(final.get("theta_norm")),
+                "final_policy_grad_norm": finite_float(final.get("policy_grad_norm")),
+                "final_beta_grad_norm": finite_float(final.get("beta_grad_norm")),
+                "final_theta_grad_norm": finite_float(final.get("theta_grad_norm")),
+            }
+        )
+    return row
+
+
+def run_candidate(candidate, mdp, planner, device, d_star, v_star, save_curves=True):
     start = time.perf_counter()
     row = base_row(candidate, device)
     curve_rows = []
@@ -646,8 +702,11 @@ def run_candidate(candidate, mdp, planner, device, d_star, v_star):
             state_weight_update=candidate["state_weight_update"],
             beta_update=candidate["beta_update"],
         )
-        curve_rows = evaluate_policy_curve(candidate, solver, mdp, planner, d_star, v_star)
-        row.update(final_metrics_from_curve(curve_rows) or {})
+        if save_curves:
+            curve_rows = evaluate_policy_curve(candidate, solver, mdp, planner, d_star, v_star)
+            row.update(final_metrics_from_curve(curve_rows) or {})
+        else:
+            row.update(final_metrics_from_policy(mdp, planner, solver, d_star, v_star))
     except Exception as exc:
         row["status"] = "failed"
         row["error"] = repr(exc)
@@ -657,14 +716,14 @@ def run_candidate(candidate, mdp, planner, device, d_star, v_star):
 
 
 def run_candidate_worker(payload):
-    candidate, device_str, torch_threads = payload
+    candidate, device_str, torch_threads, save_curves = payload
     configure_worker_threads(torch_threads)
     set_seed(int(candidate["seed"]))
     device = torch.device(device_str)
     mdp, planner = build_mdp(device)
     d_star = planner.state_mu_star.detach().cpu()
     v_star = planner.v_star.detach().cpu()
-    return run_candidate(candidate, mdp, planner, device, d_star, v_star)
+    return run_candidate(candidate, mdp, planner, device, d_star, v_star, save_curves=save_curves)
 
 
 def failed_worker_row(candidate, exc):
@@ -781,6 +840,12 @@ def run_grid_search():
     workers = max(1, int(args.workers))
     torch_threads = max(1, int(args.torch_threads))
     device_list = parse_device_list(args.devices)
+    validate_worker_devices(
+        workers,
+        device_list,
+        args.allow_cpu_workers,
+        devices_were_explicit=args.devices is not None,
+    )
     configure_worker_threads(torch_threads)
     set_seed(SEED)
 
@@ -814,7 +879,15 @@ def run_grid_search():
         v_star = planner.v_star.detach().cpu()
         outer = tqdm(candidates, desc=desc, unit="run", disable=not progress)
         for run_idx, candidate in enumerate(outer, start=len(results) + 1):
-            row, new_curve_rows = run_candidate(candidate, mdp, planner, device, d_star, v_star)
+            row, new_curve_rows = run_candidate(
+                candidate,
+                mdp,
+                planner,
+                device,
+                d_star,
+                v_star,
+                save_curves=not args.skip_curves,
+            )
             row["run_idx"] = int(run_idx)
             for curve in new_curve_rows:
                 curve["run_idx"] = int(run_idx)
@@ -831,7 +904,7 @@ def run_grid_search():
                 )
     else:
         payloads = [
-            (candidate, device_list[i % len(device_list)], torch_threads)
+            (candidate, device_list[i % len(device_list)], torch_threads, not args.skip_curves)
             for i, candidate in enumerate(candidates)
         ]
         next_run_idx = len(results) + 1

@@ -24,7 +24,7 @@ Pendulum with neural value/rho models and an RFF Gaussian policy.
 - `continuous/`: final continuous SBEED notebook for Pendulum-v1. It loads and
   inspects the continuous solver configuration, evaluation returns, and training
   diagnostics.
-- `scripts/`: grid-search and smoke-test scripts. These files run the larger
+- `scripts/`: grid-search and test scripts. These files run the larger
   hyperparameter studies for staged tabular/RBF solvers, final neural discrete
   solvers, offline tabular datasets, and the final continuous Pendulum solver.
 

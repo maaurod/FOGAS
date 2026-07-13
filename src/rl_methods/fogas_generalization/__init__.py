@@ -1,19 +1,10 @@
 """Generalized FOGAS exports."""
 
 from .solvers import (
-    BetaSolver,
     ContinuousFinalParametrizedSolver,
     FinalLinearSolver,
     FinalParametrizedSolver,
-    LinearBetaPiSolver,
-    LinearSolver,
-    LossThetaBetaPiSolver,
-    LinearPolicyFOGAS,
     PrimalAlgaeDICESolver,
-    RegularizedLossThetaBetaPiSolver,
-    VBetaLogitSolver,
-    VBetaObjectivePolicySolver,
-    VBetaSolver,
 )
 from .continuous_features import (
     ContinuousDiscretePolicyParam,
@@ -64,19 +55,10 @@ except ModuleNotFoundError as exc:
     FOGASSolverPolicy = None
 
 __all__ = [
-    "BetaSolver",
     "ContinuousFinalParametrizedSolver",
-    "VBetaSolver",
-    "VBetaObjectivePolicySolver",
-    "VBetaLogitSolver",
-    "LinearPolicyFOGAS",
-    "LinearSolver",
     "FinalLinearSolver",
     "FinalParametrizedSolver",
     "PrimalAlgaeDICESolver",
-    "LinearBetaPiSolver",
-    "LossThetaBetaPiSolver",
-    "RegularizedLossThetaBetaPiSolver",
     "GeneralizedFOGASParameters",
     "StandaloneFOGASParameters",
     "TabularPolicyFeatures",
